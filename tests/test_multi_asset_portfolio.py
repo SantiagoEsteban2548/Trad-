@@ -380,3 +380,65 @@ def test_inventory_holding_time_decay() -> None:
     # Al ser posición larga (q > 0), un mayor gamma hace que reservation_price baje más
     # para acelerar la venta agresiva del inventario hacia el mercado
     assert res_b < res_a
+
+
+def test_execution_stats_and_trade_blotter_telemetry() -> None:
+    """
+    Verifica que el servidor registre operaciones en self.recent_trades,
+    actualice Win Rate, Profit Factor, curva de equidad y emita las claves
+    'execution_stats', 'open_orders' y 'recent_trades' en el snapshot de telemetría.
+    """
+    engine = DryRunExecutionEngine()
+
+    # 1. Verificar estado inicial
+    initial_snap = engine.get_telemetry_snapshot()
+    assert "execution_stats" in initial_snap
+    assert "open_orders" in initial_snap
+    assert "recent_trades" in initial_snap
+    assert initial_snap["execution_stats"]["total_trades"] == 0
+    assert initial_snap["execution_stats"]["win_rate_pct"] == 0.0
+
+    # 2. Registrar trade ganador
+    trade_win = engine.record_trade_fill(
+        symbol="BTC/USDT:USDT",
+        strategy="AVELLANEDA_OBI",
+        side="BUY",
+        entry_price=65000.0,
+        exit_or_mid_price=65050.0,
+        qty=0.01,
+        return_pct=0.077,
+        pnl_usd=0.50,
+    )
+    assert trade_win["pnl_usd"] == 0.50
+    assert engine.wins_count == 1
+    assert engine.gross_profit_usd == 0.50
+
+    # 3. Registrar trade perdedor
+    trade_loss = engine.record_trade_fill(
+        symbol="ETH/USDT:USDT",
+        strategy="LIQ_CASCADE",
+        side="SELL",
+        entry_price=2500.0,
+        exit_or_mid_price=2505.0,
+        qty=0.1,
+        return_pct=-0.20,
+        pnl_usd=-0.50,
+    )
+    assert trade_loss["pnl_usd"] == -0.50
+    assert engine.losses_count == 1
+    assert engine.gross_loss_usd == 0.50
+
+    # 4. Verificar snapshot actualizado
+    snap = engine.get_telemetry_snapshot()
+    stats = snap["execution_stats"]
+    assert stats["total_trades"] == 2
+    assert stats["wins_count"] == 1
+    assert stats["losses_count"] == 1
+    assert stats["win_rate_pct"] == 50.0
+    assert stats["profit_factor"] == 1.0
+    assert stats["avg_trade_pnl_usd"] == 0.0
+    assert len(snap["recent_trades"]) == 2
+    assert snap["recent_trades"][0]["symbol"] == "ETH/USDT:USDT"  # Más reciente primero
+    assert snap["recent_trades"][1]["symbol"] == "BTC/USDT:USDT"
+    assert len(stats["equity_curve"]) >= 10
+

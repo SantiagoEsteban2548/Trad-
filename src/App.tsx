@@ -19,7 +19,12 @@ import {
   ShieldCheck,
   XCircle,
   Flame,
-  Power
+  Power,
+  Download,
+  TrendingUp,
+  TrendingDown,
+  Clock,
+  BarChart2
 } from 'lucide-react';
 
 // Exact Normal CDF Phi(x)
@@ -77,6 +82,118 @@ function normPpf(p: number): number {
     -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
     ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
   );
+}
+
+export interface ExecutionStats {
+  total_trades: number;
+  wins_count: number;
+  losses_count: number;
+  win_rate_pct: number;
+  profit_factor: number;
+  avg_trade_pnl_usd: number;
+  gross_profit_usd: number;
+  gross_loss_usd: number;
+  equity_curve: number[];
+}
+
+export interface OpenOrder {
+  order_id: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  price: number;
+  qty: number;
+  filled_qty: number;
+  queue_ahead_qty: number;
+  strategy: string;
+  status: string;
+}
+
+export interface RecentTrade {
+  id: string;
+  timestamp_ms: number;
+  time_str: string;
+  symbol: string;
+  strategy: string;
+  side: 'BUY' | 'SELL';
+  entry_price: number;
+  exit_or_mid_price: number;
+  qty: number;
+  return_pct: number;
+  pnl_usd: number;
+}
+
+function renderEquitySparkline(data: number[], width = 170, height = 44) {
+  if (!data || data.length < 2) {
+    return (
+      <div className="h-10 flex items-center justify-center text-slate-500 text-[11px] font-mono">
+        Sin datos suficientes
+      </div>
+    );
+  }
+  const minVal = Math.min(...data);
+  const maxVal = Math.max(...data);
+  const range = maxVal - minVal || 1.0;
+  const paddingX = 4;
+  const paddingY = 6;
+  const innerW = width - paddingX * 2;
+  const innerH = height - paddingY * 2;
+
+  const points = data.map((val, idx) => {
+    const x = paddingX + (idx / (data.length - 1)) * innerW;
+    const y = height - paddingY - ((val - minVal) / range) * innerH;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+
+  const pathD = `M ${points.join(' L ')}`;
+  const areaD = `M ${paddingX},${height - paddingY} L ${points.join(' L ')} L ${width - paddingX},${height - paddingY} Z`;
+  const isUp = (data[data.length - 1] ?? 0) >= (data[0] ?? 0);
+  const strokeColor = isUp ? '#10b981' : '#f43f5e';
+
+  return (
+    <svg width={width} height={height} className="overflow-visible">
+      <defs>
+        <linearGradient id="equitySparklineGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={strokeColor} stopOpacity="0.35" />
+          <stop offset="100%" stopColor={strokeColor} stopOpacity="0.0" />
+        </linearGradient>
+      </defs>
+      <path d={areaD} fill="url(#equitySparklineGrad)" />
+      <path d={pathD} fill="none" stroke={strokeColor} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      {points.length > 0 && (
+        <circle
+          cx={points[points.length - 1].split(',')[0]}
+          cy={points[points.length - 1].split(',')[1]}
+          r="3"
+          fill={strokeColor}
+        />
+      )}
+    </svg>
+  );
+}
+
+function exportTradesToCsv(trades: RecentTrade[]) {
+  if (!trades || trades.length === 0) return;
+  const headers = ['ID', 'Timestamp_UTC', 'Symbol', 'Strategy', 'Side', 'Entry_Price', 'Exit_Mid_Price', 'Qty', 'Return_Pct', 'PnL_USD'];
+  const rows = trades.map((t) => [
+    t.id,
+    t.time_str,
+    t.symbol,
+    t.strategy,
+    t.side,
+    t.entry_price,
+    t.exit_or_mid_price,
+    t.qty,
+    t.return_pct,
+    t.pnl_usd,
+  ]);
+  const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map((e) => e.join(','))].join('\n');
+  const encodedUri = encodeURI(csvContent);
+  const link = document.createElement('a');
+  link.setAttribute('href', encodedUri);
+  link.setAttribute('download', `trades_blotter_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '_')}.csv`);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
 }
 
 export default function App() {
@@ -209,6 +326,27 @@ export default function App() {
     bullish_count: 0,
   });
 
+  // Execution Stats & Live Blotter State (Direct from backend/telemetry_server.py)
+  const [executionStats, setExecutionStats] = useState<ExecutionStats>({
+    total_trades: 0,
+    wins_count: 0,
+    losses_count: 0,
+    win_rate_pct: 0.0,
+    profit_factor: 1.0,
+    avg_trade_pnl_usd: 0.0,
+    gross_profit_usd: 0.0,
+    gross_loss_usd: 0.0,
+    equity_curve: [5000, 5000, 5000, 5000, 5000],
+  });
+  const [openOrders, setOpenOrders] = useState<OpenOrder[]>([]);
+  const [recentTrades, setRecentTrades] = useState<RecentTrade[]>([]);
+  const [tradeFilterSymbol, setTradeFilterSymbol] = useState<string>('TODOS');
+
+  const filteredTrades = useMemo(() => {
+    if (tradeFilterSymbol === 'TODOS') return recentTrades;
+    return recentTrades.filter((t) => t.symbol.toUpperCase().includes(tradeFilterSymbol.toUpperCase()));
+  }, [recentTrades, tradeFilterSymbol]);
+
   // Stress Tester Interactive State
   const [testMarginMode, setTestMarginMode] = useState<'ISOLATED' | 'CROSS'>('ISOLATED');
   const [testOrderType, setTestOrderType] = useState<'LIMIT' | 'MARKET'>('LIMIT');
@@ -224,6 +362,18 @@ export default function App() {
     }
     if (data.trading_mode) {
       setTradingMode(data.trading_mode);
+    }
+
+    if (data.execution_stats) {
+      setExecutionStats(data.execution_stats);
+    }
+
+    if (data.open_orders && Array.isArray(data.open_orders)) {
+      setOpenOrders(data.open_orders);
+    }
+
+    if (data.recent_trades && Array.isArray(data.recent_trades)) {
+      setRecentTrades(data.recent_trades);
     }
 
     if (data.market) {
@@ -870,6 +1020,164 @@ export default function App() {
               </div>
             </div>
 
+            {/* Tira de KPIs de Ejecución Cuantitativa & Gráfico Sparkline */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3.5">
+              {/* Card 1: Trades Totales */}
+              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
+                <div className="absolute top-0 right-0 w-24 h-24 bg-cyan-500/5 rounded-full blur-2xl pointer-events-none" />
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
+                    <Activity className="w-3.5 h-3.5 text-cyan-400" />
+                    Trades Totales
+                  </span>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                    Rotaciones L2
+                  </span>
+                </div>
+                <div className="mt-2">
+                  <div className="text-2xl font-mono font-bold text-white tracking-tight">
+                    {executionStats.total_trades}{' '}
+                    <span className="text-xs font-normal text-slate-400">fills</span>
+                  </div>
+                  <div className="flex items-center gap-2 mt-1 text-xs font-mono">
+                    <span className="text-emerald-400 font-semibold flex items-center gap-0.5">
+                      <TrendingUp className="w-3 h-3" /> {executionStats.wins_count} Wins
+                    </span>
+                    <span className="text-slate-600">•</span>
+                    <span className="text-rose-400 font-semibold flex items-center gap-0.5">
+                      <TrendingDown className="w-3 h-3" /> {executionStats.losses_count} Losses
+                    </span>
+                  </div>
+                </div>
+                <div className="text-[10px] font-mono text-slate-500 mt-2 border-t border-slate-800/80 pt-1.5 flex justify-between">
+                  <span>Ratio W/L</span>
+                  <span className="text-slate-300 font-bold">
+                    {(executionStats.losses_count > 0 ? (executionStats.wins_count / executionStats.losses_count) : executionStats.wins_count).toFixed(2)}x
+                  </span>
+                </div>
+              </div>
+
+              {/* Card 2: Win Rate % con Barra Bicolor */}
+              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
+                    <Percent className="w-3.5 h-3.5 text-emerald-400" />
+                    Tasa de Acierto
+                  </span>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                    executionStats.win_rate_pct >= 60 ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' :
+                    executionStats.win_rate_pct >= 50 ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30' :
+                    'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                  }`}>
+                    {executionStats.win_rate_pct >= 50 ? 'EDGE POSITIVO' : 'MONITOR'}
+                  </span>
+                </div>
+                <div className="mt-2">
+                  <div className="text-2xl font-mono font-bold text-emerald-400 tracking-tight">
+                    {executionStats.win_rate_pct.toFixed(1)}%
+                  </div>
+                  {/* Barra Bicolor Esmeralda / Rosa */}
+                  <div className="w-full bg-slate-950 h-2 rounded-full overflow-hidden border border-slate-800 mt-2 flex">
+                    <div
+                      className="bg-emerald-400 h-full transition-all duration-300"
+                      style={{ width: `${Math.max(0, Math.min(100, executionStats.win_rate_pct))}%` }}
+                    />
+                    <div
+                      className="bg-rose-500 h-full transition-all duration-300"
+                      style={{ width: `${Math.max(0, 100 - executionStats.win_rate_pct)}%` }}
+                    />
+                  </div>
+                </div>
+                <div className="text-[10px] font-mono text-slate-500 mt-2 border-t border-slate-800/80 pt-1.5 flex justify-between">
+                  <span className="text-emerald-400 font-semibold">+${executionStats.gross_profit_usd.toFixed(2)}</span>
+                  <span className="text-slate-400">Bruto</span>
+                  <span className="text-rose-400 font-semibold">-${executionStats.gross_loss_usd.toFixed(2)}</span>
+                </div>
+              </div>
+
+              {/* Card 3: Profit Factor */}
+              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
+                    <Gauge className="w-3.5 h-3.5 text-indigo-400" />
+                    Profit Factor (PF)
+                  </span>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                    executionStats.profit_factor >= 2.0 ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' :
+                    executionStats.profit_factor >= 1.2 ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30' :
+                    'bg-slate-800 text-slate-400 border-slate-700'
+                  }`}>
+                    {executionStats.profit_factor >= 1.5 ? 'EXCELENTE (>1.5)' : 'VÁLIDO'}
+                  </span>
+                </div>
+                <div className="mt-2">
+                  <div className={`text-2xl font-mono font-bold tracking-tight ${
+                    executionStats.profit_factor >= 1.5 ? 'text-emerald-400' :
+                    executionStats.profit_factor >= 1.0 ? 'text-cyan-400' : 'text-slate-200'
+                  }`}>
+                    {executionStats.profit_factor >= 999 ? '∞' : executionStats.profit_factor.toFixed(2)}
+                  </div>
+                  <div className="text-[11px] font-mono text-slate-400 mt-1">
+                    Gross Profit / Gross Loss
+                  </div>
+                </div>
+                <div className="text-[10px] font-mono text-slate-500 mt-2 border-t border-slate-800/80 pt-1.5 flex justify-between">
+                  <span>Umbral Óptimo</span>
+                  <span className="text-indigo-400 font-semibold">&gt; 1.50 PF</span>
+                </div>
+              </div>
+
+              {/* Card 4: PnL Medio por Trade */}
+              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
+                    <BrainCircuit className="w-3.5 h-3.5 text-amber-400" />
+                    PnL Medio / Trade
+                  </span>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                    ALPHA NETO
+                  </span>
+                </div>
+                <div className="mt-2">
+                  <div className={`text-2xl font-mono font-bold tracking-tight ${
+                    executionStats.avg_trade_pnl_usd >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                  }`}>
+                    {executionStats.avg_trade_pnl_usd >= 0 ? '+' : ''}${executionStats.avg_trade_pnl_usd.toFixed(2)}{' '}
+                    <span className="text-xs font-normal text-slate-400">USDT</span>
+                  </div>
+                  <div className="text-[11px] font-mono text-slate-400 mt-1">
+                    Expectativa Matemática E[R]
+                  </div>
+                </div>
+                <div className="text-[10px] font-mono text-slate-500 mt-2 border-t border-slate-800/80 pt-1.5 flex justify-between">
+                  <span>Comisión Maker</span>
+                  <span className="text-emerald-400 font-bold">0.00% (GTX Post-Only)</span>
+                </div>
+              </div>
+
+              {/* Card 5: Curva de Equidad en Vivo (SVG Sparkline) */}
+              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
+                    <BarChart2 className="w-3.5 h-3.5 text-cyan-400" />
+                    Curva de Equidad
+                  </span>
+                  <span className="text-[10px] font-mono text-cyan-400 font-bold">
+                    ${currentEquity.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                  </span>
+                </div>
+                <div className="h-12 flex items-center justify-center my-0.5">
+                  {renderEquitySparkline(executionStats.equity_curve)}
+                </div>
+                <div className="text-[10px] font-mono text-slate-500 border-t border-slate-800/80 pt-1.5 flex justify-between items-center">
+                  <span>Últimos 60 ticks</span>
+                  <span className={`font-bold ${dailyReturnPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {dailyReturnPct >= 0 ? '+' : ''}{dailyReturnPct.toFixed(2)}% Hoy
+                  </span>
+                </div>
+              </div>
+            </div>
+
             {/* Compact Live Multi-Asset Table */}
             <div className="bg-slate-900/85 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
               <div className="px-5 py-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/70">
@@ -974,6 +1282,152 @@ export default function App() {
                         </tr>
                       );
                     })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Panel de Operaciones en Tiempo Real (Active Orders & L2 Queue Table) */}
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+              <div className="px-5 py-3.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 bg-slate-950/80">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                    <Layers className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="font-semibold text-xs text-white font-mono uppercase tracking-wider">
+                      Órdenes Abiertas en Tiempo Real • Active Orders &amp; L2 Queue Table
+                    </h3>
+                    <p className="text-[11px] font-mono text-slate-400">
+                      Órdenes límite Post-Only (GTX) posicionadas en el libro L2 con posición dinámica en cola FIFO.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="px-2.5 py-1 rounded-lg text-xs font-mono font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+                    {openOrders.length > 0 ? `${openOrders.length} ÓRDENES ACTIVAS` : '1 ORDEN COTIZANDO'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left font-mono text-xs">
+                  <thead className="bg-slate-950/90 text-slate-400 uppercase text-[10px] tracking-wider border-b border-slate-800">
+                    <tr>
+                      <th className="py-2.5 px-4">ID Orden</th>
+                      <th className="py-2.5 px-4">Símbolo</th>
+                      <th className="py-2.5 px-4">Estrategia / Escalera</th>
+                      <th className="py-2.5 px-4">Lado</th>
+                      <th className="py-2.5 px-4">Precio Límite ($)</th>
+                      <th className="py-2.5 px-4">Cantidad</th>
+                      <th className="py-2.5 px-4">Cola Delante (queue_ahead)</th>
+                      <th className="py-2.5 px-4">Estado</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {openOrders.length > 0 ? (
+                      openOrders.map((ord) => {
+                        const isBuy = ord.side === 'BUY';
+                        const baseSym = ord.symbol.split('/')[0] || ord.symbol;
+                        const ladderTier = ord.strategy === 'LIQ_CASCADE' ? 'Exhaustion Hunter' : '3-Level Ladder (N1/N2/N3)';
+                        return (
+                          <tr key={ord.order_id} className="hover:bg-slate-800/30 transition-colors">
+                            <td className="py-2.5 px-4 text-cyan-400 font-semibold">{ord.order_id}</td>
+                            <td className="py-2.5 px-4 font-bold text-white flex items-center gap-1.5">
+                              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                              {baseSym} <span className="text-[10px] text-slate-500 font-normal">USDT-M</span>
+                            </td>
+                            <td className="py-2.5 px-4">
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                ord.strategy === 'LIQ_CASCADE'
+                                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                  : 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                              }`}>
+                                {ord.strategy} • {ladderTier}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-4">
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                isBuy
+                                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                                  : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                              }`}>
+                                {isBuy ? 'BID (BUY)' : 'ASK (SELL)'}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-4 font-bold text-slate-100">
+                              ${ord.price >= 1 ? ord.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : ord.price.toFixed(5)}
+                            </td>
+                            <td className="py-2.5 px-4 text-slate-300">
+                              {ord.qty} <span className="text-[10px] text-slate-500">(fill: {ord.filled_qty})</span>
+                            </td>
+                            <td className="py-2.5 px-4 min-w-[220px]">
+                              <div className="flex items-center gap-2.5">
+                                <span className="text-white font-bold w-16">{ord.queue_ahead_qty.toFixed(4)}</span>
+                                <div className="flex-1 bg-slate-950 h-2 rounded-full overflow-hidden border border-slate-800">
+                                  <div
+                                    className="bg-cyan-500 h-full transition-all duration-200"
+                                    style={{
+                                      width: `${Math.max(12, Math.min(100, (1 - ord.queue_ahead_qty / Math.max(ord.qty * 10, 1.0)) * 100))}%`
+                                    }}
+                                  />
+                                </div>
+                              </div>
+                            </td>
+                            <td className="py-2.5 px-4">
+                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1 w-max">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                                {ord.status}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    ) : (
+                      <tr className="hover:bg-slate-800/30 transition-colors">
+                        <td className="py-2.5 px-4 text-cyan-400 font-semibold">{simOrderId !== 'NONE' ? simOrderId : 'GTX-L2-LADDER'}</td>
+                        <td className="py-2.5 px-4 font-bold text-white flex items-center gap-1.5">
+                          <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                          {selectedAssetView === 'GLOBAL' ? 'BTC' : selectedAssetView} <span className="text-[10px] text-slate-500 font-normal">USDT-M</span>
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                            AVELLANEDA_OBI • 3-Level Ladder (Nivel 1)
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
+                            BID (BUY)
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-4 font-bold text-slate-100">
+                          ${bestBid >= 1 ? bestBid.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : bestBid.toFixed(5)}
+                        </td>
+                        <td className="py-2.5 px-4 text-slate-300">
+                          {simOrderQty.toFixed(4)} <span className="text-[10px] text-slate-500">(fill: {simFilledQty.toFixed(4)})</span>
+                        </td>
+                        <td className="py-2.5 px-4 min-w-[220px]">
+                          <div className="flex items-center gap-2.5">
+                            <span className="text-white font-bold w-16">{simQueueAhead.toFixed(2)} BTC</span>
+                            <div className="flex-1 bg-slate-950 h-2 rounded-full overflow-hidden border border-slate-800">
+                              <div
+                                className="bg-emerald-400 h-full transition-all duration-200"
+                                style={{
+                                  width: `${Math.max(10, Math.min(100, (simFilledQty / Math.max(simOrderQty, 0.001)) * 100))}%`
+                                }}
+                              />
+                            </div>
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1 w-max">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                            {simStatus}
+                          </span>
+                        </td>
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -1196,6 +1650,126 @@ export default function App() {
                   <span>Selección Adversa en Vuelo</span>
                   <span className="text-amber-400">PROTEGIDA ({simLatencyMs} ms)</span>
                 </div>
+              </div>
+            </div>
+
+            {/* Historial de Operaciones Realizadas (Live Trade Blotter) */}
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+              <div className="px-5 py-3.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 bg-slate-950/80">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                    <Clock className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="font-semibold text-xs text-white font-mono uppercase tracking-wider">
+                      Historial de Operaciones Realizadas • Live Trade Blotter
+                    </h3>
+                    <p className="text-[11px] font-mono text-slate-400">
+                      Registro de los últimos 50 fills con desglose de PnL neto, retorno relativo y microestructura ejecutada.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2.5">
+                  {/* Selector Rápido de Moneda */}
+                  <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 text-[11px] font-mono">
+                    {(['TODOS', 'BTC', 'ETH', 'SOL', 'BNB', 'DOGE'] as const).map((coin) => (
+                      <button
+                        key={coin}
+                        onClick={() => setTradeFilterSymbol(coin)}
+                        className={`px-2.5 py-1 rounded-lg font-bold transition-all ${
+                          tradeFilterSymbol === coin
+                            ? 'bg-cyan-600 text-white shadow-sm'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {coin}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Botón Exportar CSV */}
+                  <button
+                    onClick={() => exportTradesToCsv(filteredTrades)}
+                    disabled={filteredTrades.length === 0}
+                    className="px-3 py-1.5 rounded-xl font-mono text-xs font-bold flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                    title="Descargar historial de trades en formato CSV"
+                  >
+                    <Download className="w-3.5 h-3.5 text-cyan-400" />
+                    Exportar CSV ({filteredTrades.length})
+                  </button>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto max-h-80 overflow-y-auto">
+                <table className="w-full text-left font-mono text-xs">
+                  <thead className="bg-slate-950/95 sticky top-0 text-slate-400 uppercase text-[10px] tracking-wider border-b border-slate-800 z-10">
+                    <tr>
+                      <th className="py-2.5 px-4">Hora (UTC)</th>
+                      <th className="py-2.5 px-4">ID Operación</th>
+                      <th className="py-2.5 px-4">Par</th>
+                      <th className="py-2.5 px-4">Estrategia</th>
+                      <th className="py-2.5 px-4">Lado</th>
+                      <th className="py-2.5 px-4">Precio Fill ($)</th>
+                      <th className="py-2.5 px-4">Cantidad</th>
+                      <th className="py-2.5 px-4">Retorno (%)</th>
+                      <th className="py-2.5 px-4">PnL Neto (USDT)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {filteredTrades.length > 0 ? (
+                      filteredTrades.map((t) => {
+                        const isBuy = t.side === 'BUY';
+                        const isWin = t.pnl_usd >= 0;
+                        const baseSym = t.symbol.split('/')[0] || t.symbol;
+                        return (
+                          <tr key={t.id} className="hover:bg-slate-800/30 transition-colors">
+                            <td className="py-2 px-4 text-slate-400 text-[11px]">{t.time_str}</td>
+                            <td className="py-2 px-4 text-slate-300 text-[11px] font-semibold">{t.id}</td>
+                            <td className="py-2 px-4 font-bold text-white flex items-center gap-1.5">
+                              <span className={`w-1.5 h-1.5 rounded-full ${isWin ? 'bg-emerald-400' : 'bg-rose-400'}`} />
+                              {baseSym}
+                            </td>
+                            <td className="py-2 px-4">
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                t.strategy === 'LIQ_CASCADE'
+                                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                  : 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                              }`}>
+                                {t.strategy}
+                              </span>
+                            </td>
+                            <td className="py-2 px-4">
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                isBuy
+                                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                                  : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                              }`}>
+                                {isBuy ? 'BUY' : 'SELL'}
+                              </span>
+                            </td>
+                            <td className="py-2 px-4 font-semibold text-slate-200">
+                              ${t.entry_price >= 1 ? t.entry_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : t.entry_price.toFixed(5)}
+                            </td>
+                            <td className="py-2 px-4 text-slate-300">{t.qty}</td>
+                            <td className={`py-2 px-4 font-bold ${isWin ? 'text-emerald-400' : 'text-rose-400'}`}>
+                              {t.return_pct >= 0 ? `+${t.return_pct.toFixed(3)}%` : `${t.return_pct.toFixed(3)}%`}
+                            </td>
+                            <td className={`py-2 px-4 font-bold ${isWin ? 'text-emerald-400' : 'text-rose-400'}`}>
+                              {isWin ? `+$${t.pnl_usd.toFixed(2)}` : `-$${Math.abs(t.pnl_usd).toFixed(2)}`}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    ) : (
+                      <tr>
+                        <td colSpan={9} className="py-8 text-center text-slate-500 font-mono text-xs">
+                          Sin operaciones ejecutadas aún en la sesión actual. El motor se encuentra cotizando continuamente en el libro L2.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
               </div>
             </div>
 
