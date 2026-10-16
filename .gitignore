@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+env/
+
+# Build & outputs
+build/
+dist/
+coverage/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment & secrets (NEVER commit live credentials)
+.env*
+!.env.example
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
+
+# Large data cache (downloaded Binance raw candles)
+data/cache/*.json

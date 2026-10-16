@@ -1,0 +1,20 @@
+{
+  "market_regime": "LOW_VOL_RANGE",
+  "avellaneda_gamma": 0.15,
+  "gamma": 0.15,
+  "order_book_intensity_kappa": 1.5,
+  "kappa": 1.5,
+  "time_horizon_tau": 1.0,
+  "obi_cancel_threshold": 0.6,
+  "obi_shield_threshold": 0.6,
+  "obi_volatility_shift_mult": 2.5,
+  "min_annualized_funding_yield": 0.18,
+  "min_basis_spread_bps": -5.0,
+  "approved_symbols": [
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT"
+  ],
+  "max_leverage_cap": 2.5,
+  "risk_rationale": "Initial baseline regime configuration."
+}

@@ -1,0 +1,9 @@
+{
+  "gamma": 0.15,
+  "kappa": 1.50,
+  "time_horizon_tau": 1.0,
+  "obi_shield_threshold": 0.60,
+  "obi_volatility_shift_mult": 2.5,
+  "min_annualized_funding_yield": 0.18,
+  "min_basis_spread_bps": -5.0
+}

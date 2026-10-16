@@ -1,0 +1,6 @@
+{
+  "name": "Apex Quant HFT Engine & Risk Terminal",
+  "description": "High-frequency microstructure execution system, mandate risk gates, L2 queue simulation, and Deflated Sharpe ratio validation terminal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
