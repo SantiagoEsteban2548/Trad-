@@ -1,0 +1,19 @@
+{
+  "updated_at": "2026-10-16T01:12:03.910002+00:00",
+  "total_rotations_filled": 4,
+  "returns_count": 9,
+  "last_fill_buy_price": null,
+  "last_fill_sell_price": null,
+  "current_equity_usd": 84.9,
+  "returns_history": [
+    0.00095,
+    0.0011,
+    0.00085,
+    0.00105,
+    0.0009,
+    0.006392427663972492,
+    -0.899009154008651,
+    -0.9865688606792772,
+    -0.8743989780111454
+  ]
+}

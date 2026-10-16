@@ -162,7 +162,7 @@ class AvellanedaStoikovOBIEngine:
         for weight, mult in ladder_tiers:
             level_half_spread = half_spread * mult
             raw_level_bid = reservation_price - level_half_spread - vol_shift
-            safe_level_bid = min(raw_level_bid, best_ask - self.tick_size)
+            safe_level_bid = max(min(raw_level_bid, best_ask - self.tick_size), self.tick_size)
             level_qty = truncate_decimal_step(max(self.quote_qty * weight, self.step_size), self.step_size)
 
             cand_bid = OrderRequest.build_maker_order(

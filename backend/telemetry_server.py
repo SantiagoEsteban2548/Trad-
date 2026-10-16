@@ -32,6 +32,9 @@ import ccxt.async_support as ccxt_async
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from backend.ingestion.ring_buffer import MarketRingBuffer
 from backend.ingestion.ws_multiplexer import WebSocketMultiplexer
@@ -107,12 +110,21 @@ class BinanceLiveWsGateway:
                 "enableRateLimit": True,
                 "options": {
                     "defaultType": "swap",
+                    "fetchOpenOrders": {
+                        "warnWithoutSymbol": False,
+                    },
                 },
             }
             exchange_class = getattr(ccxtpro, "binanceusdm", None) or getattr(ccxt_async, "binanceusdm")
             self.exchange = exchange_class(config)
-            if self.testnet and hasattr(self.exchange, "set_sandbox_mode"):
-                self.exchange.set_sandbox_mode(True)
+            if self.testnet:
+                if hasattr(self.exchange, "enable_demo_trading"):
+                    self.exchange.enable_demo_trading(True)
+                elif hasattr(self.exchange, "set_sandbox_mode"):
+                    try:
+                        self.exchange.set_sandbox_mode(True)
+                    except Exception:
+                        pass
 
     async def initialize_symbol_margin(self, symbol: str, max_leverage: int = 3) -> None:
         """
@@ -864,8 +876,17 @@ class DryRunExecutionEngine:
         await self.multiplexer.start()
         if self.warm_path_scheduler:
             self.warm_path_scheduler.start()
+
+        env_mode = os.getenv("TRADING_MODE", "PAPER_L2").strip().upper()
+        if env_mode == "LIVE_BINANCE":
+            try:
+                await self.set_trading_mode("LIVE_BINANCE")
+                logger.info("TRADING_MODE=LIVE_BINANCE activado exitosamente al iniciar.")
+            except Exception as e:
+                logger.error(f"Error activando LIVE_BINANCE al inicio: {e}")
+
         self._eval_task = asyncio.create_task(self._strategy_evaluation_loop())
-        logger.info("Motor de evaluación DRY_RUN_L2 en ejecución.")
+        logger.info(f"Motor de evaluación en ejecución (Modo: {self.trading_mode}).")
 
     async def stop(self) -> None:
         """Detiene limpiamente todas las tareas y conexiones."""
