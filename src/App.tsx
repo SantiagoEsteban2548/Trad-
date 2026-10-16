@@ -652,8 +652,9 @@ export default function App() {
   const [profitSweepReady, setProfitSweepReady] = useState<boolean>(false);
   const [sweptSpotVault, setSweptSpotVault] = useState<number>(0.0);
 
-  // Operational Mode State: PAPER_L2 vs LIVE_BINANCE
-  const [tradingMode, setTradingMode] = useState<'PAPER_L2' | 'LIVE_BINANCE'>('PAPER_L2');
+  // Operational Mode State: PAPER_L2 vs LIVE_BINANCE vs LIVE_BINGX
+  const [tradingMode, setTradingMode] = useState<'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX'>('PAPER_L2');
+  const [pendingLiveMode, setPendingLiveMode] = useState<'LIVE_BINANCE' | 'LIVE_BINGX'>('LIVE_BINANCE');
   const [isLiveConfirmOpen, setIsLiveConfirmOpen] = useState<boolean>(false);
   const [modeSwitchError, setModeSwitchError] = useState<string | null>(null);
   const [modeSwitchSuccess, setModeSwitchSuccess] = useState<string | null>(null);
@@ -686,7 +687,7 @@ export default function App() {
   const [dsrOverfitted, setDsrOverfitted] = useState<boolean>(false);
 
   // Multi-Asset Architecture State
-  const [selectedAssetView, setSelectedAssetView] = useState<'GLOBAL' | 'BTC' | 'ETH' | 'SOL' | 'BNB' | 'DOGE'>('GLOBAL');
+  const [selectedAssetView, setSelectedAssetView] = useState<'GLOBAL' | 'BTC' | 'ETH' | 'SOL' | 'BNB' | 'DOGE' | 'XAU' | 'XAG'>('GLOBAL');
   const [symbolsData, setSymbolsData] = useState<Record<string, {
     symbol: string;
     base_asset: string;
@@ -747,7 +748,7 @@ export default function App() {
   }, [recentTrades, tradeFilterSymbol]);
 
   // Pro Terminal UI States
-  const [activeCoin, setActiveCoin] = useState<'BTC' | 'ETH' | 'SOL' | 'BNB' | 'DOGE'>('BTC');
+  const [activeCoin, setActiveCoin] = useState<'BTC' | 'ETH' | 'SOL' | 'BNB' | 'DOGE' | 'XAU' | 'XAG'>('BTC');
   const [activeTimeframe, setActiveTimeframe] = useState<'1m' | '5m' | '15m' | '1h'>('1m');
   const [activeBottomTab, setActiveBottomTab] = useState<'transactions' | 'orders' | 'scanner' | 'activity'>('transactions');
 
@@ -1014,9 +1015,10 @@ export default function App() {
     }
   };
 
-  const handleSwitchMode = async (targetMode: 'PAPER_L2' | 'LIVE_BINANCE') => {
+  const handleSwitchMode = async (targetMode: 'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX') => {
     if (targetMode === tradingMode) return;
-    if (targetMode === 'LIVE_BINANCE') {
+    if (targetMode === 'LIVE_BINANCE' || targetMode === 'LIVE_BINGX') {
+      setPendingLiveMode(targetMode);
       setModeSwitchError(null);
       setIsLiveConfirmOpen(true);
       return;
@@ -1053,15 +1055,16 @@ export default function App() {
       const res = await fetch(`${apiBaseUrl}/api/trading-mode`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'LIVE_BINANCE' }),
+        body: JSON.stringify({ mode: pendingLiveMode }),
       });
       const data = await res.json();
       if (!res.ok) {
-        setModeSwitchError(data.detail || 'Error al conmutar a modo LIVE.');
+        setModeSwitchError(data.detail || `Error al conmutar a modo ${pendingLiveMode}.`);
       } else {
-        setTradingMode('LIVE_BINANCE');
+        setTradingMode(pendingLiveMode);
         setIsLiveConfirmOpen(false);
-        setModeSwitchSuccess('Modo LIVE CAPITAL (BINANCE USDⓈ-M) activado exitosamente.');
+        const exchangeLabel = pendingLiveMode === 'LIVE_BINGX' ? 'BINGX SWAP & COMMODITIES' : 'BINANCE USDⓈ-M';
+        setModeSwitchSuccess(`Modo LIVE CAPITAL (${exchangeLabel}) activado exitosamente.`);
         setTimeout(() => setModeSwitchSuccess(null), 5000);
       }
     } catch (err: any) {
@@ -1290,8 +1293,14 @@ export default function App() {
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between">
                         <span className="font-bold text-xs tracking-wide text-white uppercase font-mono">APEX QUANT BOT</span>
-                        <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-[#00F59B]/10 text-[#00F59B] border border-[#00F59B]/20">
-                          {tradingMode === 'PAPER_L2' ? 'PAPER L2' : 'LIVE'}
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${
+                          tradingMode === 'PAPER_L2'
+                            ? 'bg-[#00F59B]/10 text-[#00F59B] border-[#00F59B]/20'
+                            : tradingMode === 'LIVE_BINANCE'
+                            ? 'bg-[#A855F7]/10 text-[#A855F7] border-[#A855F7]/20'
+                            : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                        }`}>
+                          {tradingMode === 'PAPER_L2' ? 'PAPER L2' : tradingMode === 'LIVE_BINANCE' ? 'BINANCE' : 'BINGX'}
                         </span>
                       </div>
                       <p className="text-[11px] font-mono text-slate-400 truncate">
@@ -1300,29 +1309,43 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Selector bimodal protegido */}
-                  <div className="grid grid-cols-2 gap-1.5 p-1 bg-[#080A0F] rounded-lg border border-[#1C2230] text-[11px] font-mono">
+                  {/* Selector tri-modal protegido */}
+                  <div className="grid grid-cols-3 gap-1 p-1 bg-[#080A0F] rounded-lg border border-[#1C2230] text-[10px] font-mono">
                     <button
                       onClick={() => handleSwitchMode('PAPER_L2')}
-                      className={`py-1.5 px-2 rounded font-bold flex items-center justify-center gap-1.5 transition-all ${
+                      className={`py-1.5 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
                         tradingMode === 'PAPER_L2'
                           ? 'bg-[#00F59B]/20 text-[#00F59B] border border-[#00F59B]/40 shadow-sm'
                           : 'text-slate-400 hover:text-[#00F59B]'
                       }`}
+                      title="Simulador L2 Paper Trading"
                     >
-                      <Activity className="w-3 h-3" />
-                      <span>PAPER L2</span>
+                      <Activity className="w-2.5 h-2.5" />
+                      <span>PAPER</span>
                     </button>
                     <button
                       onClick={() => handleSwitchMode('LIVE_BINANCE')}
-                      className={`py-1.5 px-2 rounded font-bold flex items-center justify-center gap-1.5 transition-all ${
+                      className={`py-1.5 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
                         tradingMode === 'LIVE_BINANCE'
                           ? 'bg-[#A855F7]/20 text-[#A855F7] border border-[#A855F7]/40 shadow-sm'
                           : 'text-slate-400 hover:text-[#A855F7]'
                       }`}
+                      title="Binance Futures USDⓈ-M"
                     >
-                      <Lock className="w-3 h-3" />
-                      <span>LIVE REAL</span>
+                      <Lock className="w-2.5 h-2.5" />
+                      <span>BINANCE</span>
+                    </button>
+                    <button
+                      onClick={() => handleSwitchMode('LIVE_BINGX')}
+                      className={`py-1.5 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
+                        tradingMode === 'LIVE_BINGX'
+                          ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40 shadow-sm'
+                          : 'text-slate-400 hover:text-amber-400'
+                      }`}
+                      title="BingX Swap & Commodities"
+                    >
+                      <Zap className="w-2.5 h-2.5" />
+                      <span>BINGX</span>
                     </button>
                   </div>
 
@@ -1475,14 +1498,14 @@ export default function App() {
                   <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1C2230] pb-2.5">
                     {/* Selector de Par */}
                     <div className="flex items-center gap-1 bg-[#080A0F] p-1 rounded-lg border border-[#1C2230] text-xs font-mono">
-                      {(['BTC', 'ETH', 'SOL', 'BNB', 'DOGE'] as const).map((coin) => (
+                      {(['BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'XAU', 'XAG'] as const).map((coin) => (
                         <button
                           key={coin}
                           onClick={() => {
                             setActiveCoin(coin);
                             setSelectedAssetView(coin);
                           }}
-                          className={`px-2.5 py-1 rounded font-bold transition-all ${
+                          className={`px-2 py-1 rounded font-bold transition-all ${
                             activeCoin === coin
                               ? 'bg-[#00F59B]/20 text-[#00F59B] border border-[#00F59B]/40 shadow-sm'
                               : 'text-slate-400 hover:text-slate-200'
@@ -1612,7 +1635,7 @@ export default function App() {
                       <div className="flex items-center gap-2">
                         {/* Filtro rápido por moneda */}
                         <div className="flex items-center gap-1 bg-[#080A0F] p-0.5 rounded-md border border-[#1C2230] text-[10px] font-mono">
-                          {(['TODOS', 'BTC', 'ETH', 'SOL', 'BNB', 'DOGE'] as const).map((sym) => (
+                          {(['TODOS', 'BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'XAU', 'XAG'] as const).map((sym) => (
                             <button
                               key={sym}
                               onClick={() => setTradeFilterSymbol(sym)}
@@ -1643,7 +1666,7 @@ export default function App() {
                           <tr className="text-slate-500 border-b border-[#1C2230] text-[10px] uppercase tracking-wider">
                             <th className="py-1.5 px-2.5">Side</th>
                             <th className="py-1.5 px-2.5">Time</th>
-                            <th className="py-1.5 px-2.5">Pair</th>
+                            <th className="py-1.5 px-2.5">Asset / Class</th>
                             <th className="py-1.5 px-2.5">Strategy</th>
                             <th className="py-1.5 px-2.5">Price</th>
                             <th className="py-1.5 px-2.5">Qty</th>
@@ -1657,6 +1680,7 @@ export default function App() {
                               const isBuy = t.side === 'BUY';
                               const isWin = t.pnl_usd >= 0;
                               const baseSym = t.symbol.split('/')[0] || t.symbol;
+                              const isTradFi = t.symbol.includes('XAU') || t.symbol.includes('XAG');
                               return (
                                 <tr key={t.id} className="hover:bg-[#10141D]/80 transition-colors">
                                   <td className="py-1.5 px-2.5">
@@ -1667,7 +1691,18 @@ export default function App() {
                                     </span>
                                   </td>
                                   <td className="py-1.5 px-2.5 text-slate-400 text-[11px]">{t.age_str || t.time_str}</td>
-                                  <td className="py-1.5 px-2.5 font-bold text-white">{baseSym}</td>
+                                  <td className="py-1.5 px-2.5">
+                                    <div className="flex items-center gap-1.5">
+                                      <span className="font-bold text-white">{baseSym}</span>
+                                      <span className={`px-1 py-0.2 rounded text-[8px] font-mono font-bold ${
+                                        isTradFi
+                                          ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                                          : 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/30'
+                                      }`}>
+                                        {isTradFi ? 'COMMODITY (BINGX)' : 'CRYPTO 24/7'}
+                                      </span>
+                                    </div>
+                                  </td>
                                   <td className="py-1.5 px-2.5">
                                     <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono border ${
                                       t.strategy === 'LIQ_CASCADE'
@@ -1778,16 +1813,26 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Tab 3 Content: 12P Scanner (Basket) */}
+                  {/* Tab 3 Content: 14P Scanner (Multi-Asset Basket) */}
                   {activeBottomTab === 'scanner' && (
-                    <div className="grid grid-cols-1 md:grid-cols-5 gap-2 font-mono text-xs">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2 font-mono text-xs max-h-56 overflow-y-auto">
                       {topActiveSymbols.map((symKey) => {
                         const s = symbolsData[symKey];
                         if (!s) return null;
+                        const isTradFi = symKey.includes('XAU') || symKey.includes('XAG');
                         return (
                           <div key={symKey} className="bg-[#080A0F] border border-[#1C2230] rounded-lg p-2.5 space-y-1">
                             <div className="flex items-center justify-between">
-                              <span className="font-bold text-white">{s.base_asset}</span>
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-bold text-white">{s.base_asset}</span>
+                                <span className={`px-1 py-0.2 rounded text-[8px] font-mono font-bold ${
+                                  isTradFi
+                                    ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                                    : 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/30'
+                                }`}>
+                                  {isTradFi ? 'COMMODITY (BINGX)' : 'CRYPTO 24/7'}
+                                </span>
+                              </div>
                               <span className="text-[10px] text-slate-400">{(s.half_kelly_weight * 100).toFixed(0)}% W</span>
                             </div>
                             <div className="text-slate-200 font-bold">${s.mid_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
@@ -2360,21 +2405,27 @@ export default function App() {
         </div>
       </div>
 
-      {/* Modal de Confirmación de Seguridad: LIVE CAPITAL (BINANCE) */}
+      {/* Modal de Confirmación de Seguridad: LIVE CAPITAL (BINANCE / BINGX) */}
       {isLiveConfirmOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
           <div className="bg-slate-900 border border-slate-700/80 rounded-2xl shadow-2xl max-w-lg w-full p-6 text-slate-100 animate-in fade-in zoom-in-95 duration-150">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3 mb-4">
               <div className="flex items-center gap-3">
-                <div className="p-2.5 bg-amber-500/15 border border-amber-500/30 rounded-xl text-amber-400">
+                <div className={`p-2.5 border rounded-xl ${
+                  pendingLiveMode === 'LIVE_BINGX'
+                    ? 'bg-amber-500/15 border-amber-500/30 text-amber-400'
+                    : 'bg-purple-500/15 border-purple-500/30 text-purple-400'
+                }`}>
                   <ShieldAlert className="w-5 h-5" />
                 </div>
                 <div>
                   <h3 className="font-bold text-base text-white tracking-tight">
-                    Confirmación de Seguridad: Capital Real
+                    Confirmación de Seguridad: Capital Real ({pendingLiveMode === 'LIVE_BINGX' ? 'BingX' : 'Binance'})
                   </h3>
                   <p className="text-xs text-slate-400 font-mono">
-                    Binance USDⓈ-M Futures (binanceusdm)
+                    {pendingLiveMode === 'LIVE_BINGX'
+                      ? 'BingX Perpetual Futures & TradFi Commodities (bingx swap)'
+                      : 'Binance USDⓈ-M Futures (binanceusdm)'}
                   </p>
                 </div>
               </div>
@@ -2392,7 +2443,7 @@ export default function App() {
 
             <div className="space-y-4 mb-6">
               <p className="text-xs text-slate-300 leading-relaxed">
-                Está a punto de conmutar la ejecución hacia <strong>Capital Real en Binance</strong>.
+                Está a punto de conmutar la ejecución hacia <strong>Capital Real en {pendingLiveMode === 'LIVE_BINGX' ? 'BingX Swap' : 'Binance Futures'}</strong>.
                 Por directriz algorítmica y mandatos deterministas, se verifica la integridad del sistema:
               </p>
 
@@ -2432,7 +2483,7 @@ export default function App() {
                   <span className="text-emerald-400 font-bold">LOCKED_ISOLATED</span>
                 </div>
                 <div className="flex justify-between items-center text-slate-300">
-                  <span>Gate 2: Maker Post-Only (GTX)</span>
+                  <span>Gate 2: Maker Post-Only (GTX / PO)</span>
                   <span className="text-emerald-400 font-bold">ENFORCED</span>
                 </div>
                 <div className="flex justify-between items-center text-slate-300">
@@ -2477,7 +2528,11 @@ export default function App() {
                 type="button"
                 disabled={isSwitchingMode || gate4KillSwitch}
                 onClick={confirmSwitchToLive}
-                className="px-4 py-2 rounded-xl bg-gradient-to-r from-amber-600 to-emerald-600 hover:from-amber-500 hover:to-emerald-500 text-white font-mono text-xs font-bold transition-all shadow-lg shadow-emerald-950/40 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                className={`px-4 py-2 rounded-xl text-white font-mono text-xs font-bold transition-all shadow-lg flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${
+                  pendingLiveMode === 'LIVE_BINGX'
+                    ? 'bg-gradient-to-r from-amber-600 to-emerald-600 hover:from-amber-500 hover:to-emerald-500 shadow-amber-950/40'
+                    : 'bg-gradient-to-r from-purple-600 to-emerald-600 hover:from-purple-500 hover:to-emerald-500 shadow-purple-950/40'
+                }`}
               >
                 {isSwitchingMode ? (
                   <>
@@ -2487,7 +2542,7 @@ export default function App() {
                 ) : (
                   <>
                     <Lock className="w-3.5 h-3.5" />
-                    <span>Confirmar y Activar LIVE_BINANCE</span>
+                    <span>Confirmar y Activar {pendingLiveMode}</span>
                   </>
                 )}
               </button>

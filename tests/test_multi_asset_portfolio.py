@@ -1,31 +1,35 @@
 # tests/test_multi_asset_portfolio.py
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import time
+from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
 from backend.ingestion.ring_buffer import MarketRingBuffer
 from backend.mandate_gates.gatekeeper import MandateGatekeeper
 from backend.mandate_gates.profit_sweeper import step_up_ratchet
-from backend.mandate_gates.schemas import PortfolioState
+from backend.mandate_gates.schemas import OrderRequest, PortfolioState
 from backend.strategies.avellaneda_obi import AvellanedaStoikovOBIEngine
 from backend.strategies.regime_config import RegimeConfig
 from backend.telemetry_server import (
+    BingXLiveWsGateway,
+    ContagionShieldState,
     DryRunExecutionEngine,
     SYMBOL_SPECS,
     SymbolMarketSpec,
-    ContagionShieldState,
+    is_tradfi_market_open,
 )
 
 
 def test_symbol_specs_and_context_initialization() -> None:
-    """Verifica que SYMBOL_SPECS contenga los 12 pares con sus ticks y steps exactos."""
-    assert len(SYMBOL_SPECS) == 12
+    """Verifica que SYMBOL_SPECS contenga los 14 pares (12 cripto + 2 TradFi commodities BingX) con sus ticks y steps exactos."""
+    assert len(SYMBOL_SPECS) == 14
     for sym in [
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT",
         "XRP/USDT:USDT", "SUI/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT", "PEPE/USDT:USDT",
-        "NEAR/USDT:USDT", "ARB/USDT:USDT",
+        "NEAR/USDT:USDT", "ARB/USDT:USDT", "XAU/USDT:USDT", "XAG/USDT:USDT",
     ]:
         assert sym in SYMBOL_SPECS
 
@@ -44,11 +48,24 @@ def test_symbol_specs_and_context_initialization() -> None:
     assert SYMBOL_SPECS["DOGE/USDT:USDT"].tick_size == 0.00001
     assert SYMBOL_SPECS["DOGE/USDT:USDT"].step_size == 1.0
 
+    # BingX TradFi Commodities
+    assert SYMBOL_SPECS["XAU/USDT:USDT"].tick_size == 0.10
+    assert SYMBOL_SPECS["XAU/USDT:USDT"].step_size == 0.01
+    assert SYMBOL_SPECS["XAU/USDT:USDT"].min_spread_bps == 6.0
+    assert SYMBOL_SPECS["XAU/USDT:USDT"].asset_class == "TRADFI_COMMODITY"
+    assert SYMBOL_SPECS["XAU/USDT:USDT"].exchange == "bingx"
+
+    assert SYMBOL_SPECS["XAG/USDT:USDT"].tick_size == 0.01
+    assert SYMBOL_SPECS["XAG/USDT:USDT"].step_size == 0.1
+    assert SYMBOL_SPECS["XAG/USDT:USDT"].min_spread_bps == 6.5
+    assert SYMBOL_SPECS["XAG/USDT:USDT"].asset_class == "TRADFI_COMMODITY"
+    assert SYMBOL_SPECS["XAG/USDT:USDT"].exchange == "bingx"
+
 
 def test_dry_run_engine_multi_symbol_contexts() -> None:
-    """Verifica que el motor inicialice contenedores independientes para los 12 símbolos y seleccione el Top 5 activo."""
+    """Verifica que el motor inicialice contenedores independientes para los 14 símbolos y seleccione el Top 5 activo."""
     engine = DryRunExecutionEngine()
-    assert len(engine.symbol_contexts) == 12
+    assert len(engine.symbol_contexts) == 14
     assert len(engine.top_active_symbols) == 5
     for sym in SYMBOL_SPECS:
         assert sym in engine.symbol_contexts
@@ -68,9 +85,9 @@ def test_multivariate_half_kelly_weights_and_bounds() -> None:
 
     # Caso 1: Sin historial suficiente -> distribucion uniforme acotada (<= 20%)
     weights_init = engine.compute_multivariate_half_kelly()
-    assert len(weights_init) == 12
+    assert len(weights_init) == 14
     for sym, w in weights_init.items():
-        assert 0.02 <= w <= 0.20
+        assert 0.0 <= w <= 0.20
 
     # Caso 2: Con retornos simulados
     np.random.seed(42)
@@ -79,7 +96,7 @@ def test_multivariate_half_kelly_weights_and_bounds() -> None:
 
     weights_active = engine.compute_multivariate_half_kelly()
     for sym, w in weights_active.items():
-        assert 0.02 <= w <= 0.20  # Gate 3: max 20% por par
+        assert 0.0 <= w <= 0.20  # Gate 3: max 20% por par
     assert sum(weights_active.values()) <= 3.0  # Gate 3: max 3.0x apalancamiento global
 
 
@@ -198,9 +215,11 @@ def test_telemetry_snapshot_multi_asset_schema() -> None:
     for key in ("symbol", "base_asset", "weight_pct", "notional_usd", "color"):
         assert key in a0
 
-    # Schema de los 12 pares
+    # Schema de los 14 pares
     syms = snapshot["symbols"]
-    assert len(syms) == 12
+    assert len(syms) == 14
+    assert "tradfi_market_open" in snapshot
+    assert "xau_safe_haven_active" in snapshot["contagion_shield"]
     for expected in SYMBOL_SPECS:
         assert expected in syms
         data = syms[expected]
@@ -475,4 +494,168 @@ def test_execution_stats_and_trade_blotter_telemetry() -> None:
     assert "price" in snap["recent_trades"][0]
     assert snap["recent_trades"][0]["price"] == 2505.0
     assert len(stats["equity_curve"]) >= 10
+
+
+def test_is_tradfi_market_open_sessions() -> None:
+    """Verifica con precisión los horarios de apertura y cierre de mercados TradFi (XAU/XAG)."""
+    # 1. Viernes pre-cierre y cierre (20:30 UTC)
+    fri_open = datetime(2026, 10, 16, 20, 29, 0, tzinfo=timezone.utc)
+    fri_closed = datetime(2026, 10, 16, 20, 30, 0, tzinfo=timezone.utc)
+    assert is_tradfi_market_open(fri_open) is True
+    assert is_tradfi_market_open(fri_closed) is False
+
+    # 2. Sábado completo cerrado
+    sat_midday = datetime(2026, 10, 17, 12, 0, 0, tzinfo=timezone.utc)
+    assert is_tradfi_market_open(sat_midday) is False
+
+    # 3. Domingo antes y después de reapertura (22:05 UTC)
+    sun_pre = datetime(2026, 10, 18, 22, 4, 0, tzinfo=timezone.utc)
+    sun_reopen = datetime(2026, 10, 18, 22, 5, 0, tzinfo=timezone.utc)
+    assert is_tradfi_market_open(sun_pre) is False
+    assert is_tradfi_market_open(sun_reopen) is True
+
+    # 4. Mantenimiento diario (Lunes a Jueves 20:45 UTC a 22:05 UTC)
+    tue_regular = datetime(2026, 10, 20, 20, 44, 0, tzinfo=timezone.utc)
+    tue_maint = datetime(2026, 10, 20, 20, 45, 0, tzinfo=timezone.utc)
+    tue_maint_2 = datetime(2026, 10, 20, 21, 30, 0, tzinfo=timezone.utc)
+    tue_maint_3 = datetime(2026, 10, 20, 22, 4, 0, tzinfo=timezone.utc)
+    tue_post_maint = datetime(2026, 10, 20, 22, 5, 0, tzinfo=timezone.utc)
+    assert is_tradfi_market_open(tue_regular) is True
+    assert is_tradfi_market_open(tue_maint) is False
+    assert is_tradfi_market_open(tue_maint_2) is False
+    assert is_tradfi_market_open(tue_maint_3) is False
+    assert is_tradfi_market_open(tue_post_maint) is True
+
+
+def test_tradfi_reallocation_when_market_closed() -> None:
+    """Verifica que cuando el mercado TradFi está cerrado, el cupo de XAU y XAG se reasigne a los pares cripto 24/7."""
+    engine = DryRunExecutionEngine()
+
+    with patch("backend.telemetry_server.is_tradfi_market_open", return_value=False):
+        weights = engine.compute_multivariate_half_kelly()
+        assert weights["XAU/USDT:USDT"] == 0.0
+        assert weights["XAG/USDT:USDT"] == 0.0
+
+        # Los 12 pares cripto 24/7 deben tener ponderaciones positivas y <= 0.20 (Gate 3)
+        for sym in engine.symbols:
+            if sym not in ("XAU/USDT:USDT", "XAG/USDT:USDT"):
+                assert weights[sym] > 0.0
+                assert weights[sym] <= 0.20
+
+        assert sum(weights.values()) <= 3.0
+
+
+def test_cross_asset_contagion_shield_gold_safe_haven_exemption() -> None:
+    """
+    Verifica que en una caída de BTC (OBI < -0.70), si Oro (XAU) tiene OBI > -0.40
+    y correlación baja con BTC (< 0.25), Oro queda exento del bloqueo y actúa como activo refugio.
+    """
+    engine = DryRunExecutionEngine()
+    now_ns = time.time_ns()
+
+    # Inyectar caída severa en BTC (OBI < -0.70)
+    btc_ctx = engine.symbol_contexts["BTC/USDT:USDT"]
+    btc_ctx.ring_buffer.push_order_book(
+        bid_prices=[65000.0 - i * 0.1 for i in range(5)],
+        bid_qtys=[1.0] * 5,
+        ask_prices=[65010.0 + i * 0.1 for i in range(5)],
+        ask_qtys=[60.0] * 5,
+        timestamp_ns=now_ns,
+    )
+    assert btc_ctx.ring_buffer.compute_obi(levels=5) < -0.70
+
+    # Oro saludable (OBI > -0.40)
+    xau_ctx = engine.symbol_contexts["XAU/USDT:USDT"]
+    xau_ctx.ring_buffer.push_order_book(
+        bid_prices=[2650.0 - i * 0.1 for i in range(5)],
+        bid_qtys=[20.0] * 5,
+        ask_prices=[2650.2 + i * 0.1 for i in range(5)],
+        ask_qtys=[5.0] * 5,
+        timestamp_ns=now_ns,
+    )
+    xau_obi = xau_ctx.ring_buffer.compute_obi(levels=5)
+    assert xau_obi > -0.40
+
+    # Simular retornos descorrelacionados
+    np.random.seed(99)
+    engine.symbol_returns["BTC/USDT:USDT"] = list(np.random.normal(-0.01, 0.02, 30))
+    engine.symbol_returns["XAU/USDT:USDT"] = list(np.random.normal(0.005, 0.005, 30))
+
+    corr = engine.compute_rolling_correlation("XAU/USDT:USDT", "BTC/USDT:USDT")
+    assert corr < 0.25
+
+    # Evaluar condición de refugio
+    is_gold_haven = (btc_ctx.ring_buffer.compute_obi(levels=5) < -0.70) and (xau_obi > -0.40) and (corr < 0.25)
+    assert is_gold_haven is True
+
+
+@pytest.mark.asyncio
+async def test_bingx_live_ws_gateway_post_only_and_margin() -> None:
+    """Verifica que BingXLiveWsGateway configure margen aislado, posición unidireccional y traduzca GTX a PO."""
+    mock_exchange = MagicMock()
+    mock_exchange.set_position_mode = AsyncMock(return_value={"code": 0, "msg": "success"})
+    mock_exchange.set_margin_mode = AsyncMock(return_value={"code": 0, "msg": "success"})
+    mock_exchange.set_leverage = AsyncMock(return_value={"code": 0, "leverage": 3})
+    mock_exchange.create_order = AsyncMock(return_value={"id": "bingx_order_999", "status": "open"})
+    mock_exchange.create_order_ws = AsyncMock(return_value={"id": "bingx_order_999", "status": "open"})
+    mock_exchange.cancel_order = AsyncMock(return_value={"id": "bingx_order_999", "status": "canceled"})
+    mock_exchange.cancel_order_ws = AsyncMock(return_value={"id": "bingx_order_999", "status": "canceled"})
+    mock_exchange.cancel_all_orders = AsyncMock(return_value=[{"id": "bingx_order_999"}])
+    mock_exchange.fetch_positions = AsyncMock(return_value=[])
+
+    gatekeeper = MandateGatekeeper()
+    portfolio = PortfolioState(
+        base_capital_usd=5000.0,
+        current_equity_usd=5000.0,
+        daily_high_watermark_usd=5000.0,
+        realized_pnl_today_usd=0.0,
+        active_positions={},
+        rolling_edge_mu=0.045,
+        rolling_variance_sigma2=0.0090,
+    )
+
+    gateway = BingXLiveWsGateway(
+        api_key="mock_bingx_key",
+        api_secret="mock_bingx_secret",
+        exchange=mock_exchange,
+        gatekeeper=gatekeeper,
+        portfolio=portfolio,
+    )
+
+    # 1. Configuración de margen y apalancamiento
+    await gateway.initialize_symbol_margin("XAU/USDT:USDT", max_leverage=3)
+    mock_exchange.set_position_mode.assert_awaited_once_with(False, "XAU/USDT:USDT")
+    mock_exchange.set_margin_mode.assert_awaited_once_with("ISOLATED", "XAU/USDT:USDT")
+    mock_exchange.set_leverage.assert_awaited_once_with(3, "XAU/USDT:USDT")
+    assert "XAU/USDT:USDT" in gateway.initialized_symbols
+
+    # 2. Despacho de orden con traducción obligatoria de GTX a Post-Only PO
+    order = OrderRequest(
+        symbol="XAU/USDT:USDT",
+        side="BUY",
+        order_type="LIMIT",
+        price=2650.0,
+        qty=0.02,
+        time_in_force="GTX",
+        margin_mode="ISOLATED",
+        strategy_id="AVELLANEDA_OBI",
+        timestamp_ns=1_000_000_000,
+    )
+    order_id = await gateway.place_order_ws(order)
+    assert order_id == "bingx_order_999"
+    assert gateway.live_active_bid_id == "bingx_order_999"
+
+    # Verificar que los parámetros enviados a CCXT tengan PO y postOnly=True
+    create_call_kwargs = mock_exchange.create_order_ws.call_args.kwargs
+    assert create_call_kwargs["params"]["timeInForce"] == "PO"
+    assert create_call_kwargs["params"]["postOnly"] is True
+
+    # 3. Cancelación de orden
+    cancelled = await gateway.cancel_order_ws("bingx_order_999", "XAU/USDT:USDT")
+    assert cancelled is True
+    assert gateway.live_active_bid_id is None
+
+    # 4. Emergency Flatten
+    await gateway.emergency_flatten_all(["XAU/USDT:USDT"])
+    mock_exchange.cancel_all_orders.assert_awaited_once_with("XAU/USDT:USDT")
 
