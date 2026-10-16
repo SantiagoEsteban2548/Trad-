@@ -167,6 +167,37 @@ def test_telemetry_snapshot_multi_asset_schema() -> None:
     assert "trigger_reason" in cs
     assert "btc_obi" in cs
 
+    # Schema de terminal DEX Pro cuantitativo
+    assert "order_book_depth" in snapshot
+    assert "bids" in snapshot["order_book_depth"]
+    assert "asks" in snapshot["order_book_depth"]
+    assert len(snapshot["order_book_depth"]["bids"]) == 5
+    assert len(snapshot["order_book_depth"]["asks"]) == 5
+
+    assert "candles_history" in snapshot
+    assert len(snapshot["candles_history"]) == 40
+    c0 = snapshot["candles_history"][0]
+    for key in ("open", "high", "low", "close", "volume", "is_bullish", "reservation_price"):
+        assert key in c0
+
+    assert "equity_comparison" in snapshot
+    assert len(snapshot["equity_comparison"]) == 50
+    eq0 = snapshot["equity_comparison"][0]
+    for key in ("timestamp", "bot_equity_usd", "benchmark_equity_usd", "trade_pnl_bar"):
+        assert key in eq0
+
+    assert "whale_and_liq_tape" in snapshot
+    assert len(snapshot["whale_and_liq_tape"]) >= 10
+    w0 = snapshot["whale_and_liq_tape"][0]
+    for key in ("symbol", "side", "notional_usd", "intensity_pct", "age_str"):
+        assert key in w0
+
+    assert "portfolio_allocation" in snapshot
+    assert len(snapshot["portfolio_allocation"]) == 5
+    a0 = snapshot["portfolio_allocation"][0]
+    for key in ("symbol", "base_asset", "weight_pct", "notional_usd", "color"):
+        assert key in a0
+
     # Schema de los 12 pares
     syms = snapshot["symbols"]
     assert len(syms) == 12
@@ -440,5 +471,8 @@ def test_execution_stats_and_trade_blotter_telemetry() -> None:
     assert len(snap["recent_trades"]) == 2
     assert snap["recent_trades"][0]["symbol"] == "ETH/USDT:USDT"  # Más reciente primero
     assert snap["recent_trades"][1]["symbol"] == "BTC/USDT:USDT"
+    assert "age_str" in snap["recent_trades"][0]
+    assert "price" in snap["recent_trades"][0]
+    assert snap["recent_trades"][0]["price"] == 2505.0
     assert len(stats["equity_curve"]) >= 10
 

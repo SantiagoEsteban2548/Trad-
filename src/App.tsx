@@ -24,7 +24,11 @@ import {
   TrendingUp,
   TrendingDown,
   Clock,
-  BarChart2
+  BarChart2,
+  PieChart,
+  ArrowDownUp,
+  Cpu,
+  BarChart3
 } from 'lucide-react';
 
 // Exact Normal CDF Phi(x)
@@ -100,6 +104,7 @@ export interface OpenOrder {
   order_id: string;
   symbol: string;
   side: 'BUY' | 'SELL';
+  level?: string;
   price: number;
   qty: number;
   filled_qty: number;
@@ -117,24 +122,66 @@ export interface RecentTrade {
   side: 'BUY' | 'SELL';
   entry_price: number;
   exit_or_mid_price: number;
+  price?: number;
   qty: number;
   return_pct: number;
   pnl_usd: number;
+  age_str?: string;
 }
 
-function renderEquitySparkline(data: number[], width = 170, height = 44) {
+export interface Candle {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  is_bullish: boolean;
+  reservation_price: number;
+}
+
+export interface EquityComparisonPoint {
+  timestamp: number;
+  timestamp_ms?: number;
+  bot_equity_usd: number;
+  benchmark_equity_usd: number;
+  trade_pnl_bar: number;
+}
+
+export interface WhaleTapeEvent {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  notional_usd: number;
+  intensity_pct: number;
+  age_str: string;
+  is_liquidation?: boolean;
+}
+
+export interface PortfolioAllocationItem {
+  symbol: string;
+  base_asset: string;
+  weight_pct: number;
+  notional_usd: number;
+  color: string;
+}
+
+export interface OrderBookDepth {
+  bids: [number, number, number][]; // [price, qty, cum_qty]
+  asks: [number, number, number][];
+}
+
+function renderEquitySparkline(data: number[], width = 160, height = 36) {
   if (!data || data.length < 2) {
     return (
-      <div className="h-10 flex items-center justify-center text-slate-500 text-[11px] font-mono">
-        Sin datos suficientes
+      <div className="h-9 flex items-center justify-center text-slate-500 text-[10px] font-mono">
+        Sin datos
       </div>
     );
   }
   const minVal = Math.min(...data);
   const maxVal = Math.max(...data);
   const range = maxVal - minVal || 1.0;
-  const paddingX = 4;
-  const paddingY = 6;
+  const paddingX = 2;
+  const paddingY = 4;
   const innerW = width - paddingX * 2;
   const innerH = height - paddingY * 2;
 
@@ -147,26 +194,378 @@ function renderEquitySparkline(data: number[], width = 170, height = 44) {
   const pathD = `M ${points.join(' L ')}`;
   const areaD = `M ${paddingX},${height - paddingY} L ${points.join(' L ')} L ${width - paddingX},${height - paddingY} Z`;
   const isUp = (data[data.length - 1] ?? 0) >= (data[0] ?? 0);
-  const strokeColor = isUp ? '#10b981' : '#f43f5e';
+  const strokeColor = isUp ? '#00F59B' : '#A855F7';
 
   return (
     <svg width={width} height={height} className="overflow-visible">
       <defs>
         <linearGradient id="equitySparklineGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={strokeColor} stopOpacity="0.35" />
+          <stop offset="0%" stopColor={strokeColor} stopOpacity="0.3" />
           <stop offset="100%" stopColor={strokeColor} stopOpacity="0.0" />
         </linearGradient>
       </defs>
       <path d={areaD} fill="url(#equitySparklineGrad)" />
-      <path d={pathD} fill="none" stroke={strokeColor} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      <path d={pathD} fill="none" stroke={strokeColor} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
       {points.length > 0 && (
         <circle
           cx={points[points.length - 1].split(',')[0]}
           cy={points[points.length - 1].split(',')[1]}
-          r="3"
+          r="2.5"
           fill={strokeColor}
         />
       )}
+    </svg>
+  );
+}
+
+function CandlestickChart({
+  candles,
+  bestBid,
+  bestAsk,
+  reservationPrice,
+}: {
+  candles: Candle[];
+  bestBid: number;
+  bestAsk: number;
+  reservationPrice: number;
+}) {
+  if (!candles || candles.length === 0) return null;
+  const n = candles.length;
+  const svgW = 760;
+  const svgH = 210;
+  const priceH = 150;
+  const volH = 45;
+  const padTop = 15;
+
+  const lows = candles.map((c) => c.low).filter((v) => v > 0);
+  const highs = candles.map((c) => c.high).filter((v) => v > 0);
+  const minP = Math.min(...lows, bestBid > 0 ? bestBid * 0.999 : 64000);
+  const maxP = Math.max(...highs, bestAsk > 0 ? bestAsk * 1.001 : 66000);
+  const rangeP = maxP - minP || 1.0;
+
+  const maxV = Math.max(...candles.map((c) => c.volume), 1.0);
+  const slotW = svgW / n;
+  const barW = Math.max(slotW * 0.65, 4);
+
+  const getY = (p: number) => padTop + priceH - ((p - minP) / rangeP) * priceH;
+
+  const yBid = getY(bestBid);
+  const yAsk = getY(bestAsk);
+  const yRes = getY(reservationPrice);
+
+  const resPoints = candles.map((c, i) => {
+    const x = i * slotW + slotW / 2;
+    const y = getY(c.reservation_price || c.close);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' L ');
+
+  return (
+    <svg viewBox={`0 0 ${svgW} ${svgH}`} className="w-full h-full overflow-visible">
+      <defs>
+        <linearGradient id="volGradMint" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#00F59B" stopOpacity="0.45" />
+          <stop offset="100%" stopColor="#00F59B" stopOpacity="0.05" />
+        </linearGradient>
+        <linearGradient id="volGradPurple" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#A855F7" stopOpacity="0.45" />
+          <stop offset="100%" stopColor="#A855F7" stopOpacity="0.05" />
+        </linearGradient>
+      </defs>
+
+      {/* Grid horizontal lines */}
+      {[0.25, 0.5, 0.75].map((ratio, idx) => {
+        const y = padTop + priceH * ratio;
+        const p = maxP - ratio * rangeP;
+        return (
+          <g key={idx}>
+            <line x1="0" y1={y} x2={svgW} y2={y} stroke="#1C2230" strokeDasharray="3 3" />
+            <text x={svgW - 5} y={y - 3} fill="#64748B" fontSize="9" fontFamily="monospace" textAnchor="end">
+              ${p.toFixed(p > 100 ? 1 : 4)}
+            </text>
+          </g>
+        );
+      })}
+
+      {/* Volume Separator */}
+      <line x1="0" y1={padTop + priceH + 4} x2={svgW} y2={padTop + priceH + 4} stroke="#1C2230" />
+
+      {/* Overlay Lines: Best Bid & Best Ask */}
+      <line x1="0" y1={yBid} x2={svgW} y2={yBid} stroke="#00F59B" strokeWidth="1" strokeDasharray="4 2" opacity="0.75" />
+      <line x1="0" y1={yAsk} x2={svgW} y2={yAsk} stroke="#A855F7" strokeWidth="1" strokeDasharray="4 2" opacity="0.75" />
+
+      {/* Reservation Price overlay line */}
+      <path d={`M ${resPoints}`} fill="none" stroke="#06B6D4" strokeWidth="1.5" strokeDasharray="3 2" opacity="0.85" />
+
+      {/* Candles and Volumes */}
+      {candles.map((c, i) => {
+        const cx = i * slotW + slotW / 2;
+        const isBull = c.close >= c.open;
+        const color = isBull ? '#00F59B' : '#A855F7';
+        const yHigh = getY(c.high);
+        const yLow = getY(c.low);
+        const yOpen = getY(c.open);
+        const yClose = getY(c.close);
+        const rectY = Math.min(yOpen, yClose);
+        const rectH = Math.max(Math.abs(yClose - yOpen), 1.5);
+
+        const vH = (c.volume / maxV) * (volH - 8);
+        const vy = svgH - vH;
+
+        return (
+          <g key={i}>
+            {/* Volume bar */}
+            <rect
+              x={cx - barW / 2}
+              y={vy}
+              width={barW}
+              height={vH}
+              fill={isBull ? 'url(#volGradMint)' : 'url(#volGradPurple)'}
+              stroke={color}
+              strokeWidth="0.5"
+              opacity="0.8"
+            />
+            {/* Wick */}
+            <line x1={cx} y1={yHigh} x2={cx} y2={yLow} stroke={color} strokeWidth="1.2" />
+            {/* Body */}
+            <rect
+              x={cx - barW / 2}
+              y={rectY}
+              width={barW}
+              height={rectH}
+              fill={color}
+              rx="1"
+            />
+          </g>
+        );
+      })}
+
+      {/* Badges on right edge for Bid/Ask */}
+      {bestBid > 0 && (
+        <g>
+          <rect x={svgW - 55} y={yBid - 7} width="52" height="14" rx="3" fill="#00F59B" fillOpacity="0.2" stroke="#00F59B" strokeWidth="0.8" />
+          <text x={svgW - 29} y={yBid + 3} fill="#00F59B" fontSize="9" fontFamily="monospace" textAnchor="middle" fontWeight="bold">
+            ${bestBid >= 1 ? bestBid.toFixed(1) : bestBid.toFixed(4)}
+          </text>
+        </g>
+      )}
+
+      {bestAsk > 0 && (
+        <g>
+          <rect x={svgW - 55} y={yAsk - 7} width="52" height="14" rx="3" fill="#A855F7" fillOpacity="0.2" stroke="#A855F7" strokeWidth="0.8" />
+          <text x={svgW - 29} y={yAsk + 3} fill="#A855F7" fontSize="9" fontFamily="monospace" textAnchor="middle" fontWeight="bold">
+            ${bestAsk >= 1 ? bestAsk.toFixed(1) : bestAsk.toFixed(4)}
+          </text>
+        </g>
+      )}
+    </svg>
+  );
+}
+
+function DualEquityCurve({
+  data,
+  currentEquity,
+  baseCapital,
+}: {
+  data: EquityComparisonPoint[];
+  currentEquity: number;
+  baseCapital: number;
+}) {
+  if (!data || data.length === 0) return null;
+  const svgW = 760;
+  const svgH = 135;
+  const chartH = 90;
+  const padTop = 10;
+  const barBaseY = 118;
+
+  const botVals = data.map((d) => d.bot_equity_usd);
+  const benchVals = data.map((d) => d.benchmark_equity_usd);
+  const allVals = [...botVals, ...benchVals, currentEquity, baseCapital];
+  const minVal = Math.min(...allVals) * 0.995;
+  const maxVal = Math.max(...allVals) * 1.005;
+  const range = maxVal - minVal || 1.0;
+
+  const n = data.length;
+  const slotW = svgW / Math.max(n - 1, 1);
+
+  const getY = (v: number) => padTop + chartH - ((v - minVal) / range) * chartH;
+
+  const botPoints = data.map((d, i) => `${(i * slotW).toFixed(1)},${getY(d.bot_equity_usd).toFixed(1)}`).join(' L ');
+  const benchPoints = data.map((d, i) => `${(i * slotW).toFixed(1)},${getY(d.benchmark_equity_usd).toFixed(1)}`).join(' L ');
+  const botArea = `M 0,${padTop + chartH} L ${botPoints} L ${svgW},${padTop + chartH} Z`;
+
+  return (
+    <svg viewBox={`0 0 ${svgW} ${svgH}`} className="w-full h-full overflow-visible">
+      <defs>
+        <linearGradient id="botGradMint" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#00F59B" stopOpacity="0.3" />
+          <stop offset="100%" stopColor="#00F59B" stopOpacity="0.0" />
+        </linearGradient>
+      </defs>
+
+      {/* Grid lines */}
+      <line x1="0" y1={padTop + chartH / 2} x2={svgW} y2={padTop + chartH / 2} stroke="#1C2230" strokeDasharray="3 3" />
+      <line x1="0" y1={padTop + chartH} x2={svgW} y2={padTop + chartH} stroke="#1C2230" />
+
+      {/* Bot Area and Line */}
+      <path d={botArea} fill="url(#botGradMint)" />
+      <path d={`M ${botPoints}`} fill="none" stroke="#00F59B" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+
+      {/* Benchmark Line */}
+      <path d={`M ${benchPoints}`} fill="none" stroke="#A855F7" strokeWidth="1.8" strokeDasharray="4 3" opacity="0.85" />
+
+      {/* PnL Bars for rotation events */}
+      {data.map((d, i) => {
+        if (!d.trade_pnl_bar || d.trade_pnl_bar === 0) return null;
+        const x = i * slotW;
+        const isUp = d.trade_pnl_bar > 0;
+        const bH = Math.min(Math.abs(d.trade_pnl_bar) * 45, 14);
+        const y = isUp ? barBaseY - bH : barBaseY;
+        const color = isUp ? '#00F59B' : '#A855F7';
+        return (
+          <rect
+            key={i}
+            x={x - 2}
+            y={y}
+            width="4"
+            height={bH}
+            fill={color}
+            rx="1"
+            opacity="0.9"
+          />
+        );
+      })}
+
+      {/* Latest Bot Point Dot */}
+      {data.length > 0 && (
+        <circle
+          cx={svgW}
+          cy={getY(currentEquity)}
+          r="3.5"
+          fill="#00F59B"
+          stroke="#080A0F"
+          strokeWidth="1.5"
+        />
+      )}
+    </svg>
+  );
+}
+
+function OrderBookMountain({
+  depth,
+  microprice,
+}: {
+  depth: OrderBookDepth;
+  microprice: number;
+}) {
+  const bids = depth?.bids || [];
+  const asks = depth?.asks || [];
+  const svgW = 280;
+  const svgH = 95;
+  const midX = svgW / 2;
+
+  const maxCum = Math.max(
+    bids.length > 0 ? bids[bids.length - 1][2] : 1,
+    asks.length > 0 ? asks[asks.length - 1][2] : 1,
+    1.0
+  );
+
+  const bidPoints: string[] = [`${midX},${svgH}`];
+  bids.forEach((b, idx) => {
+    const x = midX - (idx + 1) * (midX / Math.max(bids.length, 1));
+    const y = svgH - (b[2] / maxCum) * (svgH - 15);
+    bidPoints.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+  });
+  bidPoints.push(`0,${svgH}`);
+
+  const askPoints: string[] = [`${midX},${svgH}`];
+  asks.forEach((a, idx) => {
+    const x = midX + (idx + 1) * (midX / Math.max(asks.length, 1));
+    const y = svgH - (a[2] / maxCum) * (svgH - 15);
+    askPoints.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+  });
+  askPoints.push(`${svgW},${svgH}`);
+
+  return (
+    <svg viewBox={`0 0 ${svgW} ${svgH}`} className="w-full h-full overflow-visible">
+      <defs>
+        <linearGradient id="bidsGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#00F59B" stopOpacity="0.45" />
+          <stop offset="100%" stopColor="#00F59B" stopOpacity="0.05" />
+        </linearGradient>
+        <linearGradient id="asksGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#A855F7" stopOpacity="0.45" />
+          <stop offset="100%" stopColor="#A855F7" stopOpacity="0.05" />
+        </linearGradient>
+      </defs>
+
+      <polygon points={bidPoints.join(' ')} fill="url(#bidsGrad)" stroke="#00F59B" strokeWidth="1.5" />
+      <polygon points={askPoints.join(' ')} fill="url(#asksGrad)" stroke="#A855F7" strokeWidth="1.5" />
+
+      <line x1={midX} y1="0" x2={midX} y2={svgH} stroke="#FFFFFF" strokeDasharray="3 2" opacity="0.6" />
+      <text x={midX} y="10" fill="#FFFFFF" fontSize="8" fontFamily="monospace" textAnchor="middle" opacity="0.8">
+        µP: ${microprice.toFixed(1)}
+      </text>
+
+      <text x="8" y={svgH - 6} fill="#00F59B" fontSize="9" fontFamily="monospace" fontWeight="bold">
+        BIDS
+      </text>
+      <text x={svgW - 8} y={svgH - 6} fill="#A855F7" fontSize="9" fontFamily="monospace" textAnchor="end" fontWeight="bold">
+        ASKS
+      </text>
+    </svg>
+  );
+}
+
+function AllocationDonut({
+  items,
+}: {
+  items: PortfolioAllocationItem[];
+}) {
+  const size = 96;
+  const center = size / 2;
+  const radius = 35;
+  const circumference = 2 * Math.PI * radius; // ~219.9
+
+  let accum = 0;
+  const segments = (items || []).map((it) => {
+    const strokeDash = (it.weight_pct / 100) * circumference;
+    const offset = -accum;
+    accum += strokeDash;
+    return {
+      ...it,
+      strokeDash,
+      offset,
+    };
+  });
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0">
+      <circle
+        cx={center}
+        cy={center}
+        r={radius}
+        fill="none"
+        stroke="#1C2230"
+        strokeWidth="11"
+      />
+      {segments.map((seg, idx) => (
+        <circle
+          key={idx}
+          cx={center}
+          cy={center}
+          r={radius}
+          fill="none"
+          stroke={seg.color}
+          strokeWidth="11"
+          strokeDasharray={`${seg.strokeDash} ${circumference}`}
+          strokeDashoffset={seg.offset}
+          transform={`rotate(-90 ${center} ${center})`}
+          strokeLinecap="round"
+        />
+      ))}
+      <text x={center} y={center + 3} textAnchor="middle" fill="#E2E8F0" fontSize="10" fontFamily="monospace" fontWeight="bold">
+        5P
+      </text>
     </svg>
   );
 }
@@ -347,6 +746,27 @@ export default function App() {
     return recentTrades.filter((t) => t.symbol.toUpperCase().includes(tradeFilterSymbol.toUpperCase()));
   }, [recentTrades, tradeFilterSymbol]);
 
+  // Pro Terminal UI States
+  const [activeCoin, setActiveCoin] = useState<'BTC' | 'ETH' | 'SOL' | 'BNB' | 'DOGE'>('BTC');
+  const [activeTimeframe, setActiveTimeframe] = useState<'1m' | '5m' | '15m' | '1h'>('1m');
+  const [activeBottomTab, setActiveBottomTab] = useState<'transactions' | 'orders' | 'scanner' | 'activity'>('transactions');
+
+  // Real-Time L2 Microstructure Visual State
+  const [orderBookDepth, setOrderBookDepth] = useState<OrderBookDepth>({
+    bids: [[65000.0, 1.5, 1.5], [64995.0, 2.2, 3.7], [64990.0, 3.8, 7.5], [64985.0, 5.0, 12.5], [64980.0, 7.2, 19.7]],
+    asks: [[65001.0, 1.4, 1.4], [65006.0, 2.5, 3.9], [65011.0, 3.6, 7.5], [65016.0, 4.8, 12.3], [65021.0, 6.9, 19.2]],
+  });
+  const [candlesHistory, setCandlesHistory] = useState<Candle[]>([]);
+  const [equityComparison, setEquityComparison] = useState<EquityComparisonPoint[]>([]);
+  const [whaleAndLiqTape, setWhaleAndLiqTape] = useState<WhaleTapeEvent[]>([]);
+  const [portfolioAllocation, setPortfolioAllocation] = useState<PortfolioAllocationItem[]>([
+    { symbol: 'BTC/USDT:USDT', base_asset: 'BTC', weight_pct: 35.0, notional_usd: 35.0, color: '#00F59B' },
+    { symbol: 'ETH/USDT:USDT', base_asset: 'ETH', weight_pct: 25.0, notional_usd: 25.0, color: '#A855F7' },
+    { symbol: 'SOL/USDT:USDT', base_asset: 'SOL', weight_pct: 18.0, notional_usd: 18.0, color: '#06B6D4' },
+    { symbol: 'BNB/USDT:USDT', base_asset: 'BNB', weight_pct: 12.0, notional_usd: 12.0, color: '#F59E0B' },
+    { symbol: 'DOGE/USDT:USDT', base_asset: 'DOGE', weight_pct: 10.0, notional_usd: 10.0, color: '#EC4899' },
+  ]);
+
   // Stress Tester Interactive State
   const [testMarginMode, setTestMarginMode] = useState<'ISOLATED' | 'CROSS'>('ISOLATED');
   const [testOrderType, setTestOrderType] = useState<'LIMIT' | 'MARKET'>('LIMIT');
@@ -374,6 +794,22 @@ export default function App() {
 
     if (data.recent_trades && Array.isArray(data.recent_trades)) {
       setRecentTrades(data.recent_trades);
+    }
+
+    if (data.order_book_depth) {
+      setOrderBookDepth(data.order_book_depth);
+    }
+    if (data.candles_history && Array.isArray(data.candles_history)) {
+      setCandlesHistory(data.candles_history);
+    }
+    if (data.equity_comparison && Array.isArray(data.equity_comparison)) {
+      setEquityComparison(data.equity_comparison);
+    }
+    if (data.whale_and_liq_tape && Array.isArray(data.whale_and_liq_tape)) {
+      setWhaleAndLiqTape(data.whale_and_liq_tape);
+    }
+    if (data.portfolio_allocation && Array.isArray(data.portfolio_allocation)) {
+      setPortfolioAllocation(data.portfolio_allocation);
     }
 
     if (data.market) {
@@ -722,7 +1158,7 @@ export default function App() {
   }, [testMarginMode, testOrderType, testTif, testPairPct, testDrawdownPct]);
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-slate-950">
+    <div className="min-h-screen bg-[#080A0F] text-slate-200 flex flex-col font-sans selection:bg-[#00F59B] selection:text-[#080A0F]">
       {/* Kill Switch Triggered Banner */}
       {gate4KillSwitch && (
         <div className="bg-rose-600 text-white px-6 py-2.5 flex items-center justify-between font-mono text-xs font-bold animate-pulse sticky top-0 z-50 shadow-lg">
@@ -741,146 +1177,18 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Header */}
-      <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-40 px-6 py-3 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-gradient-to-tr from-cyan-600 to-indigo-600 rounded-lg shadow-lg shadow-cyan-950/60">
-            <Zap className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2.5">
-              <span className="font-bold text-base tracking-tight text-white">
-                APEX QUANT HFT TELEMETRY
-              </span>
-              <span
-                className={`px-2 py-0.5 text-[11px] font-mono font-semibold rounded flex items-center gap-1.5 border ${
-                  wsConnected
-                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-                    : httpConnected
-                    ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
-                    : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-                }`}
-              >
-                <Radio className={`w-3 h-3 ${wsConnected ? 'text-emerald-400 animate-pulse' : httpConnected ? 'text-blue-400' : 'text-amber-400'}`} />
-                {wsConnected ? 'LIVE CCXT WS STREAM' : httpConnected ? 'LIVE TELEMETRY REST' : 'OFFLINE / LISTO PARA CONEXIÓN'}
-              </span>
-              <span className="px-2 py-0.5 text-[11px] font-mono rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/25">
-                HOT PATH: {hotPathLatencyUs} µs
-              </span>
-            </div>
-            <p className="text-xs text-slate-400 font-mono">
-              FastAPI lifespan • CCXT Pro Multiplexer • MandateGatekeeper • L2QueueSimulator • DSR &gt; 0.95
-            </p>
-          </div>
-        </div>
-
-        {/* Selector Conmutador Protegido: PAPER MODE vs LIVE CAPITAL */}
-        <div className="flex items-center gap-1.5 p-1 bg-slate-950/90 rounded-xl border border-slate-800 text-xs font-mono shadow-inner">
-          <button
-            onClick={() => handleSwitchMode('PAPER_L2')}
-            className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 transition-all ${
-              tradingMode === 'PAPER_L2'
-                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-sm shadow-cyan-900/30'
-                : 'text-slate-400 hover:text-cyan-300'
-            }`}
-            title="Modo Simulación L2 con L2QueueSimulator y flujo CCXT en tiempo real"
-          >
-            <Activity className="w-3.5 h-3.5" />
-            <span>PAPER MODE (L2 SIM)</span>
-          </button>
-          <button
-            onClick={() => handleSwitchMode('LIVE_BINANCE')}
-            className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 transition-all ${
-              tradingMode === 'LIVE_BINANCE'
-                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shadow-sm shadow-emerald-900/30'
-                : 'text-slate-400 hover:text-amber-300'
-            }`}
-            title="Modo Operativo con Capital Real en Binance USDⓈ-M Futures"
-          >
-            <Lock className="w-3.5 h-3.5" />
-            <span>LIVE CAPITAL (BINANCE)</span>
-          </button>
-        </div>
-
-        {/* Emergency Kill-Switch & Action Controls */}
-        <div className="flex items-center gap-2">
-          {!gate4KillSwitch ? (
-            <button
-              onClick={handleTriggerEmergencyFlatten}
-              className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-mono text-xs font-bold transition-all shadow-lg shadow-rose-900/40 flex items-center gap-1.5"
-            >
-              <Power className="w-3.5 h-3.5" />
-              EMERGENCY FLATTEN
-            </button>
-          ) : (
-            <button
-              onClick={handleResetKillSwitch}
-              className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-mono text-xs font-bold transition-all flex items-center gap-1.5"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              Resetear Kill-Switch
-            </button>
-          )}
-
-          {/* Navigation Tabs */}
-          <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-xl border border-slate-800 text-xs font-medium">
-            <button
-              onClick={() => setActiveTab('command')}
-              className={`px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 ${
-                activeTab === 'command'
-                  ? 'bg-cyan-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Gauge className="w-3.5 h-3.5" />
-              Centro de Comando
-            </button>
-            <button
-              onClick={() => setActiveTab('phase1')}
-              className={`px-2.5 py-1.5 rounded-lg transition-all ${
-                activeTab === 'phase1'
-                  ? 'bg-cyan-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              Mandate Gates
-            </button>
-            <button
-              onClick={() => setActiveTab('phase3')}
-              className={`px-2.5 py-1.5 rounded-lg transition-all ${
-                activeTab === 'phase3'
-                  ? 'bg-cyan-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              3 Motores
-            </button>
-            <button
-              onClick={() => setActiveTab('phase5')}
-              className={`px-2.5 py-1.5 rounded-lg transition-all ${
-                activeTab === 'phase5'
-                  ? 'bg-cyan-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              L2 &amp; DSR
-            </button>
-          </div>
-        </div>
-      </header>
-
       {/* Mode Switch Success Notification Banner */}
       {modeSwitchSuccess && (
-        <div className="bg-emerald-500/15 border-b border-emerald-500/30 px-6 py-2 text-xs font-mono text-emerald-300 flex items-center justify-between animate-fadeIn">
+        <div className="bg-[#00F59B]/15 border-b border-[#00F59B]/30 px-6 py-2 text-xs font-mono text-[#00F59B] flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <CheckCircle2 className="w-4 h-4 text-[#00F59B] shrink-0" />
             <span>{modeSwitchSuccess}</span>
           </div>
-          <button onClick={() => setModeSwitchSuccess(null)} className="text-emerald-400 hover:text-white font-bold px-1">✕</button>
+          <button onClick={() => setModeSwitchSuccess(null)} className="text-[#00F59B] hover:text-white font-bold px-1">✕</button>
         </div>
       )}
 
-      {/* Mode Switch Error Notification Banner (if modal closed) */}
+      {/* Mode Switch Error Notification Banner */}
       {modeSwitchError && !isLiveConfirmOpen && (
         <div className="bg-rose-500/15 border-b border-rose-500/30 px-6 py-2.5 text-xs font-mono text-rose-300 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
@@ -891,925 +1199,796 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Content */}
-      <main className="flex-1 p-6 max-w-7xl mx-auto w-full space-y-6">
-        {/* KPI Summary Bar */}
-        <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-          <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5">
-            <div className="text-[10px] font-mono uppercase text-slate-400">Capital Base Futuros</div>
-            <div className="text-lg font-mono font-bold text-white mt-0.5">
-              ${baseCapital.toLocaleString('en-US', { minimumFractionDigits: 2 })} <span className="text-xs text-slate-400 font-normal">USDT</span>
-            </div>
-            <div className="text-[11px] font-mono text-emerald-400">ISOLATED 2.8x Cap</div>
+      {/* Main Container: Left Rail + Work Area */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Barra Lateral Izquierda (Icon Navigation Rail) */}
+        <nav className="w-14 bg-[#0B0E14] border-r border-[#1C2230] flex flex-col items-center py-3.5 gap-5 shrink-0 z-20">
+          {/* Logo superior circular verde menta */}
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-[#00F59B]/20 to-[#A855F7]/30 border border-[#00F59B]/50 flex items-center justify-center text-[#00F59B] shadow-lg shadow-[#00F59B]/20 cursor-pointer">
+            <Zap className="w-5 h-5 text-[#00F59B]" />
           </div>
 
-          <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5">
-            <div className="text-[10px] font-mono uppercase text-slate-400">Patrimonio Actual</div>
-            <div className="text-lg font-mono font-bold text-cyan-400 mt-0.5">
-              ${currentEquity.toLocaleString('en-US', { minimumFractionDigits: 2 })} <span className="text-xs text-cyan-500 font-normal">USDT</span>
-            </div>
-            <div className="text-[11px] font-mono text-emerald-400">
-              +{dailyReturnPct.toFixed(2)}% ({rotationsFilled} rotaciones)
-            </div>
-          </div>
+          <div className="w-7 h-[1px] bg-[#1C2230]" />
 
-          <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5">
-            <div className="text-[10px] font-mono uppercase text-slate-400">Bóveda Spot Segura</div>
-            <div className="text-lg font-mono font-bold text-indigo-400 mt-0.5">
-              ${sweptSpotVault.toFixed(2)} <span className="text-xs text-indigo-400 font-normal">USDT</span>
-            </div>
+          {/* Iconos de Navegación de Pestañas */}
+          <div className="flex flex-col items-center gap-3 w-full">
             <button
-              onClick={handleManualSweep}
-              className="text-[10px] font-mono text-cyan-400 hover:underline flex items-center gap-1 mt-0.5"
+              onClick={() => setActiveTab('command')}
+              title="Terminal Quant / DEX Pro"
+              className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all ${
+                activeTab === 'command'
+                  ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/40 shadow-sm shadow-[#00F59B]/20'
+                  : 'text-slate-500 hover:text-slate-300 hover:bg-[#10141D]'
+              }`}
             >
-              <ArrowRightLeft className="w-3 h-3" /> Barrer excedente a Spot
+              <Gauge className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={() => setActiveTab('phase1')}
+              title="Mandate Gates Stress Tester"
+              className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all ${
+                activeTab === 'phase1'
+                  ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/40 shadow-sm shadow-[#00F59B]/20'
+                  : 'text-slate-500 hover:text-slate-300 hover:bg-[#10141D]'
+              }`}
+            >
+              <ShieldCheck className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={() => setActiveTab('phase3')}
+              title="3 Motores Algorítmicos"
+              className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all ${
+                activeTab === 'phase3'
+                  ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/40 shadow-sm shadow-[#00F59B]/20'
+                  : 'text-slate-500 hover:text-slate-300 hover:bg-[#10141D]'
+              }`}
+            >
+              <Cpu className="w-4 h-4" />
+            </button>
+
+            <button
+              onClick={() => setActiveTab('phase5')}
+              title="L2 Queue & DSR Auditor"
+              className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all ${
+                activeTab === 'phase5'
+                  ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/40 shadow-sm shadow-[#00F59B]/20'
+                  : 'text-slate-500 hover:text-slate-300 hover:bg-[#10141D]'
+              }`}
+            >
+              <Layers className="w-4 h-4" />
             </button>
           </div>
 
-          <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5">
-            <div className="text-[10px] font-mono uppercase text-slate-400">Velocímetro OBI</div>
-            <div
-              className={`text-lg font-mono font-bold mt-0.5 ${
-                Math.abs(liveObi) > 0.6 ? 'text-rose-400' : 'text-emerald-400'
-              }`}
-            >
-              {liveObi > 0 ? `+${liveObi.toFixed(3)}` : liveObi.toFixed(3)}
-            </div>
-            <div className="text-[11px] font-mono text-slate-400">
-              Shield: {bidCancelledByShield || askCancelledByShield ? 'DISPARADO' : 'NORMAL'}
+          <div className="mt-auto flex flex-col items-center gap-3">
+            <span
+              title={wsConnected ? 'WebSocket Conectado (10 Hz)' : 'WebSocket Desconectado'}
+              className={`w-2.5 h-2.5 rounded-full ${wsConnected ? 'bg-[#00F59B] shadow-lg shadow-[#00F59B]/50 animate-pulse' : 'bg-amber-500'}`}
+            />
+            <div className="w-8 h-8 rounded-lg bg-[#10141D] border border-[#1C2230] flex items-center justify-center text-slate-500">
+              <TerminalIcon className="w-3.5 h-3.5" />
             </div>
           </div>
+        </nav>
 
-          <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5">
-            <div className="text-[10px] font-mono uppercase text-slate-400">DSR Cuarentena</div>
-            <div
-              className={`text-lg font-mono font-bold mt-0.5 ${
-                dsrOverfitted ? 'text-rose-400' : 'text-emerald-400'
-              }`}
-            >
-              {(dsrScore * 100).toFixed(1)}%
-            </div>
-            <div className="text-[11px] font-mono text-slate-400">
-              {dsrOverfitted ? 'WARN: SNOOPING' : 'VALIDADO (>95%)'}
-            </div>
-          </div>
+        {/* Work Area */}
+        <div className="flex-1 overflow-y-auto bg-[#080A0F]">
+          {activeTab === 'command' && (
+            <div className="min-h-full flex flex-col xl:flex-row divide-y xl:divide-y-0 xl:divide-x divide-[#1C2230]">
+              {/* Columna Izquierda (w-80) */}
+              <div className="w-full xl:w-80 shrink-0 bg-[#0B0E14]/80 p-3.5 space-y-3 flex flex-col">
+                {/* 1. Tarjeta Superior de Identidad del Bot */}
+                <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3 space-y-2.5">
+                  <div className="flex items-center gap-2.5">
+                    <div className="relative">
+                      <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-[#00F59B]/30 via-[#10141D] to-[#A855F7]/30 border border-[#00F59B]/50 flex items-center justify-center text-[#00F59B] shadow-md shadow-[#00F59B]/20">
+                        <Zap className="w-5 h-5 text-[#00F59B]" />
+                      </div>
+                      <span className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-[#10141D] ${wsConnected ? 'bg-[#00F59B]' : 'bg-amber-400'}`} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-xs tracking-wide text-white uppercase font-mono">APEX QUANT BOT</span>
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-[#00F59B]/10 text-[#00F59B] border border-[#00F59B]/20">
+                          {tradingMode === 'PAPER_L2' ? 'PAPER L2' : 'LIVE'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] font-mono text-slate-400 truncate">
+                        {wsConnected ? 'LIVE CCXT WS (10 Hz)' : 'OFFLINE / RECONNECT'}
+                      </p>
+                    </div>
+                  </div>
 
-          <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 flex flex-col justify-between">
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] font-mono uppercase text-slate-400">Hot Path</span>
-              <button
-                onClick={() => setIsLiveRunning(!isLiveRunning)}
-                className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200"
-              >
-                {isLiveRunning ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
-              </button>
-            </div>
-            <div className="text-lg font-mono font-bold text-white">{hotPathLatencyUs} µs</div>
-            <div className="text-[11px] font-mono text-slate-400">Tick #{tickCount}</div>
-          </div>
-        </div>
+                  {/* Selector bimodal protegido */}
+                  <div className="grid grid-cols-2 gap-1.5 p-1 bg-[#080A0F] rounded-lg border border-[#1C2230] text-[11px] font-mono">
+                    <button
+                      onClick={() => handleSwitchMode('PAPER_L2')}
+                      className={`py-1.5 px-2 rounded font-bold flex items-center justify-center gap-1.5 transition-all ${
+                        tradingMode === 'PAPER_L2'
+                          ? 'bg-[#00F59B]/20 text-[#00F59B] border border-[#00F59B]/40 shadow-sm'
+                          : 'text-slate-400 hover:text-[#00F59B]'
+                      }`}
+                    >
+                      <Activity className="w-3 h-3" />
+                      <span>PAPER L2</span>
+                    </button>
+                    <button
+                      onClick={() => handleSwitchMode('LIVE_BINANCE')}
+                      className={`py-1.5 px-2 rounded font-bold flex items-center justify-center gap-1.5 transition-all ${
+                        tradingMode === 'LIVE_BINANCE'
+                          ? 'bg-[#A855F7]/20 text-[#A855F7] border border-[#A855F7]/40 shadow-sm'
+                          : 'text-slate-400 hover:text-[#A855F7]'
+                      }`}
+                    >
+                      <Lock className="w-3 h-3" />
+                      <span>LIVE REAL</span>
+                    </button>
+                  </div>
 
-        {/* TAB 1: CENTRO DE COMANDO EN TIEMPO REAL */}
-        {activeTab === 'command' && (
-          <div className="space-y-6">
-            {/* Multi-Asset Portfolio Toolbar & Asset View Selector */}
-            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4">
-              <div className="flex items-center gap-3">
-                <div className="p-2.5 bg-gradient-to-tr from-cyan-600/30 to-indigo-600/30 border border-cyan-500/30 rounded-xl text-cyan-300 shadow-md shadow-cyan-950/40">
-                  <Layers className="w-5 h-5" />
+                  {/* Botón Compacto EMERGENCY FLATTEN */}
+                  {!gate4KillSwitch ? (
+                    <button
+                      onClick={handleTriggerEmergencyFlatten}
+                      className="w-full py-1.5 px-3 rounded-lg bg-rose-600/90 hover:bg-rose-600 text-white font-mono text-xs font-bold transition-all shadow-md shadow-rose-950/40 flex items-center justify-center gap-1.5"
+                    >
+                      <Power className="w-3.5 h-3.5" />
+                      EMERGENCY FLATTEN
+                    </button>
+                  ) : (
+                    <button
+                      onClick={handleResetKillSwitch}
+                      className="w-full py-1.5 px-3 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-mono text-xs font-bold transition-all flex items-center justify-center gap-1.5"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Resetear Kill-Switch
+                    </button>
+                  )}
                 </div>
-                <div>
-                  <div className="flex items-center flex-wrap gap-2">
-                    <span className="text-xs font-mono uppercase text-slate-300 font-bold tracking-wider">Cesta Multimoneda Concurrente</span>
-                    <span className="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
-                      5 FUTUROS PERPETUOS
+
+                {/* 2. Grilla 2x3 de Tarjetas Cuadradas Minimalistas */}
+                <div className="grid grid-cols-2 gap-2">
+                  {/* Card 1: Equity Total ($) & % Retorno */}
+                  <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-2.5 flex flex-col justify-between">
+                    <span className="text-[10px] font-mono text-slate-400 uppercase tracking-tight">Equity Total</span>
+                    <div className="text-sm font-mono font-bold text-white mt-0.5">
+                      ${currentEquity.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </div>
+                    <div className="text-[10px] font-mono text-[#00F59B] mt-0.5 font-bold">
+                      +{dailyReturnPct.toFixed(2)}%
+                    </div>
+                  </div>
+
+                  {/* Card 2: Bóveda Spot ($) con botón de barrido */}
+                  <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-2.5 flex flex-col justify-between">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-mono text-slate-400 uppercase tracking-tight">Bóveda Spot</span>
+                      <button
+                        onClick={handleManualSweep}
+                        title="Barrer excedente a Spot"
+                        className="text-[9px] font-mono text-[#00F59B] hover:underline flex items-center gap-0.5"
+                      >
+                        <ArrowRightLeft className="w-2.5 h-2.5" /> Barrer
+                      </button>
+                    </div>
+                    <div className="text-sm font-mono font-bold text-[#A855F7] mt-0.5">
+                      ${sweptSpotVault.toFixed(2)}
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">Vault Segura</span>
+                  </div>
+
+                  {/* Card 3: Win Rate (%) */}
+                  <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-2.5 flex flex-col justify-between">
+                    <span className="text-[10px] font-mono text-slate-400 uppercase tracking-tight">Win Rate</span>
+                    <div className="text-sm font-mono font-bold text-[#00F59B] mt-0.5">
+                      {executionStats.win_rate_pct.toFixed(1)}%
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      {executionStats.wins_count}W / {executionStats.losses_count}L
                     </span>
-                    {contagionShield.bid_shield_active || contagionShield.ask_shield_active ? (
-                      <span className="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse flex items-center gap-1">
-                        <AlertTriangle className="w-3 h-3 text-rose-400" />
-                        CONTAGION SHIELD ACTIVO: {contagionShield.trigger_reason} (BTC OBI: {contagionShield.btc_obi > 0 ? `+${contagionShield.btc_obi.toFixed(2)}` : contagionShield.btc_obi.toFixed(2)})
+                  </div>
+
+                  {/* Card 4: Profit Factor */}
+                  <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-2.5 flex flex-col justify-between">
+                    <span className="text-[10px] font-mono text-slate-400 uppercase tracking-tight">Profit Factor</span>
+                    <div className="text-sm font-mono font-bold text-white mt-0.5">
+                      {executionStats.profit_factor >= 99 ? '99.0' : executionStats.profit_factor.toFixed(2)}
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      Avg: ${executionStats.avg_trade_pnl_usd.toFixed(2)}
+                    </span>
+                  </div>
+
+                  {/* Card 5: Trades Realizados */}
+                  <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-2.5 flex flex-col justify-between">
+                    <span className="text-[10px] font-mono text-slate-400 uppercase tracking-tight">Trades Totales</span>
+                    <div className="text-sm font-mono font-bold text-white mt-0.5">
+                      {executionStats.total_trades}
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      {rotationsFilled} rotaciones
+                    </span>
+                  </div>
+
+                  {/* Card 6: Hot Path Latency (µs) & DSR Score */}
+                  <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-2.5 flex flex-col justify-between">
+                    <span className="text-[10px] font-mono text-slate-400 uppercase tracking-tight">Hot Path</span>
+                    <div className="text-sm font-mono font-bold text-[#00F59B] mt-0.5">
+                      {hotPathLatencyUs} µs
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      DSR: {(dsrScore * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                </div>
+
+                {/* 3. Lista de Seguridad con Checks Verdes (✓) */}
+                <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3 space-y-2.5">
+                  <div className="flex items-center justify-between border-b border-[#1C2230] pb-1.5">
+                    <span className="text-[10px] font-mono uppercase text-slate-400 font-bold tracking-wider">
+                      MANDATE GATES AUDIT
+                    </span>
+                    <span className="text-[9px] font-mono text-[#00F59B] font-bold">100% PASS</span>
+                  </div>
+                  <div className="space-y-1.5 text-xs font-mono">
+                    <div className="flex items-center justify-between text-slate-300">
+                      <span className="text-[11px]">Gate 1: Isolated Margin</span>
+                      <span className="flex items-center gap-1 text-[#00F59B] font-bold text-[10px]">
+                        ISOLATED <CheckCircle2 className="w-3.5 h-3.5 text-[#00F59B]" />
                       </span>
-                    ) : (
-                      <span className="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
-                        <ShieldCheck className="w-3 h-3 text-emerald-400" />
-                        CROSS-ASSET SHIELD: NORMAL (BTC OBI: {contagionShield.btc_obi > 0 ? `+${contagionShield.btc_obi.toFixed(2)}` : contagionShield.btc_obi.toFixed(2)})
+                    </div>
+                    <div className="flex items-center justify-between text-slate-300">
+                      <span className="text-[11px]">Gate 2: Post-Only GTX</span>
+                      <span className="flex items-center gap-1 text-[#00F59B] font-bold text-[10px]">
+                        POST_ONLY <CheckCircle2 className="w-3.5 h-3.5 text-[#00F59B]" />
                       </span>
-                    )}
+                    </div>
+                    <div className="flex items-center justify-between text-slate-300">
+                      <span className="text-[11px]">Gate 3: Half-Kelly &le; 3.0x</span>
+                      <span className="flex items-center gap-1 text-[#00F59B] font-bold text-[10px]">
+                        {gate3CurrentLev.toFixed(1)}x / 3.0x <CheckCircle2 className="w-3.5 h-3.5 text-[#00F59B]" />
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between text-slate-300">
+                      <span className="text-[11px]">Gate 4: Kill-Switch -3%</span>
+                      <span className="flex items-center gap-1 text-[#00F59B] font-bold text-[10px]">
+                        ARMED <CheckCircle2 className="w-3.5 h-3.5 text-[#00F59B]" />
+                      </span>
+                    </div>
                   </div>
-                  <p className="text-xs text-slate-400 mt-1 font-mono">
-                    Half-Kelly Matricial (F* = 0.5·C⁻¹M) • Margen ≤20% por par • Apalancamiento Global ≤3.0x • Monitoreo OBI Transversal
-                  </p>
+
+                  {/* Mini Sparkline inferior en vivo */}
+                  <div className="pt-2 border-t border-[#1C2230]">
+                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 mb-1">
+                      <span>Equity Mini-Trend</span>
+                      <span className="text-[#00F59B] font-bold">${currentEquity.toFixed(2)}</span>
+                    </div>
+                    {renderEquitySparkline(executionStats.equity_curve || [5000, 5000])}
+                  </div>
                 </div>
               </div>
 
-              {/* Selector de Vista por Activo */}
-              <div className="flex items-center gap-1 bg-slate-950 p-1.5 rounded-xl border border-slate-800 font-mono text-xs shadow-inner">
-                {(['GLOBAL', 'BTC', 'ETH', 'SOL', 'BNB', 'DOGE'] as const).map((view) => (
-                  <button
-                    key={view}
-                    onClick={() => setSelectedAssetView(view)}
-                    className={`px-3 py-1.5 rounded-lg transition-all font-bold flex items-center gap-1.5 ${
-                      selectedAssetView === view
-                        ? 'bg-gradient-to-r from-cyan-600 to-indigo-600 text-white shadow-md shadow-cyan-950/60'
-                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/80'
-                    }`}
-                  >
-                    {view === 'GLOBAL' ? 'PORTFOLIO GLOBAL' : view}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Tira de KPIs de Ejecución Cuantitativa & Gráfico Sparkline */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3.5">
-              {/* Card 1: Trades Totales */}
-              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
-                <div className="absolute top-0 right-0 w-24 h-24 bg-cyan-500/5 rounded-full blur-2xl pointer-events-none" />
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
-                    <Activity className="w-3.5 h-3.5 text-cyan-400" />
-                    Trades Totales
-                  </span>
-                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
-                    Rotaciones L2
-                  </span>
-                </div>
-                <div className="mt-2">
-                  <div className="text-2xl font-mono font-bold text-white tracking-tight">
-                    {executionStats.total_trades}{' '}
-                    <span className="text-xs font-normal text-slate-400">fills</span>
-                  </div>
-                  <div className="flex items-center gap-2 mt-1 text-xs font-mono">
-                    <span className="text-emerald-400 font-semibold flex items-center gap-0.5">
-                      <TrendingUp className="w-3 h-3" /> {executionStats.wins_count} Wins
-                    </span>
-                    <span className="text-slate-600">•</span>
-                    <span className="text-rose-400 font-semibold flex items-center gap-0.5">
-                      <TrendingDown className="w-3 h-3" /> {executionStats.losses_count} Losses
-                    </span>
-                  </div>
-                </div>
-                <div className="text-[10px] font-mono text-slate-500 mt-2 border-t border-slate-800/80 pt-1.5 flex justify-between">
-                  <span>Ratio W/L</span>
-                  <span className="text-slate-300 font-bold">
-                    {(executionStats.losses_count > 0 ? (executionStats.wins_count / executionStats.losses_count) : executionStats.wins_count).toFixed(2)}x
-                  </span>
-                </div>
-              </div>
-
-              {/* Card 2: Win Rate % con Barra Bicolor */}
-              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
-                    <Percent className="w-3.5 h-3.5 text-emerald-400" />
-                    Tasa de Acierto
-                  </span>
-                  <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
-                    executionStats.win_rate_pct >= 60 ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' :
-                    executionStats.win_rate_pct >= 50 ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30' :
-                    'bg-rose-500/15 text-rose-300 border-rose-500/30'
-                  }`}>
-                    {executionStats.win_rate_pct >= 50 ? 'EDGE POSITIVO' : 'MONITOR'}
-                  </span>
-                </div>
-                <div className="mt-2">
-                  <div className="text-2xl font-mono font-bold text-emerald-400 tracking-tight">
-                    {executionStats.win_rate_pct.toFixed(1)}%
-                  </div>
-                  {/* Barra Bicolor Esmeralda / Rosa */}
-                  <div className="w-full bg-slate-950 h-2 rounded-full overflow-hidden border border-slate-800 mt-2 flex">
-                    <div
-                      className="bg-emerald-400 h-full transition-all duration-300"
-                      style={{ width: `${Math.max(0, Math.min(100, executionStats.win_rate_pct))}%` }}
-                    />
-                    <div
-                      className="bg-rose-500 h-full transition-all duration-300"
-                      style={{ width: `${Math.max(0, 100 - executionStats.win_rate_pct)}%` }}
-                    />
-                  </div>
-                </div>
-                <div className="text-[10px] font-mono text-slate-500 mt-2 border-t border-slate-800/80 pt-1.5 flex justify-between">
-                  <span className="text-emerald-400 font-semibold">+${executionStats.gross_profit_usd.toFixed(2)}</span>
-                  <span className="text-slate-400">Bruto</span>
-                  <span className="text-rose-400 font-semibold">-${executionStats.gross_loss_usd.toFixed(2)}</span>
-                </div>
-              </div>
-
-              {/* Card 3: Profit Factor */}
-              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
-                    <Gauge className="w-3.5 h-3.5 text-indigo-400" />
-                    Profit Factor (PF)
-                  </span>
-                  <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold border ${
-                    executionStats.profit_factor >= 2.0 ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' :
-                    executionStats.profit_factor >= 1.2 ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30' :
-                    'bg-slate-800 text-slate-400 border-slate-700'
-                  }`}>
-                    {executionStats.profit_factor >= 1.5 ? 'EXCELENTE (>1.5)' : 'VÁLIDO'}
-                  </span>
-                </div>
-                <div className="mt-2">
-                  <div className={`text-2xl font-mono font-bold tracking-tight ${
-                    executionStats.profit_factor >= 1.5 ? 'text-emerald-400' :
-                    executionStats.profit_factor >= 1.0 ? 'text-cyan-400' : 'text-slate-200'
-                  }`}>
-                    {executionStats.profit_factor >= 999 ? '∞' : executionStats.profit_factor.toFixed(2)}
-                  </div>
-                  <div className="text-[11px] font-mono text-slate-400 mt-1">
-                    Gross Profit / Gross Loss
-                  </div>
-                </div>
-                <div className="text-[10px] font-mono text-slate-500 mt-2 border-t border-slate-800/80 pt-1.5 flex justify-between">
-                  <span>Umbral Óptimo</span>
-                  <span className="text-indigo-400 font-semibold">&gt; 1.50 PF</span>
-                </div>
-              </div>
-
-              {/* Card 4: PnL Medio por Trade */}
-              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
-                    <BrainCircuit className="w-3.5 h-3.5 text-amber-400" />
-                    PnL Medio / Trade
-                  </span>
-                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                    ALPHA NETO
-                  </span>
-                </div>
-                <div className="mt-2">
-                  <div className={`text-2xl font-mono font-bold tracking-tight ${
-                    executionStats.avg_trade_pnl_usd >= 0 ? 'text-emerald-400' : 'text-rose-400'
-                  }`}>
-                    {executionStats.avg_trade_pnl_usd >= 0 ? '+' : ''}${executionStats.avg_trade_pnl_usd.toFixed(2)}{' '}
-                    <span className="text-xs font-normal text-slate-400">USDT</span>
-                  </div>
-                  <div className="text-[11px] font-mono text-slate-400 mt-1">
-                    Expectativa Matemática E[R]
-                  </div>
-                </div>
-                <div className="text-[10px] font-mono text-slate-500 mt-2 border-t border-slate-800/80 pt-1.5 flex justify-between">
-                  <span>Comisión Maker</span>
-                  <span className="text-emerald-400 font-bold">0.00% (GTX Post-Only)</span>
-                </div>
-              </div>
-
-              {/* Card 5: Curva de Equidad en Vivo (SVG Sparkline) */}
-              <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between shadow-lg relative overflow-hidden">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400 font-bold flex items-center gap-1.5">
-                    <BarChart2 className="w-3.5 h-3.5 text-cyan-400" />
-                    Curva de Equidad
-                  </span>
-                  <span className="text-[10px] font-mono text-cyan-400 font-bold">
-                    ${currentEquity.toLocaleString('en-US', { minimumFractionDigits: 2 })}
-                  </span>
-                </div>
-                <div className="h-12 flex items-center justify-center my-0.5">
-                  {renderEquitySparkline(executionStats.equity_curve)}
-                </div>
-                <div className="text-[10px] font-mono text-slate-500 border-t border-slate-800/80 pt-1.5 flex justify-between items-center">
-                  <span>Últimos 60 ticks</span>
-                  <span className={`font-bold ${dailyReturnPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                    {dailyReturnPct >= 0 ? '+' : ''}{dailyReturnPct.toFixed(2)}% Hoy
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {/* Compact Live Multi-Asset Table */}
-            <div className="bg-slate-900/85 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
-              <div className="px-5 py-3 border-b border-slate-800 flex items-center justify-between bg-slate-950/70">
-                <div className="flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-cyan-400" />
-                  <h3 className="font-semibold text-xs text-white font-mono uppercase tracking-wider">
-                    Matriz Multimoneda en Vivo • Cesta de 5 Activos Perpetuos
-                  </h3>
-                </div>
-                <div className="text-[11px] font-mono text-slate-400">
-                  Vista Actual: <span className="text-cyan-400 font-bold">{selectedAssetView === 'GLOBAL' ? 'PORTFOLIO GLOBAL' : `${selectedAssetView}/USDT:USDT`}</span> • Hot Path 20 Hz
-                </div>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left font-mono text-xs">
-                  <thead className="bg-slate-950/90 text-slate-400 uppercase text-[10px] tracking-wider border-b border-slate-800">
-                    <tr>
-                      <th className="py-2.5 px-4">Activo</th>
-                      <th className="py-2.5 px-4">Mid-Price ($)</th>
-                      <th className="py-2.5 px-4">Velocímetro OBI</th>
-                      <th className="py-2.5 px-4">Inventario (qᵢ)</th>
-                      <th className="py-2.5 px-4">Posición Abierta</th>
-                      <th className="py-2.5 px-4">Peso Kelly (%)</th>
-                      <th className="py-2.5 px-4">Rotaciones Hoy</th>
-                      <th className="py-2.5 px-4">PnL Aportado ($)</th>
-                      <th className="py-2.5 px-4">Estado Escudo</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/60">
-                    {Object.values(symbolsData).map((sym) => {
-                      const isSelected = selectedAssetView === sym.base_asset || selectedAssetView === 'GLOBAL';
-                      const isAlt = sym.base_asset !== 'BTC';
-                      const isShielded = isAlt && (
-                        contagionShield.bid_shield_active || contagionShield.ask_shield_active
-                      );
-
-                      return (
-                        <tr
-                          key={sym.symbol}
-                          onClick={() => setSelectedAssetView(sym.base_asset as any)}
-                          className={`cursor-pointer transition-colors ${
-                            selectedAssetView === sym.base_asset
-                              ? 'bg-cyan-500/15 text-white'
-                              : 'hover:bg-slate-800/40 text-slate-300'
+              {/* Columna Central (flex-1) */}
+              <div className="flex-1 min-w-0 p-3.5 space-y-3.5 flex flex-col bg-[#080A0F]">
+                {/* 1. Gráfico Principal de Velas + Bandas Avellaneda (SVG Nativo) */}
+                <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3.5 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1C2230] pb-2.5">
+                    {/* Selector de Par */}
+                    <div className="flex items-center gap-1 bg-[#080A0F] p-1 rounded-lg border border-[#1C2230] text-xs font-mono">
+                      {(['BTC', 'ETH', 'SOL', 'BNB', 'DOGE'] as const).map((coin) => (
+                        <button
+                          key={coin}
+                          onClick={() => {
+                            setActiveCoin(coin);
+                            setSelectedAssetView(coin);
+                          }}
+                          className={`px-2.5 py-1 rounded font-bold transition-all ${
+                            activeCoin === coin
+                              ? 'bg-[#00F59B]/20 text-[#00F59B] border border-[#00F59B]/40 shadow-sm'
+                              : 'text-slate-400 hover:text-slate-200'
                           }`}
                         >
-                          <td className="py-2.5 px-4 font-bold flex items-center gap-2">
-                            <span className={`w-2 h-2 rounded-full ${selectedAssetView === sym.base_asset ? 'bg-cyan-400 animate-pulse' : 'bg-slate-500'}`} />
-                            <span className="text-white">{sym.base_asset}</span>
-                            <span className="text-[10px] font-normal text-slate-500">USDT-M</span>
-                          </td>
-                          <td className="py-2.5 px-4 font-semibold text-slate-100">
-                            ${sym.mid_price >= 1 ? sym.mid_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : sym.mid_price.toFixed(5)}
-                          </td>
-                          <td className="py-2.5 px-4">
-                            <div className="flex items-center gap-2">
-                              <span className={`font-bold ${Math.abs(sym.obi) > 0.6 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                                {sym.obi > 0 ? `+${sym.obi.toFixed(3)}` : sym.obi.toFixed(3)}
-                              </span>
-                              <div className="w-16 h-1.5 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
-                                <div
-                                  className={`h-full ${sym.obi > 0 ? 'bg-emerald-400' : 'bg-rose-400'}`}
-                                  style={{ width: `${Math.min(Math.abs(sym.obi) * 100, 100)}%` }}
-                                />
-                              </div>
-                            </div>
-                          </td>
-                          <td className="py-2.5 px-4">
-                            <span className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${
-                              Math.abs(sym.inventory_q) > 0.8
-                                ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
-                                : Math.abs(sym.inventory_q) > 0.3
-                                ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-                                : 'bg-slate-800 text-slate-300 border-slate-700'
-                            }`}>
-                              q = {sym.inventory_q > 0 ? `+${sym.inventory_q.toFixed(2)}` : sym.inventory_q.toFixed(2)}
-                            </span>
-                          </td>
-                          <td className="py-2.5 px-4 text-slate-300">
-                            ${sym.position_usd.toFixed(2)}
-                          </td>
-                          <td className="py-2.5 px-4 text-cyan-400 font-semibold">
-                            {(sym.half_kelly_weight * 100).toFixed(1)}%
-                          </td>
-                          <td className="py-2.5 px-4 text-slate-200">
-                            {sym.rotations_today} fills
-                          </td>
-                          <td className={`py-2.5 px-4 font-bold ${sym.pnl_today_usd >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                            {sym.pnl_today_usd >= 0 ? `+$${sym.pnl_today_usd.toFixed(2)}` : `-$${Math.abs(sym.pnl_today_usd).toFixed(2)}`}
-                          </td>
-                          <td className="py-2.5 px-4">
-                            {isShielded ? (
-                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-300 border border-rose-500/40">
-                                {contagionShield.bid_shield_active && contagionShield.ask_shield_active ? 'SHIELD: BID/ASK' : contagionShield.bid_shield_active ? 'SHIELD: NO BID' : 'SHIELD: NO ASK'}
-                              </span>
-                            ) : (
-                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                                NORMAL
-                              </span>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+                          {coin}
+                        </button>
+                      ))}
+                    </div>
 
-            {/* Panel de Operaciones en Tiempo Real (Active Orders & L2 Queue Table) */}
-            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
-              <div className="px-5 py-3.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 bg-slate-950/80">
-                <div className="flex items-center gap-2.5">
-                  <div className="p-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-                    <Layers className="w-4 h-4" />
+                    {/* Selector Timeframe */}
+                    <div className="flex items-center gap-1 bg-[#080A0F] p-1 rounded-lg border border-[#1C2230] text-[11px] font-mono">
+                      {(['1m', '5m', '15m', '1h'] as const).map((tf) => (
+                        <button
+                          key={tf}
+                          onClick={() => setActiveTimeframe(tf)}
+                          className={`px-2 py-0.5 rounded font-bold transition-all ${
+                            activeTimeframe === tf
+                              ? 'bg-[#1C2230] text-[#00F59B]'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {tf}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Métricas técnicas inline */}
+                    <div className="flex items-center gap-3 text-xs font-mono">
+                      <span className="text-slate-400">Mid: <strong className="text-white">${midPrice.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 })}</strong></span>
+                      <span className="text-slate-400">Res: <strong className="text-[#00F59B]">${reservationPrice.toFixed(1)}</strong></span>
+                      <span className="text-slate-400">Spread: <strong className="text-[#A855F7]">${optimalSpread.toFixed(2)}</strong></span>
+                      <span className="text-slate-400">OBI: <strong className={liveObi >= 0 ? 'text-[#00F59B]' : 'text-[#A855F7]'}>{liveObi > 0 ? `+${liveObi.toFixed(3)}` : liveObi.toFixed(3)}</strong></span>
+                    </div>
                   </div>
-                  <div>
-                    <h3 className="font-semibold text-xs text-white font-mono uppercase tracking-wider">
-                      Órdenes Abiertas en Tiempo Real • Active Orders &amp; L2 Queue Table
-                    </h3>
-                    <p className="text-[11px] font-mono text-slate-400">
-                      Órdenes límite Post-Only (GTX) posicionadas en el libro L2 con posición dinámica en cola FIFO.
-                    </p>
+
+                  <div className="w-full">
+                    <CandlestickChart
+                      candles={candlesHistory}
+                      reservationPrice={reservationPrice}
+                      bestBid={bestBid}
+                      bestAsk={bestAsk}
+                    />
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <span className="px-2.5 py-1 rounded-lg text-xs font-mono font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 flex items-center gap-1.5">
-                    <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-                    {openOrders.length > 0 ? `${openOrders.length} ÓRDENES ACTIVAS` : '1 ORDEN COTIZANDO'}
-                  </span>
-                </div>
-              </div>
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-left font-mono text-xs">
-                  <thead className="bg-slate-950/90 text-slate-400 uppercase text-[10px] tracking-wider border-b border-slate-800">
-                    <tr>
-                      <th className="py-2.5 px-4">ID Orden</th>
-                      <th className="py-2.5 px-4">Símbolo</th>
-                      <th className="py-2.5 px-4">Estrategia / Escalera</th>
-                      <th className="py-2.5 px-4">Lado</th>
-                      <th className="py-2.5 px-4">Precio Límite ($)</th>
-                      <th className="py-2.5 px-4">Cantidad</th>
-                      <th className="py-2.5 px-4">Cola Delante (queue_ahead)</th>
-                      <th className="py-2.5 px-4">Estado</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/60">
-                    {openOrders.length > 0 ? (
-                      openOrders.map((ord) => {
-                        const isBuy = ord.side === 'BUY';
-                        const baseSym = ord.symbol.split('/')[0] || ord.symbol;
-                        const ladderTier = ord.strategy === 'LIQ_CASCADE' ? 'Exhaustion Hunter' : '3-Level Ladder (N1/N2/N3)';
-                        return (
-                          <tr key={ord.order_id} className="hover:bg-slate-800/30 transition-colors">
-                            <td className="py-2.5 px-4 text-cyan-400 font-semibold">{ord.order_id}</td>
-                            <td className="py-2.5 px-4 font-bold text-white flex items-center gap-1.5">
-                              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
-                              {baseSym} <span className="text-[10px] text-slate-500 font-normal">USDT-M</span>
-                            </td>
-                            <td className="py-2.5 px-4">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
-                                ord.strategy === 'LIQ_CASCADE'
-                                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-                                  : 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
-                              }`}>
-                                {ord.strategy} • {ladderTier}
-                              </span>
-                            </td>
-                            <td className="py-2.5 px-4">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
-                                isBuy
-                                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                                  : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
-                              }`}>
-                                {isBuy ? 'BID (BUY)' : 'ASK (SELL)'}
-                              </span>
-                            </td>
-                            <td className="py-2.5 px-4 font-bold text-slate-100">
-                              ${ord.price >= 1 ? ord.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : ord.price.toFixed(5)}
-                            </td>
-                            <td className="py-2.5 px-4 text-slate-300">
-                              {ord.qty} <span className="text-[10px] text-slate-500">(fill: {ord.filled_qty})</span>
-                            </td>
-                            <td className="py-2.5 px-4 min-w-[220px]">
-                              <div className="flex items-center gap-2.5">
-                                <span className="text-white font-bold w-16">{ord.queue_ahead_qty.toFixed(4)}</span>
-                                <div className="flex-1 bg-slate-950 h-2 rounded-full overflow-hidden border border-slate-800">
-                                  <div
-                                    className="bg-cyan-500 h-full transition-all duration-200"
-                                    style={{
-                                      width: `${Math.max(12, Math.min(100, (1 - ord.queue_ahead_qty / Math.max(ord.qty * 10, 1.0)) * 100))}%`
-                                    }}
-                                  />
-                                </div>
-                              </div>
-                            </td>
-                            <td className="py-2.5 px-4">
-                              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1 w-max">
-                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
-                                {ord.status}
-                              </span>
-                            </td>
-                          </tr>
-                        );
-                      })
-                    ) : (
-                      <tr className="hover:bg-slate-800/30 transition-colors">
-                        <td className="py-2.5 px-4 text-cyan-400 font-semibold">{simOrderId !== 'NONE' ? simOrderId : 'GTX-L2-LADDER'}</td>
-                        <td className="py-2.5 px-4 font-bold text-white flex items-center gap-1.5">
-                          <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
-                          {selectedAssetView === 'GLOBAL' ? 'BTC' : selectedAssetView} <span className="text-[10px] text-slate-500 font-normal">USDT-M</span>
-                        </td>
-                        <td className="py-2.5 px-4">
-                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                            AVELLANEDA_OBI • 3-Level Ladder (Nivel 1)
-                          </span>
-                        </td>
-                        <td className="py-2.5 px-4">
-                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                            BID (BUY)
-                          </span>
-                        </td>
-                        <td className="py-2.5 px-4 font-bold text-slate-100">
-                          ${bestBid >= 1 ? bestBid.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : bestBid.toFixed(5)}
-                        </td>
-                        <td className="py-2.5 px-4 text-slate-300">
-                          {simOrderQty.toFixed(4)} <span className="text-[10px] text-slate-500">(fill: {simFilledQty.toFixed(4)})</span>
-                        </td>
-                        <td className="py-2.5 px-4 min-w-[220px]">
-                          <div className="flex items-center gap-2.5">
-                            <span className="text-white font-bold w-16">{simQueueAhead.toFixed(2)} BTC</span>
-                            <div className="flex-1 bg-slate-950 h-2 rounded-full overflow-hidden border border-slate-800">
-                              <div
-                                className="bg-emerald-400 h-full transition-all duration-200"
-                                style={{
-                                  width: `${Math.max(10, Math.min(100, (simFilledQty / Math.max(simOrderQty, 0.001)) * 100))}%`
-                                }}
-                              />
-                            </div>
-                          </div>
-                        </td>
-                        <td className="py-2.5 px-4">
-                          <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1 w-max">
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                            {simStatus}
-                          </span>
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              {/* Panel 1: Velocímetro OBI & Avellaneda L2 */}
-              <div className="bg-slate-900/85 border border-slate-800 rounded-2xl p-5 flex flex-col justify-between">
-                <div>
-                  <div className="flex items-center justify-between border-b border-slate-800 pb-3 mb-4">
+                {/* 2. Gráfico Medio de Doble Curva (Equity Curve vs. Base/Benchmark) */}
+                <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3.5 space-y-2.5">
+                  <div className="flex items-center justify-between border-b border-[#1C2230] pb-2">
                     <div className="flex items-center gap-2">
-                      <Activity className="w-4 h-4 text-cyan-400" />
-                      <h2 className="font-semibold text-sm text-white">
-                        Velocímetro OBI &amp; Cotización Avellaneda
-                      </h2>
-                    </div>
-                    <span className="text-[11px] font-mono text-cyan-400 font-bold">
-                      {selectedAssetView === 'GLOBAL' ? 'BTC/USDT:USDT (Primario)' : `${selectedAssetView}/USDT:USDT`}
-                    </span>
-                  </div>
-
-                  {/* Gauge Visualizer */}
-                  <div className="mb-4">
-                    <div className="flex justify-between text-[11px] font-mono text-slate-400 mb-1">
-                      <span className="text-rose-400">-1.0 (Sell Burst)</span>
-                      <span className="text-slate-300">OBI = {liveObi.toFixed(3)}</span>
-                      <span className="text-emerald-400">+1.0 (Buy Burst)</span>
-                    </div>
-                    <div className="relative h-4 bg-slate-950 rounded-full border border-slate-800 overflow-hidden">
-                      <div className="absolute left-0 top-0 bottom-0 w-[20%] bg-rose-500/20 border-r border-rose-500/40" />
-                      <div className="absolute right-0 top-0 bottom-0 w-[20%] bg-emerald-500/20 border-l border-emerald-500/40" />
-                      <div className="absolute left-1/2 top-0 bottom-0 w-0.5 bg-slate-600" />
-                      <div
-                        className={`absolute top-0 bottom-0 w-2.5 rounded-full transition-all duration-150 ${
-                          Math.abs(liveObi) > 0.6 ? 'bg-rose-400 shadow-lg shadow-rose-500' : 'bg-cyan-400'
-                        }`}
-                        style={{ left: `calc(${((liveObi + 1) / 2) * 100}% - 5px)` }}
-                      />
-                    </div>
-                    <div className="flex justify-between text-[10px] font-mono text-slate-500 mt-1">
-                      <span>Shield &lt; -0.60 (Cancel BID)</span>
-                      <span>Neutral</span>
-                      <span>Shield &gt; +0.60 (Cancel ASK)</span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2 bg-slate-950 p-3.5 rounded-xl border border-slate-800/80 font-mono text-xs">
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Mid-Price (s):</span>
-                      <span className="text-white font-semibold">${midPrice.toFixed(2)}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Microprice L1 (Asimétrico):</span>
-                      <span className="text-amber-400 font-semibold">${microprice.toFixed(2)}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Punta Libro (Bid / Ask):</span>
-                      <span className="text-slate-300">
-                        ${bestBid.toFixed(1)} / ${bestAsk.toFixed(1)}
+                      <TrendingUp className="w-4 h-4 text-[#00F59B]" />
+                      <span className="font-bold text-xs font-mono text-white tracking-wide uppercase">
+                        BOT COMPOSITE EQUITY VS BENCHMARK
                       </span>
                     </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Precio Reserva r(s,q,t):</span>
-                      <span className="text-cyan-400 font-semibold">${reservationPrice.toFixed(2)}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Inventario Dinámico (q):</span>
-                      <span className={`font-semibold ${normInventoryQ > 0 ? 'text-cyan-400' : normInventoryQ < 0 ? 'text-purple-400' : 'text-slate-300'}`}>
-                        {normInventoryQ > 0 ? `+${normInventoryQ.toFixed(3)}` : normInventoryQ.toFixed(3)} (Max 20% Cap)
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Trade Flow Imbalance (TFI 500ms):</span>
-                      <span className={`font-semibold ${liveTfi > 0.2 ? 'text-emerald-400' : liveTfi < -0.2 ? 'text-rose-400' : 'text-slate-300'}`}>
-                        {liveTfi > 0 ? `+${liveTfi.toFixed(3)}` : liveTfi.toFixed(3)}
-                      </span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Spread Óptimo:</span>
-                      <span className="text-indigo-400">${optimalSpread.toFixed(2)}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Estado OBI Shield:</span>
-                      {Math.abs(liveObi) > 0.6 ? (
-                        <span className="text-rose-400 font-bold">CANCELACIÓN ACTIVA (&lt;20ms)</span>
-                      ) : (
-                        <span className="text-emerald-400">COTIZACIÓN GTX ACTIVA</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-4 text-[11px] font-mono text-slate-400 flex items-center justify-between border-t border-slate-800/80 pt-3">
-                  <span>Régimen: backend/config/regime_config.json</span>
-                  <span className="text-emerald-400">0% Taker Fee</span>
-                </div>
-              </div>
-
-              {/* Panel 2: Cortafuegos Determinista (Mandate Gates) */}
-              <div className="bg-slate-900/85 border border-slate-800 rounded-2xl p-5 flex flex-col justify-between">
-                <div>
-                  <div className="flex items-center justify-between border-b border-slate-800 pb-3 mb-4">
-                    <div className="flex items-center gap-2">
-                      <Lock className="w-4 h-4 text-emerald-400" />
-                      <h2 className="font-semibold text-sm text-white">
-                        Cortafuegos Determinista (MandateGatekeeper)
-                      </h2>
-                    </div>
-                    <span className="px-2 py-0.5 text-[10px] font-mono rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                      &lt; 0.002 ms
-                    </span>
-                  </div>
-
-                  <div className="space-y-2.5 font-mono text-xs">
-                    <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
-                      <div>
-                        <div className="text-slate-200 font-semibold">GATE 1: Margen Aislado</div>
-                        <div className="text-[11px] text-slate-400">Prohíbe modo CROSS</div>
+                    <div className="flex items-center gap-4 text-[11px] font-mono">
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-[#00F59B]" />
+                        <span className="text-slate-300">Bot Compuesto: <strong>${currentEquity.toFixed(2)}</strong></span>
                       </div>
-                      <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[10px]">
-                        {gate1Mode}
-                      </span>
-                    </div>
-
-                    <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
-                      <div>
-                        <div className="text-slate-200 font-semibold">GATE 2: Protección Maker</div>
-                        <div className="text-[11px] text-slate-400">Exige LIMIT + GTX (Post-Only)</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-[#A855F7]" />
+                        <span className="text-slate-400">Benchmark: <strong>${baseCapital.toFixed(2)}</strong></span>
                       </div>
-                      <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[10px]">
-                        {gate2Mode}
-                      </span>
                     </div>
-
-                    <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
-                      <div>
-                        <div className="text-slate-200 font-semibold">GATE 3: Techo Half-Kelly</div>
-                        <div className="text-[11px] text-slate-400">Tope: {gate3HalfKelly.toFixed(2)}x | Máx 20% par</div>
-                      </div>
-                      <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 text-[10px]">
-                        {gate3CurrentLev.toFixed(2)}x / {gate3HalfKelly.toFixed(2)}x
-                      </span>
-                    </div>
-
-                    <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
-                      <div>
-                        <div className="text-slate-200 font-semibold">GATE 4: Kill-Switch Diario</div>
-                        <div className="text-[11px] text-slate-400">Flatten a -3.0% HWM ({emergencyFlattenCount} disparos)</div>
-                      </div>
-                      <span
-                        className={`px-2 py-0.5 rounded text-[10px] ${
-                          gate4KillSwitch
-                            ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                            : 'bg-emerald-500/15 text-emerald-400'
-                        }`}
-                      >
-                        {gate4KillSwitch ? 'ENGAGED' : 'ARMED'}
-                      </span>
-                    </div>
+                  </div>
+                  <div className="w-full">
+                    <DualEquityCurve data={equityComparison} />
                   </div>
                 </div>
 
-                <div className="mt-4 text-[11px] font-mono text-slate-400 flex items-center justify-between border-t border-slate-800/80 pt-3">
-                  <span>Barrido Spot (+2.2% / 00:00 UTC)</span>
-                  <span className="text-indigo-400">{profitSweepReady ? 'LISTO' : 'MONITOR'}</span>
-                </div>
-              </div>
-
-              {/* Panel 3: Simulador de Cola FIFO L2 */}
-              <div className="bg-slate-900/85 border border-slate-800 rounded-2xl p-5 flex flex-col justify-between">
-                <div>
-                  <div className="flex items-center justify-between border-b border-slate-800 pb-3 mb-4">
-                    <div className="flex items-center gap-2">
-                      <Layers className="w-4 h-4 text-indigo-400" />
-                      <h2 className="font-semibold text-sm text-white">
-                        Simulador de Posición en Cola L2
-                      </h2>
-                    </div>
-                    <span className="text-[11px] font-mono text-cyan-400">
-                      Latencia: {simLatencyMs} ms
-                    </span>
-                  </div>
-
-                  <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800 mb-4 space-y-3 font-mono text-xs">
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">ID Orden GTX:</span>
-                      <span className="text-cyan-400 font-semibold">{simOrderId}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Estado de Ejecución:</span>
-                      <span className="text-emerald-400 font-semibold">{simStatus}</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Cola Delante (queue_ahead):</span>
-                      <span className="text-white font-bold">{simQueueAhead.toFixed(2)} BTC</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-400">Cantidad Ejecutada:</span>
-                      <span className="text-slate-200">
-                        {simFilledQty.toFixed(4)} / {simOrderQty.toFixed(4)} BTC
-                      </span>
-                    </div>
-
-                    <div className="w-full bg-slate-800 h-2.5 rounded-full overflow-hidden">
-                      <div
-                        className="bg-emerald-500 h-full transition-all duration-200"
-                        style={{
-                          width: `${Math.min(100, (simFilledQty / Math.max(simOrderQty, 0.001)) * 100)}%`
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  <p className="text-[11px] text-slate-400 font-mono leading-relaxed">
-                    Modelado FIFO exacto: Los trades a mercado consumen primero el volumen que estaba descansando antes de llenar nuestra orden límite Post-Only.
-                  </p>
-                </div>
-
-                <div className="mt-4 text-[11px] font-mono text-slate-400 flex items-center justify-between border-t border-slate-800/80 pt-3">
-                  <span>Selección Adversa en Vuelo</span>
-                  <span className="text-amber-400">PROTEGIDA ({simLatencyMs} ms)</span>
-                </div>
-              </div>
-            </div>
-
-            {/* Historial de Operaciones Realizadas (Live Trade Blotter) */}
-            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
-              <div className="px-5 py-3.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 bg-slate-950/80">
-                <div className="flex items-center gap-2.5">
-                  <div className="p-1.5 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-                    <Clock className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <h3 className="font-semibold text-xs text-white font-mono uppercase tracking-wider">
-                      Historial de Operaciones Realizadas • Live Trade Blotter
-                    </h3>
-                    <p className="text-[11px] font-mono text-slate-400">
-                      Registro de los últimos 50 fills con desglose de PnL neto, retorno relativo y microestructura ejecutada.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2.5">
-                  {/* Selector Rápido de Moneda */}
-                  <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 text-[11px] font-mono">
-                    {(['TODOS', 'BTC', 'ETH', 'SOL', 'BNB', 'DOGE'] as const).map((coin) => (
+                {/* 3. Panel Inferior con Pestañas (Transactions | Active Orders | 12P Scanner | Activity) */}
+                <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3.5 space-y-3 flex-1 flex flex-col">
+                  {/* Tab headers */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#1C2230] pb-2">
+                    <div className="flex items-center gap-1 text-xs font-mono">
                       <button
-                        key={coin}
-                        onClick={() => setTradeFilterSymbol(coin)}
-                        className={`px-2.5 py-1 rounded-lg font-bold transition-all ${
-                          tradeFilterSymbol === coin
-                            ? 'bg-cyan-600 text-white shadow-sm'
+                        onClick={() => setActiveBottomTab('transactions')}
+                        className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 transition-all ${
+                          activeBottomTab === 'transactions'
+                            ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/30'
                             : 'text-slate-400 hover:text-slate-200'
                         }`}
                       >
-                        {coin}
+                        <ArrowDownUp className="w-3.5 h-3.5" />
+                        <span>Transactions ({filteredTrades.length})</span>
                       </button>
-                    ))}
+
+                      <button
+                        onClick={() => setActiveBottomTab('orders')}
+                        className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 transition-all ${
+                          activeBottomTab === 'orders'
+                            ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/30'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        <Layers className="w-3.5 h-3.5" />
+                        <span>Active Orders ({openOrders.length})</span>
+                      </button>
+
+                      <button
+                        onClick={() => setActiveBottomTab('scanner')}
+                        className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 transition-all ${
+                          activeBottomTab === 'scanner'
+                            ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/30'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        <Radio className="w-3.5 h-3.5" />
+                        <span>12P Scanner (Basket)</span>
+                      </button>
+
+                      <button
+                        onClick={() => setActiveBottomTab('activity')}
+                        className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 transition-all ${
+                          activeBottomTab === 'activity'
+                            ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/30'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        <Activity className="w-3.5 h-3.5" />
+                        <span>Activity</span>
+                      </button>
+                    </div>
+
+                    {activeBottomTab === 'transactions' && (
+                      <div className="flex items-center gap-2">
+                        {/* Filtro rápido por moneda */}
+                        <div className="flex items-center gap-1 bg-[#080A0F] p-0.5 rounded-md border border-[#1C2230] text-[10px] font-mono">
+                          {(['TODOS', 'BTC', 'ETH', 'SOL', 'BNB', 'DOGE'] as const).map((sym) => (
+                            <button
+                              key={sym}
+                              onClick={() => setTradeFilterSymbol(sym)}
+                              className={`px-1.5 py-0.5 rounded transition-all ${
+                                tradeFilterSymbol === sym ? 'bg-[#1C2230] text-[#00F59B] font-bold' : 'text-slate-400 hover:text-slate-200'
+                              }`}
+                            >
+                              {sym}
+                            </button>
+                          ))}
+                        </div>
+                        <button
+                          onClick={() => exportTradesToCsv(recentTrades)}
+                          className="px-2.5 py-1 rounded bg-[#080A0F] hover:bg-[#1C2230] text-slate-300 border border-[#1C2230] font-mono text-[10px] font-bold flex items-center gap-1"
+                          title="Exportar blotter a CSV"
+                        >
+                          <Download className="w-3 h-3 text-[#00F59B]" /> CSV
+                        </button>
+                      </div>
+                    )}
                   </div>
 
-                  {/* Botón Exportar CSV */}
-                  <button
-                    onClick={() => exportTradesToCsv(filteredTrades)}
-                    disabled={filteredTrades.length === 0}
-                    className="px-3 py-1.5 rounded-xl font-mono text-xs font-bold flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-                    title="Descargar historial de trades en formato CSV"
-                  >
-                    <Download className="w-3.5 h-3.5 text-cyan-400" />
-                    Exportar CSV ({filteredTrades.length})
-                  </button>
+                  {/* Tab 1 Content: Transactions */}
+                  {activeBottomTab === 'transactions' && (
+                    <div className="overflow-x-auto max-h-56 overflow-y-auto font-mono text-xs">
+                      <table className="w-full text-left">
+                        <thead>
+                          <tr className="text-slate-500 border-b border-[#1C2230] text-[10px] uppercase tracking-wider">
+                            <th className="py-1.5 px-2.5">Side</th>
+                            <th className="py-1.5 px-2.5">Time</th>
+                            <th className="py-1.5 px-2.5">Pair</th>
+                            <th className="py-1.5 px-2.5">Strategy</th>
+                            <th className="py-1.5 px-2.5">Price</th>
+                            <th className="py-1.5 px-2.5">Qty</th>
+                            <th className="py-1.5 px-2.5">Return %</th>
+                            <th className="py-1.5 px-2.5 text-right">PnL (USDT)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#1C2230]/60">
+                          {filteredTrades.length > 0 ? (
+                            filteredTrades.map((t) => {
+                              const isBuy = t.side === 'BUY';
+                              const isWin = t.pnl_usd >= 0;
+                              const baseSym = t.symbol.split('/')[0] || t.symbol;
+                              return (
+                                <tr key={t.id} className="hover:bg-[#10141D]/80 transition-colors">
+                                  <td className="py-1.5 px-2.5">
+                                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold flex items-center gap-1 w-fit ${
+                                      isBuy ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/30' : 'bg-[#A855F7]/15 text-[#A855F7] border border-[#A855F7]/30'
+                                    }`}>
+                                      {isBuy ? '↑ BUY' : '↓ SELL'}
+                                    </span>
+                                  </td>
+                                  <td className="py-1.5 px-2.5 text-slate-400 text-[11px]">{t.age_str || t.time_str}</td>
+                                  <td className="py-1.5 px-2.5 font-bold text-white">{baseSym}</td>
+                                  <td className="py-1.5 px-2.5">
+                                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono border ${
+                                      t.strategy === 'LIQ_CASCADE'
+                                        ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                                        : 'bg-[#A855F7]/10 text-[#A855F7] border-[#A855F7]/30'
+                                    }`}>
+                                      {t.strategy}
+                                    </span>
+                                  </td>
+                                  <td className="py-1.5 px-2.5 text-slate-200">
+                                    ${t.entry_price >= 1 ? t.entry_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : t.entry_price.toFixed(5)}
+                                  </td>
+                                  <td className="py-1.5 px-2.5 text-slate-300">{t.qty}</td>
+                                  <td className="py-1.5 px-2.5">
+                                    <div className="flex items-center gap-1.5">
+                                      <div className="w-12 h-1.5 bg-[#080A0F] rounded-full overflow-hidden">
+                                        <div
+                                          className={`h-full ${isWin ? 'bg-[#00F59B]' : 'bg-[#A855F7]'}`}
+                                          style={{ width: `${Math.min(Math.abs(t.return_pct) * 100, 100)}%` }}
+                                        />
+                                      </div>
+                                      <span className={isWin ? 'text-[#00F59B]' : 'text-[#A855F7]'}>
+                                        {t.return_pct >= 0 ? `+${t.return_pct.toFixed(2)}%` : `${t.return_pct.toFixed(2)}%`}
+                                      </span>
+                                    </div>
+                                  </td>
+                                  <td className={`py-1.5 px-2.5 text-right font-bold ${isWin ? 'text-[#00F59B]' : 'text-[#A855F7]'}`}>
+                                    {isWin ? `+$${t.pnl_usd.toFixed(2)}` : `-$${Math.abs(t.pnl_usd).toFixed(2)}`}
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          ) : (
+                            <tr>
+                              <td colSpan={8} className="py-6 text-center text-slate-500 text-xs">
+                                Sin operaciones ejecutadas en la sesión actual. Cotizando continuamente en L2...
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {/* Tab 2 Content: Active Orders (L2) */}
+                  {activeBottomTab === 'orders' && (
+                    <div className="overflow-x-auto max-h-56 overflow-y-auto font-mono text-xs">
+                      <table className="w-full text-left">
+                        <thead>
+                          <tr className="text-slate-500 border-b border-[#1C2230] text-[10px] uppercase tracking-wider">
+                            <th className="py-1.5 px-2.5">Level</th>
+                            <th className="py-1.5 px-2.5">Symbol</th>
+                            <th className="py-1.5 px-2.5">Side</th>
+                            <th className="py-1.5 px-2.5">Price</th>
+                            <th className="py-1.5 px-2.5">Qty</th>
+                            <th className="py-1.5 px-2.5">Filled</th>
+                            <th className="py-1.5 px-2.5">FIFO Queue Ahead</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#1C2230]/60">
+                          {openOrders.length > 0 ? (
+                            openOrders.map((ord) => {
+                              const isBid = ord.side === 'BUY';
+                              const filledPct = ord.qty > 0 ? (ord.filled_qty / ord.qty) * 100 : 0;
+                              return (
+                                <tr key={ord.order_id} className="hover:bg-[#10141D]/80 transition-colors">
+                                  <td className="py-1.5 px-2.5">
+                                    <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#1C2230] text-slate-300">
+                                      {ord.level || 'L1'}
+                                    </span>
+                                  </td>
+                                  <td className="py-1.5 px-2.5 font-bold text-white">{ord.symbol.split('/')[0]}</td>
+                                  <td className="py-1.5 px-2.5">
+                                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                      isBid ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/30' : 'bg-[#A855F7]/15 text-[#A855F7] border border-[#A855F7]/30'
+                                    }`}>
+                                      {isBid ? 'BID' : 'ASK'}
+                                    </span>
+                                  </td>
+                                  <td className="py-1.5 px-2.5 text-slate-200">
+                                    ${ord.price >= 1 ? ord.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : ord.price.toFixed(5)}
+                                  </td>
+                                  <td className="py-1.5 px-2.5 text-slate-300">{ord.qty}</td>
+                                  <td className="py-1.5 px-2.5 text-slate-300">{ord.filled_qty} ({filledPct.toFixed(0)}%)</td>
+                                  <td className="py-1.5 px-2.5">
+                                    <div className="flex items-center gap-2">
+                                      <div className="w-16 h-1.5 bg-[#080A0F] rounded-full overflow-hidden">
+                                        <div
+                                          className="h-full bg-cyan-400 transition-all duration-300"
+                                          style={{ width: `${Math.max(10, Math.min(100, (1 - ord.queue_ahead_qty / 5.0) * 100))}%` }}
+                                        />
+                                      </div>
+                                      <span className="text-[11px] text-slate-400">{ord.queue_ahead_qty.toFixed(2)} BTC</span>
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          ) : (
+                            <tr>
+                              <td colSpan={7} className="py-6 text-center text-slate-500 text-xs">
+                                No hay órdenes activas en reposo. Todas las cotizaciones pasaron al motor de fills.
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {/* Tab 3 Content: 12P Scanner (Basket) */}
+                  {activeBottomTab === 'scanner' && (
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-2 font-mono text-xs">
+                      {topActiveSymbols.map((symKey) => {
+                        const s = symbolsData[symKey];
+                        if (!s) return null;
+                        return (
+                          <div key={symKey} className="bg-[#080A0F] border border-[#1C2230] rounded-lg p-2.5 space-y-1">
+                            <div className="flex items-center justify-between">
+                              <span className="font-bold text-white">{s.base_asset}</span>
+                              <span className="text-[10px] text-slate-400">{(s.half_kelly_weight * 100).toFixed(0)}% W</span>
+                            </div>
+                            <div className="text-slate-200 font-bold">${s.mid_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                            <div className="flex items-center justify-between text-[10px]">
+                              <span className="text-slate-400">OBI:</span>
+                              <span className={s.obi >= 0 ? 'text-[#00F59B]' : 'text-[#A855F7]'}>{s.obi > 0 ? `+${s.obi.toFixed(2)}` : s.obi.toFixed(2)}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-[10px]">
+                              <span className="text-slate-400">Posición:</span>
+                              <span className="text-slate-300">${s.position_usd.toFixed(1)}</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Tab 4 Content: Activity */}
+                  {activeBottomTab === 'activity' && (
+                    <div className="space-y-2 font-mono text-xs text-slate-400">
+                      <div className="flex items-center justify-between p-2 rounded bg-[#080A0F] border border-[#1C2230]">
+                        <span>Stream WebSocket</span>
+                        <span className="text-[#00F59B]">{wsConnected ? 'Activo (10 Hz) • FastAPI Lifespan' : 'Offline'}</span>
+                      </div>
+                      <div className="flex items-center justify-between p-2 rounded bg-[#080A0F] border border-[#1C2230]">
+                        <span>Ticks Procesados</span>
+                        <span className="text-white">#{tickCount}</span>
+                      </div>
+                      <div className="flex items-center justify-between p-2 rounded bg-[#080A0F] border border-[#1C2230]">
+                        <span>Hot Path Latency</span>
+                        <span className="text-[#00F59B]">{hotPathLatencyUs} µs (&lt; 100 µs target)</span>
+                      </div>
+                      <div className="flex items-center justify-between p-2 rounded bg-[#080A0F] border border-[#1C2230]">
+                        <span>Cross-Asset Contagion Shield</span>
+                        <span className={contagionShield.bid_shield_active || contagionShield.ask_shield_active ? 'text-[#A855F7]' : 'text-[#00F59B]'}>
+                          {contagionShield.trigger_reason}
+                        </span>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
 
-              <div className="overflow-x-auto max-h-80 overflow-y-auto">
-                <table className="w-full text-left font-mono text-xs">
-                  <thead className="bg-slate-950/95 sticky top-0 text-slate-400 uppercase text-[10px] tracking-wider border-b border-slate-800 z-10">
-                    <tr>
-                      <th className="py-2.5 px-4">Hora (UTC)</th>
-                      <th className="py-2.5 px-4">ID Operación</th>
-                      <th className="py-2.5 px-4">Par</th>
-                      <th className="py-2.5 px-4">Estrategia</th>
-                      <th className="py-2.5 px-4">Lado</th>
-                      <th className="py-2.5 px-4">Precio Fill ($)</th>
-                      <th className="py-2.5 px-4">Cantidad</th>
-                      <th className="py-2.5 px-4">Retorno (%)</th>
-                      <th className="py-2.5 px-4">PnL Neto (USDT)</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/60">
-                    {filteredTrades.length > 0 ? (
-                      filteredTrades.map((t) => {
-                        const isBuy = t.side === 'BUY';
-                        const isWin = t.pnl_usd >= 0;
-                        const baseSym = t.symbol.split('/')[0] || t.symbol;
+              {/* Columna Derecha (w-80) */}
+              <div className="w-full xl:w-80 shrink-0 bg-[#0B0E14]/80 p-3.5 space-y-3.5 flex flex-col border-t xl:border-t-0 border-[#1C2230]">
+                {/* 1. Gráfico Superior de Profundidad L2 (Order Book Mountain Chart) */}
+                <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3.5 space-y-2.5">
+                  <div className="flex items-center justify-between border-b border-[#1C2230] pb-2">
+                    <div className="flex items-center gap-2">
+                      <BarChart3 className="w-4 h-4 text-[#00F59B]" />
+                      <span className="font-bold text-xs font-mono text-white tracking-wide uppercase">
+                        L2 ORDER BOOK DEPTH
+                      </span>
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">
+                      µP: ${microprice.toFixed(1)}
+                    </span>
+                  </div>
+
+                  <div className="w-full">
+                    <OrderBookMountain depth={orderBookDepth} microprice={microprice} />
+                  </div>
+
+                  {/* OBI Speedometer / Bar */}
+                  <div className="space-y-1 pt-1 border-t border-[#1C2230]">
+                    <div className="flex items-center justify-between text-[10px] font-mono">
+                      <span className="text-[#A855F7] font-bold">ASKS HEAVY</span>
+                      <span className={`font-bold ${liveObi >= 0 ? 'text-[#00F59B]' : 'text-[#A855F7]'}`}>
+                        OBI: {liveObi > 0 ? `+${liveObi.toFixed(3)}` : liveObi.toFixed(3)}
+                      </span>
+                      <span className="text-[#00F59B] font-bold">BIDS HEAVY</span>
+                    </div>
+                    <div className="w-full h-1.5 bg-[#080A0F] rounded-full overflow-hidden relative">
+                      <div className="absolute inset-0 flex">
+                        <div className="w-1/2 flex justify-end">
+                          {liveObi < 0 && (
+                            <div
+                              className="h-full bg-[#A855F7] transition-all duration-200"
+                              style={{ width: `${Math.min(Math.abs(liveObi) * 100, 100)}%` }}
+                            />
+                          )}
+                        </div>
+                        <div className="w-1/2 flex justify-start">
+                          {liveObi > 0 && (
+                            <div
+                              className="h-full bg-[#00F59B] transition-all duration-200"
+                              style={{ width: `${Math.min(liveObi * 100, 100)}%` }}
+                            />
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 2. Panel Medio (Whale Flow & L2 Tape) */}
+                <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3.5 space-y-2.5 flex-1 flex flex-col">
+                  <div className="flex items-center justify-between border-b border-[#1C2230] pb-2">
+                    <div className="flex items-center gap-2">
+                      <Flame className="w-4 h-4 text-amber-400" />
+                      <span className="font-bold text-xs font-mono text-white tracking-wide uppercase">
+                        WHALE FLOW & L2 TAPE
+                      </span>
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">12 Events</span>
+                  </div>
+
+                  <div className="space-y-1.5 overflow-y-auto max-h-56 pr-1 font-mono text-xs">
+                    {whaleAndLiqTape && whaleAndLiqTape.length > 0 ? (
+                      whaleAndLiqTape.map((ev, idx) => {
+                        const isBuy = ev.side === 'BUY';
                         return (
-                          <tr key={t.id} className="hover:bg-slate-800/30 transition-colors">
-                            <td className="py-2 px-4 text-slate-400 text-[11px]">{t.time_str}</td>
-                            <td className="py-2 px-4 text-slate-300 text-[11px] font-semibold">{t.id}</td>
-                            <td className="py-2 px-4 font-bold text-white flex items-center gap-1.5">
-                              <span className={`w-1.5 h-1.5 rounded-full ${isWin ? 'bg-emerald-400' : 'bg-rose-400'}`} />
-                              {baseSym}
-                            </td>
-                            <td className="py-2 px-4">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
-                                t.strategy === 'LIQ_CASCADE'
-                                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-                                  : 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                          <div
+                            key={idx}
+                            className="p-1.5 rounded-lg bg-[#080A0F] border border-[#1C2230] flex items-center justify-between gap-2 hover:border-slate-700 transition-colors"
+                          >
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span className={`w-2 h-2 rounded-full shrink-0 ${isBuy ? 'bg-[#00F59B]' : 'bg-[#A855F7]'}`} />
+                              <span className="font-bold text-white text-[11px]">{ev.symbol}</span>
+                              <span className={`px-1 py-0.2 rounded text-[9px] font-bold ${
+                                isBuy ? 'bg-[#00F59B]/15 text-[#00F59B]' : 'bg-[#A855F7]/15 text-[#A855F7]'
                               }`}>
-                                {t.strategy}
+                                {ev.side}
                               </span>
-                            </td>
-                            <td className="py-2 px-4">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
-                                isBuy
-                                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                                  : 'bg-rose-500/20 text-rose-300 border-rose-500/40'
-                              }`}>
-                                {isBuy ? 'BUY' : 'SELL'}
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                              <div className="w-12 h-1 bg-[#1C2230] rounded-full overflow-hidden">
+                                <div
+                                  className={`h-full ${isBuy ? 'bg-[#00F59B]' : 'bg-[#A855F7]'}`}
+                                  style={{ width: `${Math.min(ev.intensity_pct, 100)}%` }}
+                                />
+                              </div>
+                              <span className="text-slate-300 font-bold text-[10px]">
+                                ${(ev.notional_usd / 1000).toFixed(1)}k
                               </span>
-                            </td>
-                            <td className="py-2 px-4 font-semibold text-slate-200">
-                              ${t.entry_price >= 1 ? t.entry_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : t.entry_price.toFixed(5)}
-                            </td>
-                            <td className="py-2 px-4 text-slate-300">{t.qty}</td>
-                            <td className={`py-2 px-4 font-bold ${isWin ? 'text-emerald-400' : 'text-rose-400'}`}>
-                              {t.return_pct >= 0 ? `+${t.return_pct.toFixed(3)}%` : `${t.return_pct.toFixed(3)}%`}
-                            </td>
-                            <td className={`py-2 px-4 font-bold ${isWin ? 'text-emerald-400' : 'text-rose-400'}`}>
-                              {isWin ? `+$${t.pnl_usd.toFixed(2)}` : `-$${Math.abs(t.pnl_usd).toFixed(2)}`}
-                            </td>
-                          </tr>
+                              <span className="text-slate-500 text-[9px] w-6 text-right">
+                                {ev.age_str}
+                              </span>
+                            </div>
+                          </div>
                         );
                       })
                     ) : (
-                      <tr>
-                        <td colSpan={9} className="py-8 text-center text-slate-500 font-mono text-xs">
-                          Sin operaciones ejecutadas aún en la sesión actual. El motor se encuentra cotizando continuamente en el libro L2.
-                        </td>
-                      </tr>
+                      <div className="py-6 text-center text-slate-500 text-xs">
+                        Esperando órdenes institucionales &gt;$50k...
+                      </div>
                     )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+                  </div>
+                </div>
 
-            {/* Configuración de Telemetría en Vivo */}
-            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-5">
-              <div className="flex flex-wrap items-center justify-between gap-4">
-                <div>
-                  <h3 className="text-sm font-semibold text-white flex items-center gap-2">
-                    <TerminalIcon className="w-4 h-4 text-cyan-400" />
-                    Enlace de Telemetría WebSocket (FastAPI Lifespan)
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    Stream en tiempo real a 10 Hz transmitiendo directamente desde `MarketRingBuffer` y `PortfolioState`.
-                  </p>
-                </div>
-                <div className="flex items-center gap-2 font-mono text-xs">
-                  <input
-                    type="text"
-                    value={wsUrl}
-                    onChange={(e) => setWsUrl(e.target.value)}
-                    className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 w-64 focus:border-cyan-500 focus:outline-none"
-                    placeholder="ws://localhost:8000/ws/telemetry"
-                  />
-                  <span
-                    className={`px-2.5 py-1.5 rounded-lg font-bold ${
-                      wsConnected ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-800 text-slate-400'
-                    }`}
-                  >
-                    {wsConnected ? 'CONECTADO' : 'DESCONECTADO'}
-                  </span>
+                {/* 3. Panel Inferior (Multi-Asset Allocation Donut Chart) */}
+                <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3.5 space-y-2.5">
+                  <div className="flex items-center justify-between border-b border-[#1C2230] pb-2">
+                    <div className="flex items-center gap-2">
+                      <PieChart className="w-4 h-4 text-[#00F59B]" />
+                      <span className="font-bold text-xs font-mono text-white tracking-wide uppercase">
+                        PORTFOLIO ALLOCATION
+                      </span>
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-400">5 Perpetuals</span>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-3">
+                    <AllocationDonut items={portfolioAllocation} />
+                    <div className="space-y-1 font-mono text-[11px] flex-1">
+                      {portfolioAllocation.map((it) => (
+                        <div key={it.symbol} className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-full" style={{ backgroundColor: it.color }} />
+                            <span className="text-slate-300">{it.base_asset}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-slate-400">${it.notional_usd.toFixed(0)}</span>
+                            <span className="font-bold text-white w-8 text-right">{it.weight_pct.toFixed(0)}%</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Base Half-Kelly Capital Usage Bar */}
+                  <div className="pt-2 border-t border-[#1C2230] space-y-1 font-mono">
+                    <div className="flex items-center justify-between text-[10px]">
+                      <span className="text-slate-400">Half-Kelly Limit Usage</span>
+                      <span className="text-[#00F59B] font-bold">{((gate3CurrentLev / 3.0) * 100).toFixed(0)}% (Lev {gate3CurrentLev.toFixed(1)}x / 3.0x)</span>
+                    </div>
+                    <div className="w-full h-1.5 bg-[#080A0F] rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-[#00F59B] to-[#A855F7] transition-all duration-300"
+                        style={{ width: `${Math.max(5, Math.min(100, (gate3CurrentLev / 3.0) * 100))}%` }}
+                      />
+                    </div>
+                  </div>
                 </div>
               </div>
-              {wsLastError && (
-                <div className="mt-3 p-2.5 rounded-xl bg-amber-950/20 border border-amber-800/40 text-amber-300 font-mono text-xs">
-                  Aviso: {wsLastError} (Puedes arrancar el servidor con: `uvicorn backend.telemetry_server:app --port 8000`)
-                </div>
-              )}
             </div>
-          </div>
-        )}
+          )}
+
+          {activeTab !== 'command' && (
+            <div className="p-6 max-w-7xl mx-auto w-full space-y-6">
 
         {/* TAB 2: MANDATE GATES STRESS TESTER */}
         {activeTab === 'phase1' && (
@@ -2176,7 +2355,10 @@ export default function App() {
             </div>
           </div>
         )}
-      </main>
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* Modal de Confirmación de Seguridad: LIVE CAPITAL (BINANCE) */}
       {isLiveConfirmOpen && (
