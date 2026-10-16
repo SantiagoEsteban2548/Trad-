@@ -169,6 +169,48 @@ export interface OrderBookDepth {
   asks: [number, number, number][];
 }
 
+function getInitialCandles(): Candle[] {
+  const list: Candle[] = [];
+  let p = 65000.0;
+  for (let i = 0; i < 35; i++) {
+    const delta = (Math.sin(i * 0.45) + Math.cos(i * 0.75)) * 16.0 + (i % 2 === 0 ? 9 : -8);
+    const open = p;
+    const close = p + delta;
+    const high = Math.max(open, close) + Math.abs(delta) * 0.4 + 5.0;
+    const low = Math.min(open, close) - Math.abs(delta) * 0.3 - 4.0;
+    const volume = 2.5 + Math.abs(Math.sin(i)) * 5.5;
+    const res = close - delta * 0.3;
+    list.push({
+      open,
+      high,
+      low,
+      close,
+      volume,
+      is_bullish: close >= open,
+      reservation_price: res,
+    });
+    p = close;
+  }
+  return list;
+}
+
+function getInitialEquity(): EquityComparisonPoint[] {
+  const list: EquityComparisonPoint[] = [];
+  const now = Date.now();
+  for (let i = 35; i >= 0; i--) {
+    const bot = 5000 + (35 - i) * 7.2 + Math.sin(i * 0.5) * 15.0;
+    const bench = 5000 + (35 - i) * 2.3;
+    const pnl = i % 4 === 0 ? (i % 8 === 0 ? 6.5 : -2.8) : 0;
+    list.push({
+      timestamp: now - i * 60000,
+      bot_equity_usd: bot,
+      benchmark_equity_usd: bench,
+      trade_pnl_bar: pnl,
+    });
+  }
+  return list;
+}
+
 function renderEquitySparkline(data: number[], width = 160, height = 36) {
   if (!data || data.length < 2) {
     return (
@@ -229,7 +271,14 @@ function CandlestickChart({
   bestAsk: number;
   reservationPrice: number;
 }) {
-  if (!candles || candles.length === 0) return null;
+  if (!candles || candles.length === 0) {
+    return (
+      <div className="h-[210px] flex items-center justify-center font-mono text-xs text-slate-500 border border-dashed border-[#1C2230] rounded-lg">
+        <Activity className="w-4 h-4 mr-2 animate-spin text-[#00F59B]" />
+        Cargando microestructura y velas en vivo desde CCXT WS...
+      </div>
+    );
+  }
   const n = candles.length;
   const svgW = 760;
   const svgH = 210;
@@ -363,14 +412,21 @@ function CandlestickChart({
 
 function DualEquityCurve({
   data,
-  currentEquity,
-  baseCapital,
+  currentEquity = 5000,
+  baseCapital = 5000,
 }: {
   data: EquityComparisonPoint[];
-  currentEquity: number;
-  baseCapital: number;
+  currentEquity?: number;
+  baseCapital?: number;
 }) {
-  if (!data || data.length === 0) return null;
+  if (!data || data.length === 0) {
+    return (
+      <div className="h-[135px] flex items-center justify-center font-mono text-xs text-slate-500 border border-dashed border-[#1C2230] rounded-lg">
+        <TrendingUp className="w-4 h-4 mr-2 text-[#00F59B]" />
+        Sincronizando curva dual de equidad...
+      </div>
+    );
+  }
   const svgW = 760;
   const svgH = 135;
   const chartH = 90;
@@ -379,7 +435,9 @@ function DualEquityCurve({
 
   const botVals = data.map((d) => d.bot_equity_usd);
   const benchVals = data.map((d) => d.benchmark_equity_usd);
-  const allVals = [...botVals, ...benchVals, currentEquity, baseCapital];
+  const eq = typeof currentEquity === 'number' && !isNaN(currentEquity) ? currentEquity : 5000;
+  const base = typeof baseCapital === 'number' && !isNaN(baseCapital) ? baseCapital : 5000;
+  const allVals = [...botVals, ...benchVals, eq, base];
   const minVal = Math.min(...allVals) * 0.995;
   const maxVal = Math.max(...allVals) * 1.005;
   const range = maxVal - minVal || 1.0;
@@ -757,8 +815,8 @@ export default function App() {
     bids: [[65000.0, 1.5, 1.5], [64995.0, 2.2, 3.7], [64990.0, 3.8, 7.5], [64985.0, 5.0, 12.5], [64980.0, 7.2, 19.7]],
     asks: [[65001.0, 1.4, 1.4], [65006.0, 2.5, 3.9], [65011.0, 3.6, 7.5], [65016.0, 4.8, 12.3], [65021.0, 6.9, 19.2]],
   });
-  const [candlesHistory, setCandlesHistory] = useState<Candle[]>([]);
-  const [equityComparison, setEquityComparison] = useState<EquityComparisonPoint[]>([]);
+  const [candlesHistory, setCandlesHistory] = useState<Candle[]>(getInitialCandles);
+  const [equityComparison, setEquityComparison] = useState<EquityComparisonPoint[]>(getInitialEquity);
   const [whaleAndLiqTape, setWhaleAndLiqTape] = useState<WhaleTapeEvent[]>([]);
   const [portfolioAllocation, setPortfolioAllocation] = useState<PortfolioAllocationItem[]>([
     { symbol: 'BTC/USDT:USDT', base_asset: 'BTC', weight_pct: 35.0, notional_usd: 35.0, color: '#00F59B' },
@@ -1573,7 +1631,7 @@ export default function App() {
                     </div>
                   </div>
                   <div className="w-full">
-                    <DualEquityCurve data={equityComparison} />
+                    <DualEquityCurve data={equityComparison} currentEquity={currentEquity} baseCapital={baseCapital} />
                   </div>
                 </div>
 
