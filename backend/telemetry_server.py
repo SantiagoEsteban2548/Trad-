@@ -1384,6 +1384,10 @@ class TradingModeRequest(BaseModel):
     mode: Literal["PAPER_L2", "LIVE_BINANCE"]
 
 
+class BaseCapitalRequest(BaseModel):
+    base_capital_usd: float
+
+
 @app.get("/api/health")
 async def health_check() -> dict[str, Any]:
     """Chequeo de salud del motor bimodal."""
@@ -1531,6 +1535,25 @@ async def reset_kill_switch_endpoint() -> dict[str, Any]:
         "kill_switch_engaged": False,
         "timestamp_ns": time.time_ns(),
     }
+
+
+@app.post("/api/base-capital")
+async def set_base_capital_endpoint(req: BaseCapitalRequest) -> dict[str, Any]:
+    """Permite ajustar dinámicamente el capital base operativo asignado a las estrategias."""
+    if req.base_capital_usd <= 0:
+        raise HTTPException(status_code=400, detail="El capital base debe ser mayor a 0.")
+    engine.portfolio.base_capital_usd = round(req.base_capital_usd, 2)
+    engine.portfolio.daily_high_watermark_usd = max(
+        engine.portfolio.daily_high_watermark_usd, engine.portfolio.base_capital_usd
+    )
+    logger.info(f"Capital base operativo asignado a {engine.portfolio.base_capital_usd} USDT.")
+    return {
+        "status": "BASE_CAPITAL_UPDATED",
+        "base_capital_usd": engine.portfolio.base_capital_usd,
+        "current_equity_usd": engine.portfolio.current_equity_usd,
+        "timestamp_ns": time.time_ns(),
+    }
+
 
 
 @app.websocket("/ws/telemetry")
