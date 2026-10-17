@@ -1071,14 +1071,25 @@ class BingXLiveWsGateway:
             "clientOrderId": cid,
         }
 
+        order_qty = order.qty
+        order_price = order.price
+        if "1000PEPE" in target_sym:
+            if order_price < 0.0005:
+                order_price = round(order_price * 1000.0, 7)
+                order_qty = max(1.0, round(order_qty / 1000.0, 1))
+            if order.side.upper() == "BUY" and order_price < 0.0010:
+                order_price = 0.0010
+            elif order.side.upper() == "SELL" and order_price > 0.0150:
+                order_price = 0.0150
+
         res = None
         try:
             res_raw = order_fn(
                 symbol=target_sym,
                 type="limit",
                 side=side_str,
-                amount=order.qty,
-                price=order.price,
+                amount=order_qty,
+                price=order_price,
                 params=order_params,
             )
             if inspect.isawaitable(res_raw):
@@ -1095,8 +1106,8 @@ class BingXLiveWsGateway:
                         symbol=target_sym,
                         type="limit",
                         side=side_str,
-                        amount=order.qty,
-                        price=order.price,
+                        amount=order_qty,
+                        price=order_price,
                         params=order_params,
                     )
                     if inspect.isawaitable(res_raw):
@@ -1118,7 +1129,9 @@ class BingXLiveWsGateway:
                 if is_post_only_cross:
                     spec = SYMBOL_SPECS.get(order.symbol)
                     tick = spec.tick_size if spec else 0.1
-                    adj_price = order.price - tick if order.side.upper() == "BUY" else order.price + tick
+                    if "1000PEPE" in target_sym and tick < 0.00001:
+                        tick = 0.000001
+                    adj_price = order_price - tick if order.side.upper() == "BUY" else order_price + tick
                     adj_price = round(adj_price / tick) * tick
                     logger.warning(f"Post-Only en BingX cruzó libro en {order.symbol}. Reintentando a {adj_price}...")
                     cid_retry = self.ledger.generate_client_order_id(order.strategy_id)
@@ -1127,7 +1140,7 @@ class BingXLiveWsGateway:
                         symbol=target_sym,
                         type="limit",
                         side=side_str,
-                        amount=order.qty,
+                        amount=order_qty,
                         price=adj_price,
                         params=order_params,
                     )
@@ -1292,17 +1305,28 @@ class BingXLiveWsGateway:
             return None
 
     async def cancel_order_ws(self, order_id: str, symbol: str) -> bool:
-        """Cancela la orden activa en BingX en tiempo real."""
+        """Cancela la orden activa en BingX en tiempo real con fallback a REST si WS no está soportado."""
         try:
             target_sym = self.resolve_bingx_symbol(symbol)
+            res = None
+            cancelled = False
             if hasattr(self.exchange, "cancel_order_ws") and callable(getattr(self.exchange, "cancel_order_ws")):
-                res = self.exchange.cancel_order_ws(id=order_id, symbol=target_sym)
-                if inspect.isawaitable(res):
-                    await res
-            elif hasattr(self.exchange, "cancel_order") and callable(getattr(self.exchange, "cancel_order")):
-                res = self.exchange.cancel_order(id=order_id, symbol=target_sym)
-                if inspect.isawaitable(res):
-                    await res
+                try:
+                    res_raw = self.exchange.cancel_order_ws(id=order_id, symbol=target_sym)
+                    if inspect.isawaitable(res_raw):
+                        res = await res_raw
+                    else:
+                        res = res_raw
+                    cancelled = True
+                except Exception as ws_err:
+                    if "not supported" not in str(ws_err).lower():
+                        raise ws_err
+            if not cancelled and hasattr(self.exchange, "cancel_order") and callable(getattr(self.exchange, "cancel_order")):
+                res_raw = self.exchange.cancel_order(id=order_id, symbol=target_sym)
+                if inspect.isawaitable(res_raw):
+                    res = await res_raw
+                else:
+                    res = res_raw
             if self.live_active_bid_id == order_id:
                 self.live_active_bid_id = None
             if self.live_active_ask_id == order_id:
@@ -1314,6 +1338,18 @@ class BingXLiveWsGateway:
             self.active_orders_meta.pop(order_id, None)
             return True
         except Exception as e:
+            err_msg = str(e).lower()
+            if "not found" in err_msg or "does not exist" in err_msg or "already canceled" in err_msg or "already closed" in err_msg:
+                if self.live_active_bid_id == order_id:
+                    self.live_active_bid_id = None
+                if self.live_active_ask_id == order_id:
+                    self.live_active_ask_id = None
+                if self.active_bids_by_symbol.get(symbol) == order_id:
+                    self.active_bids_by_symbol.pop(symbol, None)
+                if self.active_asks_by_symbol.get(symbol) == order_id:
+                    self.active_asks_by_symbol.pop(symbol, None)
+                self.active_orders_meta.pop(order_id, None)
+                return True
             logger.error(f"Error cancelando orden {order_id} en BingX ({symbol}): {e}")
             return False
 
@@ -1325,9 +1361,10 @@ class BingXLiveWsGateway:
         Corrige detección de posiciones SHORT (side == 'short' o positionAmt < 0 -> close_side = 'buy').
         """
         for sym in symbols:
+            target_sym = self.resolve_bingx_symbol(sym)
             try:
                 if hasattr(self.exchange, "cancel_all_orders"):
-                    await self.exchange.cancel_all_orders(sym)
+                    await self.exchange.cancel_all_orders(target_sym)
                     logger.warning(f"cancel_all_orders ejecutado en BingX para {sym}")
             except Exception as e:
                 logger.error(f"Error en cancel_all_orders para {sym} (BingX): {e}")
