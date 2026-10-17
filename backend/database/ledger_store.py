@@ -154,21 +154,31 @@ class LedgerSqliteStore:
                 )
                 conn.commit()
 
-    def load_recent_trades(self, limit: int = 100) -> list[dict[str, Any]]:
+    def load_recent_trades(self, limit: int | None = 1000) -> list[dict[str, Any]]:
         """Carga los trades más recientes ordenados cronológicamente descendente."""
         with self._lock:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT id, timestamp_ms, time_str, symbol, strategy, side,
-                           entry_price, exit_or_mid_price, qty, return_pct, pnl_usd, fee_cost, exchange
-                    FROM trades
-                    ORDER BY timestamp_ms DESC
-                    LIMIT ?;
-                    """,
-                    (limit,)
-                )
+                if limit is not None and limit > 0:
+                    cursor.execute(
+                        """
+                        SELECT id, timestamp_ms, time_str, symbol, strategy, side,
+                               entry_price, exit_or_mid_price, qty, return_pct, pnl_usd, fee_cost, exchange
+                        FROM trades
+                        ORDER BY timestamp_ms DESC
+                        LIMIT ?;
+                        """,
+                        (limit,)
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT id, timestamp_ms, time_str, symbol, strategy, side,
+                               entry_price, exit_or_mid_price, qty, return_pct, pnl_usd, fee_cost, exchange
+                        FROM trades
+                        ORDER BY timestamp_ms DESC;
+                        """
+                    )
                 rows = cursor.fetchall()
                 results = []
                 for row in rows:
@@ -188,6 +198,15 @@ class LedgerSqliteStore:
                         "exchange": row["exchange"],
                     })
                 return results
+
+    def count_trades(self) -> int:
+        """Retorna el número total de transacciones guardadas en SQLite."""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM trades;")
+                row = cursor.fetchone()
+                return int(row[0]) if row else 0
 
     def save_lot(self, lot_key: str, symbol: str, strategy_id: str, sub_lot_id: str,
                  inventory_q: float, entry_price: float, break_even_price: float,

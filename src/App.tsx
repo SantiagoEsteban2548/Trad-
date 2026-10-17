@@ -635,10 +635,33 @@ function AllocationDonut({
   );
 }
 
-function exportTradesToCsv(trades: RecentTrade[]) {
-  if (!trades || trades.length === 0) return;
+async function exportTradesToCsv(trades: RecentTrade[], apiBaseUrl: string = '', filterSymbol: string = 'TODOS') {
+  try {
+    const query = filterSymbol && filterSymbol !== 'TODOS' ? `?symbol=${encodeURIComponent(filterSymbol)}` : '';
+    const res = await fetch(`${apiBaseUrl}/api/trades/export-csv${query}`);
+    if (res.ok) {
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `trades_blotter_${filterSymbol}_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '_')}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+      return;
+    }
+  } catch {
+    // Fallback a exportación en memoria
+  }
+
+  const targetTrades = filterSymbol && filterSymbol !== 'TODOS'
+    ? trades.filter((t) => t.symbol.toUpperCase().includes(filterSymbol.toUpperCase()))
+    : trades;
+
+  if (!targetTrades || targetTrades.length === 0) return;
   const headers = ['ID', 'Timestamp_UTC', 'Symbol', 'Strategy', 'Side', 'Entry_Price', 'Exit_Mid_Price', 'Qty', 'Return_Pct', 'PnL_USD'];
-  const rows = trades.map((t) => [
+  const rows = targetTrades.map((t) => [
     t.id,
     t.time_str,
     t.symbol,
@@ -654,7 +677,7 @@ function exportTradesToCsv(trades: RecentTrade[]) {
   const encodedUri = encodeURI(csvContent);
   const link = document.createElement('a');
   link.setAttribute('href', encodedUri);
-  link.setAttribute('download', `trades_blotter_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '_')}.csv`);
+  link.setAttribute('download', `trades_blotter_${filterSymbol}_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '_')}.csv`);
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
@@ -1142,10 +1165,10 @@ export default function App() {
     if (data.order_book_depth) {
       setOrderBookDepth(data.order_book_depth);
     }
-    if (data.candles_history && Array.isArray(data.candles_history)) {
+    if (data.candles_history && Array.isArray(data.candles_history) && data.candles_history.length > 0) {
       setCandlesHistory(data.candles_history);
     }
-    if (data.equity_comparison && Array.isArray(data.equity_comparison)) {
+    if (data.equity_comparison && Array.isArray(data.equity_comparison) && data.equity_comparison.length > 0) {
       setEquityComparison(data.equity_comparison);
     }
     if (data.whale_and_liq_tape && Array.isArray(data.whale_and_liq_tape)) {
@@ -2247,11 +2270,11 @@ export default function App() {
                           ))}
                         </div>
                         <button
-                          onClick={() => exportTradesToCsv(recentTrades)}
-                          className="px-2.5 py-1 rounded bg-[#080A0F] hover:bg-[#1C2230] text-slate-300 border border-[#1C2230] font-mono text-[10px] font-bold flex items-center gap-1"
-                          title="Exportar blotter a CSV"
+                          onClick={() => exportTradesToCsv(recentTrades, apiBaseUrl, tradeFilterSymbol)}
+                          className="px-2.5 py-1 rounded bg-[#080A0F] hover:bg-[#1C2230] text-slate-300 border border-[#1C2230] font-mono text-[10px] font-bold flex items-center gap-1 transition-all active:scale-95"
+                          title="Exportar blotter completo de transacciones a CSV"
                         >
-                          <Download className="w-3 h-3 text-[#00F59B]" /> CSV
+                          <Download className="w-3 h-3 text-[#00F59B]" /> CSV ({filteredTrades.length})
                         </button>
                       </div>
                     )}

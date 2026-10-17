@@ -345,3 +345,54 @@ def test_cross_hedge_pairs_definition():
     assert "ETH/USDT:USDT" in CROSS_HEDGE_PAIRS
     assert "SOL/USDT:USDT" in CROSS_HEDGE_PAIRS
     assert len(CROSS_HEDGE_PAIRS) >= 5
+
+
+# =============================================================================
+# 8. Test Ampliación de Historial de Transacciones y Exportador CSV
+# =============================================================================
+
+def test_trades_history_expansion_and_csv_export_endpoint():
+    from fastapi.testclient import TestClient
+    from backend.telemetry_server import app, engine
+
+    client = TestClient(app)
+
+    # Inyectar 120 transacciones para superar el límite antiguo de 50
+    for i in range(120):
+        engine.record_trade_fill(
+            symbol="BTC/USDT:USDT" if i % 2 == 0 else "ETH/USDT:USDT",
+            strategy="AVELLANEDA_OBI",
+            side="BUY" if i % 2 == 0 else "SELL",
+            entry_price=80000.0 + i,
+            exit_or_mid_price=80010.0 + i,
+            qty=0.01,
+            return_pct=0.05,
+            pnl_usd=1.5,
+            trade_id=f"TEST_EXPAND_TRD_{i}",
+        )
+
+    # 1. Telemetría ahora devuelve más de 50 (hasta 500)
+    snap = engine.get_telemetry_snapshot()
+    assert len(snap["recent_trades"]) >= 120
+
+    # 2. Endpoint GET /api/trades
+    res = client.get("/api/trades?limit=1000")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "OK"
+    assert data["count"] >= 120
+
+    # Filtro por símbolo
+    res_eth = client.get("/api/trades?symbol=ETH&limit=1000")
+    assert res_eth.status_code == 200
+    assert all("ETH" in t["symbol"] for t in res_eth.json()["trades"])
+
+    # 3. Endpoint GET /api/trades/export-csv
+    res_csv = client.get("/api/trades/export-csv")
+    assert res_csv.status_code == 200
+    assert "text/csv" in res_csv.headers["content-type"]
+    assert "attachment; filename=" in res_csv.headers["content-disposition"]
+    csv_text = res_csv.text
+    assert "ID,Timestamp_MS,Time_UTC,Symbol,Strategy,Side" in csv_text
+    assert "TEST_EXPAND_TRD_0" in csv_text
+
