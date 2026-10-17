@@ -115,6 +115,9 @@ class BinanceLiveWsGateway:
         self.active_bids_by_symbol: dict[str, str] = {}
         self.active_asks_by_symbol: dict[str, str] = {}
         self.active_orders_meta: dict[str, dict[str, Any]] = {}
+        self._last_trade_ts_ms: dict[str, int] = {}
+        self._processed_trade_ids: set[str] = set()
+        self._init_ts_ms: int = int(time.time() * 1000)
 
         if exchange is not None:
             self.exchange = exchange
@@ -177,27 +180,56 @@ class BinanceLiveWsGateway:
             await self.exchange.set_leverage(max_leverage, target_sym)
             self.initialized_symbols.add(symbol)
         except Exception as e:
-            logger.warning(f"set_leverage {max_leverage} en {target_sym}: {e}")
-            if "does not have market symbol" not in str(e):
+            if "-4161" in str(e) or "leverage reduction" in str(e).lower():
+                logger.info(f"set_leverage {max_leverage} omitido en {target_sym} (-4161: reducción con posición abierta)")
                 self.initialized_symbols.add(symbol)
+            else:
+                logger.warning(f"set_leverage {max_leverage} en {target_sym}: {e}")
+                if "does not have market symbol" not in str(e):
+                    self.initialized_symbols.add(symbol)
 
     async def update_symbol_leverage_if_needed(self, symbol: str, optimal_leverage: int) -> bool:
         """
         Ajusta dinámicamente el apalancamiento en Binance cuando cambia en >= 1x.
         Modo ISOLATED estricto, entero entre 1x y 10x.
+        Protección contra error -4161:
+        Binance rechaza reducir apalancamiento si hay posición u órdenes abiertas.
+        Solo llama a set_leverage si opt_int > cur_lev o si no hay posición ni órdenes abiertas.
         """
         opt_int = max(1, min(int(optimal_leverage), 10))
         cur_lev = self.symbol_leverage.get(symbol, self.default_leverage)
         if cur_lev == opt_int:
             return False
         target_sym = self.resolve_binance_symbol(symbol)
+
+        # Si se requiere menor apalancamiento, verificar si hay posición u órdenes abiertas
+        if opt_int < cur_lev:
+            has_pos = False
+            if self.portfolio and self.portfolio.active_positions:
+                pos_val = float(self.portfolio.active_positions.get(symbol, 0.0) or self.portfolio.active_positions.get(target_sym, 0.0) or 0.0)
+                has_pos = abs(pos_val) > 1e-6
+            has_orders = (
+                symbol in self.active_bids_by_symbol
+                or symbol in self.active_asks_by_symbol
+                or any(m.get("symbol") in (symbol, target_sym) for m in self.active_orders_meta.values())
+            )
+            if has_pos or has_orders:
+                logger.info(
+                    f"Reducción de apalancamiento omitida en Binance {target_sym} ({cur_lev}x -> {opt_int}x) "
+                    "para evitar -4161 (posición u órdenes abiertas). Se escala quote_qty."
+                )
+                return False
+
         try:
             await self.exchange.set_leverage(opt_int, target_sym)
             self.symbol_leverage[symbol] = opt_int
             logger.info(f"Apalancamiento dinámico actualizado en Binance para {symbol}: {cur_lev}x -> {opt_int}x (ISOLATED)")
             return True
         except Exception as e:
-            logger.warning(f"Error actualizando apalancamiento dinámico en {target_sym}: {e}")
+            if "-4161" in str(e) or "leverage reduction" in str(e).lower():
+                logger.info(f"Binance rechazó reducción de apalancamiento en {target_sym} (-4161: posición abierta).")
+            else:
+                logger.warning(f"Error actualizando apalancamiento dinámico en {target_sym}: {e}")
             return False
 
     async def place_order_ws(self, order: OrderRequest) -> str:
@@ -656,6 +688,147 @@ class BinanceLiveWsGateway:
         except Exception as e:
             logger.error(f"Error sincronizando órdenes abiertas con Binance: {e}")
 
+        # Ingesta de ejecuciones reales (fetch_my_trades) hacia strategy_ledger y recent_trades
+        try:
+            if hasattr(self.exchange, "fetch_my_trades"):
+                symbols_to_check = list(self.initialized_symbols) or ["BTC/USDT:USDT"]
+                for sym in symbols_to_check:
+                    target_sym = self.resolve_binance_symbol(sym)
+                    last_ts = self._last_trade_ts_ms.get(sym, self._init_ts_ms)
+                    res_trades = self.exchange.fetch_my_trades(target_sym, since=last_ts)
+                    if inspect.isawaitable(res_trades):
+                        res_trades = await res_trades
+                    if isinstance(res_trades, list):
+                        for tr in res_trades:
+                            tid = str(tr.get("id") or "")
+                            if tid and tid in self._processed_trade_ids:
+                                continue
+                            if tid:
+                                self._processed_trade_ids.add(tid)
+
+                            tr_ts = int(tr.get("timestamp") or 0)
+                            if tr_ts > 0:
+                                self._last_trade_ts_ms[sym] = max(self._last_trade_ts_ms.get(sym, 0), tr_ts + 1)
+
+                            tr_side = str(tr.get("side") or "").upper()
+                            tr_px = float(tr.get("price") or 0.0)
+                            tr_qty = float(tr.get("amount") or 0.0)
+                            tr_cost = float(tr.get("cost") or (tr_px * tr_qty))
+                            cid = tr.get("clientOrderId") or tr.get("info", {}).get("clientOrderId") or str(tr.get("order") or "")
+
+                            fee_info = tr.get("fee") or {}
+                            fee_cost = float(fee_info.get("cost") or 0.0)
+                            realized_pnl_raw = float(tr.get("info", {}).get("realizedPnl") or 0.0)
+
+                            fill_res = self.ledger.record_fill(
+                                order_id_or_cid=cid,
+                                symbol=sym,
+                                side=tr_side,
+                                fill_price=tr_px,
+                                fill_qty=tr_qty,
+                                ts_ns=(tr_ts * 1_000_000) if tr_ts > 0 else time.time_ns(),
+                            )
+                            sub_lot = fill_res.get("sub_lot_id", "MAIN")
+                            strat = fill_res.get("strategy_id", "AVELLANEDA_OBI")
+                            strat_tag = f"{strat}_{sub_lot}" if sub_lot != "MAIN" else strat
+
+                            gross_pnl = float(fill_res.get("realized_pnl_usd", 0.0) or realized_pnl_raw)
+                            net_pnl = gross_pnl - fee_cost
+                            ret_pct = round((net_pnl / max(tr_cost, 1.0)) * 100.0, 3) if tr_cost > 0 else 0.05
+
+                            logger.info(
+                                f"TRADE REAL REGISTRADO [Binance {sym}]: {tr_side} {tr_qty} @ ${tr_px} "
+                                f"(net PnL: ${net_pnl:.2f}, fee: ${fee_cost:.4f}, lot: {strat_tag})"
+                            )
+                            if self.on_fill and callable(self.on_fill):
+                                try:
+                                    self.on_fill(
+                                        symbol=sym,
+                                        strategy=strat_tag,
+                                        side=tr_side,
+                                        entry_price=tr_px,
+                                        exit_or_mid_price=tr_px,
+                                        qty=tr_qty,
+                                        return_pct=ret_pct,
+                                        pnl_usd=round(net_pnl, 2),
+                                        trade_id=f"LIVE-{tid or cid}",
+                                        timestamp_ns=(tr_ts * 1_000_000) if tr_ts > 0 else None,
+                                    )
+                                except Exception as ef:
+                                    logger.debug(f"Error despachando on_fill Binance: {ef}")
+        except Exception as et:
+            logger.debug(f"fetch_my_trades en Binance sync_portfolio_state: {et}")
+
+    async def reconcile_existing_positions(self, symbols: list[str]) -> list[dict[str, Any]]:
+        """
+        Reconciliación en Frío (reconcile_existing_positions):
+        1. Limpia órdenes huérfanas antiguas con cancel_all_orders.
+        2. Inspecciona fetch_positions.
+        3. Registra posiciones abiertas en strategy_ledger.py con su entryPrice y
+           su breakEvenPrice real (float(pos.get("info", {}).get("breakEvenPrice") or entry_price)),
+           para que el motor gestione su cierre reduceOnly por encima del punto de equilibrio.
+        """
+        reconciled = []
+        for sym in symbols:
+            target_sym = self.resolve_binance_symbol(sym)
+            try:
+                if hasattr(self.exchange, "cancel_all_orders"):
+                    await self.exchange.cancel_all_orders(target_sym)
+            except Exception as e:
+                logger.debug(f"cancel_all_orders en reconcile Binance ({target_sym}): {e}")
+
+        positions = []
+        try:
+            if hasattr(self.exchange, "fetch_positions"):
+                res = self.exchange.fetch_positions(symbols)
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, list):
+                    positions = res
+        except Exception as e:
+            try:
+                res = self.exchange.fetch_positions()
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, list):
+                    positions = res
+            except Exception as e2:
+                logger.error(f"Error consultando fetch_positions en reconcile Binance: {e2}")
+
+        for pos in positions:
+            sym = pos.get("symbol")
+            if not sym:
+                continue
+            raw_pos_amt = pos.get("info", {}).get("positionAmt")
+            amt = float(pos.get("contracts") or raw_pos_amt or 0.0)
+            side_str = str(pos.get("side") or "").lower()
+            is_short = (side_str == "short") or (raw_pos_amt is not None and float(raw_pos_amt) < 0.0) or (amt < 0.0)
+            qty = abs(amt)
+            if qty > 1e-8:
+                entry_px = float(pos.get("entryPrice") or pos.get("info", {}).get("entryPrice") or 0.0)
+                be_px = float(pos.get("info", {}).get("breakEvenPrice") or entry_px)
+                side = "SELL" if is_short else "BUY"
+                self.ledger.reconcile_position(
+                    symbol=sym,
+                    side=side,
+                    quantity=qty,
+                    entry_price=entry_px,
+                    break_even_price=be_px,
+                    strategy_id="AVELLANEDA_OBI",
+                    sub_lot_id="MAIN",
+                )
+                reconciled.append({
+                    "symbol": sym,
+                    "side": side,
+                    "qty": qty,
+                    "entry_price": entry_px,
+                    "break_even_price": be_px,
+                })
+                logger.info(
+                    f"POSICIÓN RECONCILIADA en Binance {sym}: {side} {qty} @ entry ${entry_px:.2f} (Break-Even: ${be_px:.2f})"
+                )
+        return reconciled
+
     def start_sync_loop(self, portfolio: PortfolioState) -> None:
         """Inicia el bucle de sincronización periódica cada 2 segundos."""
         self.running = True
@@ -732,6 +905,9 @@ class BingXLiveWsGateway:
             "XAG/USDT:USDT": "NCCOXAG2USD/USDT:USDT",
             "PEPE/USDT:USDT": "1000PEPE/USDT:USDT",
         }
+        self._last_trade_ts_ms: dict[str, int] = {}
+        self._processed_trade_ids: set[str] = set()
+        self._init_ts_ms: int = int(time.time() * 1000)
 
         if exchange is not None:
             self.exchange = exchange
@@ -1256,6 +1432,139 @@ class BingXLiveWsGateway:
         except Exception as e:
             logger.error(f"Error sincronizando órdenes abiertas con BingX: {e}")
 
+        # Ingesta de Ejecuciones Reales (fetch_my_trades) hacia strategy_ledger.py y recent_trades en BingX
+        try:
+            if hasattr(self.exchange, "fetch_my_trades"):
+                for sym in list(portfolio.active_positions.keys()) + list(self.active_bids_by_symbol.keys()) + list(self.active_asks_by_symbol.keys()):
+                    target_sym = self.resolve_bingx_symbol(sym)
+                    since_ts = self._last_trade_ts_ms.get(sym, self._init_ts_ms - 60_000)
+                    res_trades = self.exchange.fetch_my_trades(target_sym, since=since_ts)
+                    if inspect.isawaitable(res_trades):
+                        res_trades = await res_trades
+                    if not isinstance(res_trades, list):
+                        continue
+                    for tr in res_trades:
+                        if not isinstance(tr, dict):
+                            continue
+                        tid = str(tr.get("id") or "")
+                        if tid and tid in self._processed_trade_ids:
+                            continue
+                        if tid:
+                            self._processed_trade_ids.add(tid)
+                        tr_ts = int(tr.get("timestamp") or 0)
+                        if tr_ts > self._last_trade_ts_ms.get(sym, 0):
+                            self._last_trade_ts_ms[sym] = tr_ts
+                        tr_side = str(tr.get("side") or "").upper()
+                        tr_px = float(tr.get("price") or 0.0)
+                        tr_qty = float(tr.get("amount") or 0.0)
+                        fee_cost = float(tr.get("fee", {}).get("cost") or 0.0) if isinstance(tr.get("fee"), dict) else 0.0
+                        cid = str(tr.get("order") or tr.get("clientOrderId") or "")
+                        fill_res = self.ledger.record_fill(
+                            order_id_or_cid=cid or f"tr_{tid}",
+                            symbol=sym,
+                            side=tr_side,
+                            fill_price=tr_px,
+                            fill_qty=tr_qty,
+                            ts_ns=(tr_ts * 1_000_000) if tr_ts > 0 else time.time_ns(),
+                        )
+                        sub_lot = fill_res.get("sub_lot_id", "MAIN")
+                        strat_tag = f"{fill_res.get('strategy_id', 'AVELLANEDA_OBI')}_{sub_lot}" if sub_lot != "MAIN" else fill_res.get("strategy_id", "AVELLANEDA_OBI")
+                        gross_pnl = float(fill_res.get("realized_pnl_usd", 0.0) or 0.0)
+                        net_pnl = gross_pnl - fee_cost
+                        ret_pct = (net_pnl / (tr_px * tr_qty)) * 100.0 if (tr_px * tr_qty) > 0 else 0.05
+                        logger.info(
+                            f"TRADE REAL REGISTRADO [BingX {sym}]: {tr_side} {tr_qty} @ ${tr_px} "
+                            f"(net PnL: ${net_pnl:.2f}, fee: ${fee_cost:.4f}, lot: {strat_tag})"
+                        )
+                        if self.on_fill and callable(self.on_fill):
+                            try:
+                                self.on_fill(
+                                    symbol=sym,
+                                    strategy=strat_tag,
+                                    side=tr_side,
+                                    entry_price=tr_px,
+                                    exit_or_mid_price=tr_px,
+                                    qty=tr_qty,
+                                    return_pct=ret_pct,
+                                    pnl_usd=round(net_pnl, 2),
+                                    trade_id=f"LIVE-BINGX-{tid or cid}",
+                                    timestamp_ns=(tr_ts * 1_000_000) if tr_ts > 0 else None,
+                                )
+                            except Exception as ef:
+                                logger.debug(f"Error despachando on_fill BingX: {ef}")
+        except Exception as et:
+            logger.debug(f"fetch_my_trades en BingX sync_portfolio_state: {et}")
+
+    async def reconcile_existing_positions(self, symbols: list[str]) -> list[dict[str, Any]]:
+        """
+        Reconciliación en Frío (reconcile_existing_positions) en BingX:
+        1. Limpia órdenes huérfanas antiguas con cancel_all_orders.
+        2. Inspecciona fetch_positions.
+        3. Registra posiciones abiertas en strategy_ledger.py con su entryPrice y
+           su breakEvenPrice real (float(pos.get("info", {}).get("breakEvenPrice") or entry_price)),
+           para que el motor gestione su cierre reduceOnly por encima del punto de equilibrio.
+        """
+        reconciled = []
+        for sym in symbols:
+            target_sym = self.resolve_bingx_symbol(sym)
+            try:
+                if hasattr(self.exchange, "cancel_all_orders"):
+                    await self.exchange.cancel_all_orders(target_sym)
+            except Exception as e:
+                logger.debug(f"cancel_all_orders en reconcile BingX ({target_sym}): {e}")
+
+        positions = []
+        try:
+            if hasattr(self.exchange, "fetch_positions"):
+                res = self.exchange.fetch_positions(symbols)
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, list):
+                    positions = res
+        except Exception as e:
+            try:
+                res = self.exchange.fetch_positions()
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, list):
+                    positions = res
+            except Exception as e2:
+                logger.error(f"Error consultando fetch_positions en reconcile BingX: {e2}")
+
+        for pos in positions:
+            sym = pos.get("symbol")
+            if not sym:
+                continue
+            raw_pos_amt = pos.get("info", {}).get("positionAmt")
+            amt = float(pos.get("contracts") or raw_pos_amt or 0.0)
+            side_str = str(pos.get("side") or "").lower()
+            is_short = (side_str == "short") or (raw_pos_amt is not None and float(raw_pos_amt) < 0.0) or (amt < 0.0)
+            qty = abs(amt)
+            if qty > 1e-8:
+                entry_px = float(pos.get("entryPrice") or pos.get("info", {}).get("entryPrice") or 0.0)
+                be_px = float(pos.get("info", {}).get("breakEvenPrice") or entry_px)
+                side = "SELL" if is_short else "BUY"
+                self.ledger.reconcile_position(
+                    symbol=sym,
+                    side=side,
+                    quantity=qty,
+                    entry_price=entry_px,
+                    break_even_price=be_px,
+                    strategy_id="AVELLANEDA_OBI",
+                    sub_lot_id="MAIN",
+                )
+                reconciled.append({
+                    "symbol": sym,
+                    "side": side,
+                    "qty": qty,
+                    "entry_price": entry_px,
+                    "break_even_price": be_px,
+                })
+                logger.info(
+                    f"POSICIÓN RECONCILIADA en BingX {sym}: {side} {qty} @ entry ${entry_px:.2f} (Break-Even: ${be_px:.2f})"
+                )
+        return reconciled
+
     def start_sync_loop(self, portfolio: PortfolioState) -> None:
         """Inicia el bucle de sincronización periódica cada 2 segundos."""
         self.running = True
@@ -1419,6 +1728,7 @@ class SymbolExecutionContext:
     live_active_ask_id: str | None = None
     inventory_open_ts_ns: int | None = None
     avg_entry_price: float | None = None
+    break_even_price: float | None = None
     take_profit_price: float | None = None
     stop_loss_price: float | None = None
     tp_bps: float = 22.0
@@ -2607,6 +2917,18 @@ class DryRunExecutionEngine:
                 init_lev = self.symbol_optimal_leverage.get(sym, self.selected_leverage)
                 await self.live_gateway.initialize_symbol_margin(sym, max_leverage=init_lev)
 
+            if hasattr(self.live_gateway, "reconcile_existing_positions"):
+                try:
+                    reconciled = await self.live_gateway.reconcile_existing_positions(self.symbols)
+                    for rec in reconciled:
+                        rsym = rec.get("symbol")
+                        if rsym in self.symbol_contexts:
+                            rctx = self.symbol_contexts[rsym]
+                            rctx.avg_entry_price = float(rec.get("entry_price") or 0.0)
+                            rctx.break_even_price = float(rec.get("break_even_price") or rctx.avg_entry_price)
+                except Exception as er:
+                    logger.warning(f"Error en reconcile_existing_positions Binance: {er}")
+
             await self.live_gateway.sync_portfolio_state(self.portfolio)
             self.live_gateway.start_sync_loop(self.portfolio)
             self.trading_mode = "LIVE_BINANCE"
@@ -2637,6 +2959,18 @@ class DryRunExecutionEngine:
             for sym in self.symbols:
                 init_lev = self.symbol_optimal_leverage.get(sym, self.selected_leverage)
                 await self.bingx_gateway.initialize_symbol_margin(sym, max_leverage=init_lev)
+
+            if hasattr(self.bingx_gateway, "reconcile_existing_positions"):
+                try:
+                    reconciled = await self.bingx_gateway.reconcile_existing_positions(self.symbols)
+                    for rec in reconciled:
+                        rsym = rec.get("symbol")
+                        if rsym in self.symbol_contexts:
+                            rctx = self.symbol_contexts[rsym]
+                            rctx.avg_entry_price = float(rec.get("entry_price") or 0.0)
+                            rctx.break_even_price = float(rec.get("break_even_price") or rctx.avg_entry_price)
+                except Exception as er:
+                    logger.warning(f"Error en reconcile_existing_positions BingX: {er}")
 
             await self.bingx_gateway.sync_portfolio_state(self.portfolio)
             self.bingx_gateway.start_sync_loop(self.portfolio)
@@ -2867,6 +3201,7 @@ class DryRunExecutionEngine:
                             inventory_holding_time_s=holding_time_s,
                             vpin=sym_vpin,
                             entry_price=ctx.avg_entry_price,
+                            break_even_price=getattr(ctx, "break_even_price", None),
                         )
 
                         # Escudo de Contagio Sistémico sobre Altcoins (sym != BTC)

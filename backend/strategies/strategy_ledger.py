@@ -18,6 +18,7 @@ class VirtualPositionLot:
     sub_lot_id: str   # e.g. "L1", "L2", "L3", "MAIN"
     inventory_q: float = 0.0  # signed: >0 para Long, <0 para Short
     entry_price: float = 0.0
+    break_even_price: float = 0.0
     entry_ts_ns: int = 0
     realized_pnl_usd: float = 0.0
     active_orders: set[str] = field(default_factory=set)
@@ -211,6 +212,30 @@ class VirtualStrategyLedger:
     def get_net_inventory(self, symbol: str) -> float:
         """Devuelve la suma total de inventario de todos los lotes del par (debe coincidir con la posición neta en Binance)."""
         return sum(lot.inventory_q for lot in self.lots.values() if lot.symbol == symbol)
+
+    def reconcile_position(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        entry_price: float,
+        break_even_price: float | None = None,
+        strategy_id: str = "AVELLANEDA_OBI",
+        sub_lot_id: str = "MAIN",
+    ) -> VirtualPositionLot:
+        """
+        Reconciliación en Frío (reconcile_existing_positions):
+        Registra una posición preexistente en el exchange dentro del sub-libro virtual
+        con su cantidad firmada, precio de entrada y break-even price real.
+        """
+        lot = self.get_or_create_lot(symbol, strategy_id, sub_lot_id)
+        qty = abs(float(quantity))
+        signed_q = -qty if str(side).upper() in ("SELL", "SHORT") else qty
+        lot.inventory_q = signed_q
+        lot.entry_price = float(entry_price)
+        lot.break_even_price = float(break_even_price if break_even_price is not None and break_even_price > 0 else entry_price)
+        lot.entry_ts_ns = time.time_ns()
+        return lot
 
     def get_lots_by_symbol(self, symbol: str) -> list[VirtualPositionLot]:
         """Retorna todos los lotes de un símbolo."""

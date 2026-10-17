@@ -131,9 +131,12 @@ class AvellanedaStoikovOBIEngine:
         inventory_holding_time_s: float = 0.0,
         vpin: float | None = None,
         entry_price: float | None = None,
+        break_even_price: float | None = None,
     ) -> AvellanedaQuoteResult:
         if ring_buffer.ob_count == 0:
             return AvellanedaQuoteResult(0.0, 0.0, None, None, False, False, 0.0, 0.0, [], [])
+
+        effective_entry = break_even_price if (break_even_price is not None and break_even_price > 0) else entry_price
 
         latest_idx = (ring_buffer.ob_head - 1) % ring_buffer.capacity
         best_bid = float(ring_buffer.ob_bid_prices[latest_idx, 0])
@@ -186,22 +189,20 @@ class AvellanedaStoikovOBIEngine:
         now_ms_tag = int(time.time() * 1000) % 100_000_000
         tfi = ring_buffer.compute_tfi(window_ns=500_000_000) if hasattr(ring_buffer, "compute_tfi") else 0.0
 
-        # Validación de MIN_NOTIONAL en la Escalera de Niveles:
-        # En Binance Futures, BTC exige un nocional mínimo de $50-100 USDT, ETH/LINK $20 USDT y otros $5 USDT.
-        # Si el tamaño asignado a un escalón menor (20% en L3) cae por debajo del min_notional,
-        # el motor fusiona automáticamente los escalones (3 niveles -> 2 niveles -> 1 nivel L1) para
-        # no recibir rechazos -4164 de la API.
+        # Auto-Colapso de Escalera por MIN_NOTIONAL ($100 USDT en BTC, $20 en ETH, $5 en el resto):
+        # Si el nocional de cualquier nivel individual (L1: 45%, L2: 35%, L3: 20%) queda por debajo
+        # del min_notional del símbolo, colapsa automáticamente la escalera en 1 sola orden L1
+        # con el 100% del cupo del par para evitar rechazos -4164 de Binance / BingX.
         total_quote_notional = self.quote_qty * mid_price
-        if total_quote_notional * 0.20 >= self.min_notional:
+        if (
+            total_quote_notional * 0.20 >= self.min_notional
+            and total_quote_notional * 0.35 >= self.min_notional
+            and total_quote_notional * 0.45 >= self.min_notional
+        ):
             ladder_tiers = [
                 (0.45, 1.0, "L1"),
                 (0.35, 2.0, "L2"),
                 (0.20, 3.5, "L3"),
-            ]
-        elif total_quote_notional * 0.35 >= self.min_notional:
-            ladder_tiers = [
-                (0.65, 1.0, "L1"),
-                (0.35, 2.0, "L2"),
             ]
         else:
             ladder_tiers = [
@@ -224,11 +225,11 @@ class AvellanedaStoikovOBIEngine:
             safe_level_bid = max(min(raw_level_bid, best_ask - self.tick_size), self.tick_size)
 
             # Si estamos en SHORT, este BID es orden de cierre: imponer Break-Even real y Momentum Trailing
-            if normalized_inventory_q < -1e-4 and entry_price and entry_price > 0:
-                max_be_bid = entry_price * (1.0 - (be_bps_delta / 10_000.0))
+            if normalized_inventory_q < -1e-4 and effective_entry and effective_entry > 0:
+                max_be_bid = effective_entry * (1.0 - (be_bps_delta / 10_000.0))
                 safe_level_bid = min(safe_level_bid, max_be_bid)
                 # Momentum Trailing Exit a favor de la tendencia bajista si OBI < -0.45 o TFI < -0.50
-                if (obi < -0.45 or tfi < -0.50) and (best_ask < entry_price or mid_price < entry_price):
+                if (obi < -0.45 or tfi < -0.50) and (best_ask < effective_entry or mid_price < effective_entry):
                     trail_shift = mid_price * (self.momentum_shift_bps / 10_000.0)
                     safe_level_bid = max(safe_level_bid - trail_shift, self.tick_size)
 
@@ -262,11 +263,11 @@ class AvellanedaStoikovOBIEngine:
                 safe_level_ask = max(raw_level_ask, best_bid + self.tick_size)
 
                 # Si estamos en LONG, este ASK es orden de cierre: imponer Break-Even real y Momentum Trailing
-                if normalized_inventory_q > 1e-4 and entry_price and entry_price > 0:
-                    min_be_ask = entry_price * (1.0 + (be_bps_delta / 10_000.0))
+                if normalized_inventory_q > 1e-4 and effective_entry and effective_entry > 0:
+                    min_be_ask = effective_entry * (1.0 + (be_bps_delta / 10_000.0))
                     safe_level_ask = max(safe_level_ask, min_be_ask)
                     # Momentum Trailing Exit a favor de la tendencia alcista si OBI > 0.45 o TFI > 0.50
-                    if (obi > 0.45 or tfi > 0.50) and (best_bid > entry_price or mid_price > entry_price):
+                    if (obi > 0.45 or tfi > 0.50) and (best_bid > effective_entry or mid_price > effective_entry):
                         trail_shift = mid_price * (self.momentum_shift_bps / 10_000.0)
                         safe_level_ask = safe_level_ask + trail_shift
 

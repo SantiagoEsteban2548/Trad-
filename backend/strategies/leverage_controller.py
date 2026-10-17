@@ -67,3 +67,24 @@ class AutonomousLeverageController:
         int_lev = int(round(calculated_lev))
 
         return max(cls.MIN_LEVERAGE, min(int_lev, cls.MAX_LEVERAGE))
+
+    @classmethod
+    def should_apply_exchange_leverage(
+        cls,
+        new_leverage: int,
+        current_leverage: int,
+        has_open_position: bool = False,
+        has_open_orders: bool = False,
+    ) -> bool:
+        """
+        Determina si es seguro invocar set_leverage en Binance Isolated Margin.
+        Protección contra error -4161:
+        Binance rechaza reducir apalancamiento si hay posición u órdenes abiertas.
+        Solo permite set_leverage si new_leverage > current_leverage, o si la posición
+        y órdenes abiertas del símbolo son 0.
+        """
+        if new_leverage > current_leverage:
+            return True
+        if new_leverage < current_leverage:
+            return not (has_open_position or has_open_orders)
+        return False

@@ -294,3 +294,193 @@ async def test_prune_stale_orders():
     remaining_asks = [o for o in sim.orders.values() if o.status == "OPEN" and o.request.side == "SELL"]
     assert len(remaining_bids) == 3
     assert len(remaining_asks) == 3
+
+
+@pytest.mark.asyncio
+async def test_ladder_auto_collapse_under_min_notional():
+    """
+    Falla 5: Auto-Colapso de escalera a 1 sola orden si nocional cae por debajo de min_notional.
+    En BTC (min_notional=$100), si total_notional es $120, L3 (20%= $24) estaría bajo $100.
+    Debe colapsar a 1 solo nivel (L1) con 100% de la cantidad.
+    """
+    config = RegimeConfig(
+        gamma=0.05,
+        kappa=1.5,
+        time_horizon_tau=0.05,
+        obi_shield_threshold=0.60,
+        obi_volatility_shift_mult=0.5,
+    )
+    gatekeeper = MandateGatekeeper()
+    engine = AvellanedaStoikovOBIEngine(
+        symbol="BTC/USDT:USDT",
+        tick_size=0.10,
+        step_size=0.001,
+        quote_qty=0.0015,  # 0.0015 * 80000 = $120 total nocional
+        min_notional=100.0,
+        config=config,
+        gatekeeper=gatekeeper,
+    )
+
+    ring = MarketRingBuffer(capacity=50)
+    now_ns = time.time_ns()
+    ring.push_order_book(
+        bid_prices=[80000.0, 79990.0, 79980.0, 79970.0, 79960.0],
+        bid_qtys=[5.0, 5.0, 5.0, 5.0, 5.0],
+        ask_prices=[80010.0, 80020.0, 80030.0, 80040.0, 80050.0],
+        ask_qtys=[5.0, 5.0, 5.0, 5.0, 5.0],
+        timestamp_ns=now_ns,
+    )
+
+    portfolio = PortfolioState(
+        base_capital_usd=2000.0,
+        current_equity_usd=2000.0,
+        daily_high_watermark_usd=2000.0,
+        realized_pnl_today_usd=0.0,
+        active_positions={},
+        rolling_edge_mu=0.045,
+        rolling_variance_sigma2=0.0090,
+    )
+    mock_gw = AsyncMock()
+
+    # Total notional = 0.0015 * 80000 = 120. 20% es 24 < min_notional (100) -> colapsa a 1 solo nivel
+    res = await engine.on_l2_update(ring, portfolio, mock_gw, normalized_inventory_q=0.0)
+    assert res.bid_ladder is not None
+    assert len(res.bid_ladder) == 1
+    assert "_L1_" in res.bid_ladder[0].client_order_id
+    assert res.bid_ladder[0].qty * res.bid_ladder[0].price >= 100.0
+
+    # Si total nocional es $600 (0.0075 * 80000), 20% es 120 >= 100 -> mantiene 3 niveles
+    engine.quote_qty = 0.0075
+    res_3levels = await engine.on_l2_update(ring, portfolio, mock_gw, normalized_inventory_q=0.0)
+    assert res_3levels.bid_ladder is not None
+    assert len(res_3levels.bid_ladder) == 3
+
+
+def test_leverage_controller_binance_4161_protection():
+    """
+    Falla 4: Protección contra el Error -4161 de Binance en leverage_controller.py.
+    Binance rechaza reducir apalancamiento si hay posición u órdenes abiertas en el símbolo.
+    """
+    # Aumentar apalancamiento siempre permitido
+    assert AutonomousLeverageController.should_apply_exchange_leverage(
+        new_leverage=7, current_leverage=3, has_open_position=True, has_open_orders=True
+    ) is True
+
+    # Reducir apalancamiento bloqueado si hay posición abierta
+    assert AutonomousLeverageController.should_apply_exchange_leverage(
+        new_leverage=3, current_leverage=7, has_open_position=True, has_open_orders=False
+    ) is False
+
+    # Reducir apalancamiento bloqueado si hay órdenes abiertas
+    assert AutonomousLeverageController.should_apply_exchange_leverage(
+        new_leverage=3, current_leverage=7, has_open_position=False, has_open_orders=True
+    ) is False
+
+    # Reducir apalancamiento permitido solo si posición y órdenes son 0
+    assert AutonomousLeverageController.should_apply_exchange_leverage(
+        new_leverage=3, current_leverage=7, has_open_position=False, has_open_orders=False
+    ) is True
+
+
+def test_cold_reconciliation_and_break_even_entry():
+    """
+    Falla 2: Reconciliación en Frío y registro de breakEvenPrice en strategy_ledger.
+    """
+    ledger = VirtualStrategyLedger()
+    lot = ledger.reconcile_position(
+        symbol="BTC/USDT:USDT",
+        side="BUY",
+        quantity=0.005,
+        entry_price=80000.0,
+        break_even_price=80050.0,
+        strategy_id="AVELLANEDA_OBI",
+        sub_lot_id="MAIN",
+    )
+    assert lot.symbol == "BTC/USDT:USDT"
+    assert lot.inventory_q == 0.005
+    assert lot.entry_price == 80000.0
+    assert lot.break_even_price == 80050.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_my_trades_ingestion_and_net_pnl():
+    """
+    Falla 1: Ingesta de Ejecuciones Reales (fetch_my_trades) deduciendo fees y actualizando blotter.
+    """
+    from backend.telemetry_server import BinanceLiveWsGateway
+
+    mock_exchange = AsyncMock()
+    mock_exchange.fetch_balance = AsyncMock(return_value={"total": {"USDT": 1000.0}})
+    mock_exchange.fetch_positions = AsyncMock(return_value=[])
+    mock_exchange.fetch_open_orders = AsyncMock(return_value=[])
+
+    captured_fills = []
+    def mock_on_fill(**kwargs):
+        captured_fills.append(kwargs)
+
+    portfolio = PortfolioState(
+        base_capital_usd=1000.0,
+        current_equity_usd=1000.0,
+        daily_high_watermark_usd=1000.0,
+        realized_pnl_today_usd=0.0,
+        active_positions={"BTC/USDT:USDT": 500.0},
+        rolling_edge_mu=0.045,
+        rolling_variance_sigma2=0.0090,
+    )
+
+    gw = BinanceLiveWsGateway(
+        api_key="mock",
+        api_secret="mock",
+        exchange=mock_exchange,
+        portfolio=portfolio,
+        on_fill=mock_on_fill,
+    )
+
+    # Simular un trade real devuelto por Binance con comisión
+    trade_id = "tr_binance_9999"
+    mock_trade = {
+        "id": trade_id,
+        "symbol": "BTC/USDT:USDT",
+        "timestamp": int(time.time() * 1000),
+        "side": "buy",
+        "price": 80000.0,
+        "amount": 0.005,
+        "fee": {"cost": 0.16, "currency": "USDT"},
+        "clientOrderId": "AVEL_L1_test_01",
+    }
+    mock_exchange.fetch_my_trades = AsyncMock(return_value=[mock_trade])
+
+    await gw.sync_portfolio_state(portfolio)
+
+    assert len(captured_fills) == 1
+    fill = captured_fills[0]
+    assert fill["symbol"] == "BTC/USDT:USDT"
+    assert fill["side"] == "BUY"
+    assert fill["entry_price"] == 80000.0
+    assert fill["qty"] == 0.005
+    # PnL neto descontando el fee (0.0 gross - 0.16 fee = -0.16)
+    assert fill["pnl_usd"] == -0.16
+
+    # Verificar que el mismo trade no se procesa 2 veces (de-duplicación)
+    await gw.sync_portfolio_state(portfolio)
+    assert len(captured_fills) == 1
+
+
+def test_unified_regime_config_path():
+    """
+    Falla 3: Unificación de la Ruta Duplicada de regime_config.json.
+    Verifica que backend/config/regime_config.json sea la ruta única canónica.
+    """
+    from backend.strategies.regime_config import DEFAULT_REGIME_CONFIG_PATH
+    from backend.telemetry_server import CONFIG_PATH
+    from pathlib import Path
+
+    assert DEFAULT_REGIME_CONFIG_PATH == CONFIG_PATH
+    assert DEFAULT_REGIME_CONFIG_PATH.name == "regime_config.json"
+    assert DEFAULT_REGIME_CONFIG_PATH.parent.name == "config"
+
+    # Verificar que NO exista la copia duplicada en backend/regime_config.json
+    root_dir = DEFAULT_REGIME_CONFIG_PATH.parent.parent
+    legacy_file = root_dir / "regime_config.json"
+    assert not legacy_file.exists(), f"El archivo duplicado {legacy_file} no debe existir."
+
