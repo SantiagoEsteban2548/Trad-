@@ -115,6 +115,7 @@ export interface OpenOrder {
   queue_ahead_qty: number;
   strategy: string;
   status: string;
+  exchange?: 'binance' | 'bingx' | string;
 }
 
 export interface RecentTrade {
@@ -859,6 +860,7 @@ export default function App() {
   const [dailyDrawdownPct, setDailyDrawdownPct] = useState<number>(0.0);
   const [profitSweepReady, setProfitSweepReady] = useState<boolean>(false);
   const [sweptSpotVault, setSweptSpotVault] = useState<number>(0.0);
+  const [exchangeEquities, setExchangeEquities] = useState<Record<string, number>>({});
 
   // Operational Mode State: PAPER_L2 vs LIVE_BINANCE vs LIVE_BINGX vs LIVE_MULTI
   const [tradingMode, setTradingMode] = useState<'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI'>('PAPER_L2');
@@ -1200,6 +1202,9 @@ export default function App() {
       if (data.portfolio.simulated_vault_usd !== undefined) {
         setSweptSpotVault(data.portfolio.simulated_vault_usd);
       }
+      if (data.portfolio.exchange_equities) {
+        setExchangeEquities(data.portfolio.exchange_equities);
+      }
     }
 
     if (data.mandate_gates) {
@@ -1495,7 +1500,7 @@ export default function App() {
       const res = await fetch(`${apiBaseUrl}/api/reset-state`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ base_capital_usd: 5000.0 }),
+        body: JSON.stringify({}),
       });
       const data = await res.json();
       if (res.ok) {
@@ -1855,12 +1860,31 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-2">
                   {/* Card 1: Equity Total ($) & % Retorno */}
                   <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-2.5 flex flex-col justify-between">
-                    <span className="text-[10px] font-mono text-slate-400 uppercase tracking-tight">Equity Total</span>
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-mono text-slate-400 uppercase tracking-tight">Equity Total</span>
+                      {tradingMode === 'LIVE_MULTI' && (
+                        <span className="text-[9px] font-mono px-1 py-0.2 rounded bg-[#06B6D4]/15 text-[#06B6D4] border border-[#06B6D4]/30 font-bold">
+                          DUAL
+                        </span>
+                      )}
+                    </div>
                     <div className="text-sm font-mono font-bold text-white mt-0.5">
                       ${currentEquity.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </div>
-                    <div className="text-[10px] font-mono text-[#00F59B] mt-0.5 font-bold">
-                      +{dailyReturnPct.toFixed(2)}%
+                    <div className="flex items-center justify-between mt-0.5">
+                      <div className={`text-[10px] font-mono font-bold ${dailyReturnPct >= 0 ? 'text-[#00F59B]' : 'text-[#FF4D4D]'}`}>
+                        {dailyReturnPct >= 0 ? `+${dailyReturnPct.toFixed(2)}%` : `${dailyReturnPct.toFixed(2)}%`}
+                      </div>
+                      {tradingMode === 'LIVE_MULTI' && exchangeEquities && (
+                        <div className="text-[9px] font-mono text-slate-400 space-x-1">
+                          {exchangeEquities.binance !== undefined && (
+                            <span title="Binance Margin Balance">Bin: ${(exchangeEquities.binance).toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
+                          )}
+                          {exchangeEquities.bingx !== undefined && (
+                            <span title="BingX VST Balance">| Bing: ${(exchangeEquities.bingx).toLocaleString('en-US', { maximumFractionDigits: 0 })}</span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -2349,7 +2373,20 @@ export default function App() {
                                       {ord.level || 'L1'}
                                     </span>
                                   </td>
-                                  <td className="py-1.5 px-2.5 font-bold text-white">{ord.symbol.split('/')[0]}</td>
+                                  <td className="py-1.5 px-2.5 font-bold text-white">
+                                    <div className="flex items-center gap-1.5">
+                                      <span>{ord.symbol.split('/')[0]}</span>
+                                      {ord.exchange && (
+                                        <span className={`px-1 py-0.2 rounded text-[9px] font-bold ${
+                                          ord.exchange.toLowerCase() === 'bingx'
+                                            ? 'bg-blue-500/20 text-blue-400 border border-blue-500/40'
+                                            : 'bg-amber-500/20 text-amber-400 border border-amber-500/40'
+                                        }`}>
+                                          {ord.exchange.toUpperCase()}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </td>
                                   <td className="py-1.5 px-2.5">
                                     <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
                                       isBid ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/30' : 'bg-[#A855F7]/15 text-[#A855F7] border border-[#A855F7]/30'

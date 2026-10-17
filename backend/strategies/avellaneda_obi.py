@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import time
+import uuid
 from dataclasses import dataclass
 
 from backend.ingestion.ring_buffer import MarketRingBuffer
@@ -238,7 +239,7 @@ class AvellanedaStoikovOBIEngine:
                 needed_qty = math.ceil(self.min_notional / safe_level_bid / self.step_size) * self.step_size
                 raw_qty = max(raw_qty, needed_qty)
             level_qty = truncate_decimal_step(raw_qty, self.step_size)
-            cid = f"AV_{sub_lot}_{now_ms_tag}_{int(weight * 100)}"
+            cid = f"AV_{sub_lot}_B_{now_ms_tag}_{uuid.uuid4().hex[:4]}"
 
             cand_bid = OrderRequest.build_maker_order(
                 symbol=self.symbol,
@@ -276,7 +277,7 @@ class AvellanedaStoikovOBIEngine:
                     needed_qty = math.ceil(self.min_notional / safe_level_ask / self.step_size) * self.step_size
                     raw_qty = max(raw_qty, needed_qty)
                 level_qty = truncate_decimal_step(raw_qty, self.step_size)
-                cid = f"AV_{sub_lot}_{now_ms_tag}_{int(weight * 100)}"
+                cid = f"AV_{sub_lot}_S_{now_ms_tag}_{uuid.uuid4().hex[:4]}"
 
                 cand_ask = OrderRequest.build_maker_order(
                     symbol=self.symbol,

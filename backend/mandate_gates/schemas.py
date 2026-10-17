@@ -132,6 +132,10 @@ class PortfolioState(BaseModel):
         default_factory=dict,
         description="Patrimonio neto segregado por exchange {exchange: equity_usd}",
     )
+    initial_exchange_equities: dict[str, float] = Field(
+        default_factory=dict,
+        description="Capital inicial de referencia por exchange {exchange: equity_usd} para evitar ganancias fantasma",
+    )
     trading_mode: str = Field(
         default="PAPER_L2",
         description="Modo de ejecución activo (PAPER_L2, LIVE_BINANCE, LIVE_BINGX, LIVE_MULTI)",

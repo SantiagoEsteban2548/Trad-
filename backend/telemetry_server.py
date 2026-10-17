@@ -335,6 +335,7 @@ class BinanceLiveWsGateway:
         elif order.side.upper() == "SELL":
             self.live_active_ask_id = order_id
             self.active_asks_by_symbol[order.symbol] = order_id
+        logger.info(f"ORDEN ENVIADA a Binance: {order.symbol} ({target_sym}) {order.side.upper()} {order.qty} @ ${order.price} [ID: {order_id}, CID: {cid}]")
         return order_id
 
     async def prune_stale_orders(
@@ -494,21 +495,17 @@ class BinanceLiveWsGateway:
         con params={'reduceOnly': True} para dejar la exposición en cero inmediatamente.
         Corrige detección de posiciones SHORT (side == 'short' o positionAmt < 0 -> close_side = 'buy').
         """
-        binance_symbols = [
-            s for s in symbols
-            if SYMBOL_SPECS.get(s, SymbolMarketSpec(s, 0.01, 0.001, s)).exchange == "binance"
-        ] or symbols
-
-        for sym in binance_symbols:
+        for sym in symbols:
             try:
-                await self.exchange.cancel_all_orders(sym)
+                target_sym = self.resolve_binance_symbol(sym)
+                await self.exchange.cancel_all_orders(target_sym)
                 logger.warning(f"cancel_all_orders ejecutado en Binance para {sym}")
             except Exception as e:
                 logger.error(f"Error en cancel_all_orders para {sym}: {e}")
 
         positions = []
         try:
-            positions = await self.exchange.fetch_positions(binance_symbols)
+            positions = await self.exchange.fetch_positions(symbols)
         except Exception as e:
             logger.warning(f"Fallback fetch_positions() sin filtro en Binance tras error por símbolo: {e}")
             try:
@@ -620,12 +617,30 @@ class BinanceLiveWsGateway:
 
             if not hasattr(portfolio, "exchange_equities"):
                 portfolio.exchange_equities = {}
+            if not hasattr(portfolio, "initial_exchange_equities"):
+                portfolio.initial_exchange_equities = {}
+
             if total_usdt > 0.0:
+                is_first_sync = "binance" not in portfolio.initial_exchange_equities or portfolio.initial_exchange_equities["binance"] <= 0.0
+                if is_first_sync:
+                    portfolio.initial_exchange_equities["binance"] = round(total_usdt, 2)
+
                 portfolio.exchange_equities["binance"] = total_usdt
                 if getattr(portfolio, "trading_mode", "") == "LIVE_MULTI":
                     portfolio.current_equity_usd = round(sum(portfolio.exchange_equities.values()), 2)
+                    if portfolio.initial_exchange_equities:
+                        combined_initial = round(sum(portfolio.initial_exchange_equities.values()), 2)
+                        if combined_initial > 0 and (portfolio.base_capital_usd in (100.0, 5000.0) or len(portfolio.initial_exchange_equities) >= 2):
+                            portfolio.base_capital_usd = combined_initial
+                            portfolio.daily_high_watermark_usd = max(portfolio.base_capital_usd, portfolio.current_equity_usd)
+                elif getattr(portfolio, "trading_mode", "") == "LIVE_BINANCE":
+                    portfolio.current_equity_usd = round(total_usdt, 2)
+                    if is_first_sync or portfolio.base_capital_usd in (100.0, 5000.0):
+                        portfolio.base_capital_usd = round(total_usdt, 2)
+                        portfolio.daily_high_watermark_usd = max(portfolio.base_capital_usd, portfolio.current_equity_usd)
                 else:
                     portfolio.current_equity_usd = round(total_usdt, 2)
+
                 if portfolio.current_equity_usd > portfolio.daily_high_watermark_usd:
                     portfolio.daily_high_watermark_usd = portfolio.current_equity_usd
 
@@ -949,14 +964,14 @@ class BingXLiveWsGateway:
 
     def resolve_bingx_symbol(self, symbol: str) -> str:
         """Traduce símbolos a nombres nativos de BingX swap si difieren del estándar."""
-        if hasattr(self.exchange, "markets") and self.exchange.markets:
+        if hasattr(self.exchange, "markets") and isinstance(self.exchange.markets, dict) and self.exchange.markets:
             if symbol in self.exchange.markets:
                 return symbol
             mapped = self.BINGX_SYMBOL_MAP.get(symbol)
             if mapped and mapped in self.exchange.markets:
                 return mapped
             return mapped or symbol
-        return self.BINGX_SYMBOL_MAP.get(symbol, symbol)
+        return symbol
 
     async def initialize_symbol_margin(self, symbol: str, max_leverage: int = 3) -> None:
         """
@@ -984,10 +999,10 @@ class BingXLiveWsGateway:
             logger.info(f"set_margin_mode ISOLATED en {target_sym} (BingX): {e}")
 
         try:
-            await self.exchange.set_leverage(max_leverage, target_sym, params={"side": "BOTH"})
+            await self.exchange.set_leverage(max_leverage, target_sym)
         except Exception:
             try:
-                await self.exchange.set_leverage(max_leverage, target_sym)
+                await self.exchange.set_leverage(max_leverage, target_sym, params={"side": "BOTH"})
             except Exception as e:
                 logger.warning(f"set_leverage {max_leverage} en {target_sym} (BingX): {e}")
 
@@ -1056,8 +1071,9 @@ class BingXLiveWsGateway:
             "clientOrderId": cid,
         }
 
+        res = None
         try:
-            res = await order_fn(
+            res_raw = order_fn(
                 symbol=target_sym,
                 type="limit",
                 side=side_str,
@@ -1065,27 +1081,63 @@ class BingXLiveWsGateway:
                 price=order.price,
                 params=order_params,
             )
+            if inspect.isawaitable(res_raw):
+                res = await res_raw
+            else:
+                res = res_raw
         except Exception as e:
             err_str = str(e).lower()
-            if "immediately" in err_str or "post only" in err_str or "po" in err_str:
-                spec = SYMBOL_SPECS.get(order.symbol)
-                tick = spec.tick_size if spec else 0.1
-                adj_price = order.price - tick if order.side.upper() == "BUY" else order.price + tick
-                adj_price = round(adj_price / tick) * tick
-                logger.warning(f"Post-Only en BingX cruzó libro en {order.symbol}. Reintentando a {adj_price}...")
-                cid_retry = self.ledger.generate_client_order_id(order.strategy_id)
-                order_params["clientOrderId"] = cid_retry
-                res = await order_fn(
-                    symbol=target_sym,
-                    type="limit",
-                    side=side_str,
-                    amount=order.qty,
-                    price=adj_price,
-                    params=order_params,
+            if "not supported" in err_str:
+                # CCXT BingX stub create_order_ws() fallback to REST create_order
+                order_fn = self.exchange.create_order
+                try:
+                    res_raw = order_fn(
+                        symbol=target_sym,
+                        type="limit",
+                        side=side_str,
+                        amount=order.qty,
+                        price=order.price,
+                        params=order_params,
+                    )
+                    if inspect.isawaitable(res_raw):
+                        res = await res_raw
+                    else:
+                        res = res_raw
+                except Exception as inner_e:
+                    e = inner_e
+                    err_str = str(e).lower()
+
+            if res is None:
+                is_post_only_cross = (
+                    "immediately" in err_str
+                    or "post only" in err_str
+                    or "postonly" in err_str
+                    or "post_only" in err_str
+                    or ("po" in err_str and "supported" not in err_str)
                 )
-                cid = cid_retry
-            else:
-                raise
+                if is_post_only_cross:
+                    spec = SYMBOL_SPECS.get(order.symbol)
+                    tick = spec.tick_size if spec else 0.1
+                    adj_price = order.price - tick if order.side.upper() == "BUY" else order.price + tick
+                    adj_price = round(adj_price / tick) * tick
+                    logger.warning(f"Post-Only en BingX cruzó libro en {order.symbol}. Reintentando a {adj_price}...")
+                    cid_retry = self.ledger.generate_client_order_id(order.strategy_id)
+                    order_params["clientOrderId"] = cid_retry
+                    res_raw = order_fn(
+                        symbol=target_sym,
+                        type="limit",
+                        side=side_str,
+                        amount=order.qty,
+                        price=adj_price,
+                        params=order_params,
+                    )
+                    if inspect.isawaitable(res_raw):
+                        res = await res_raw
+                    else:
+                        res = res_raw
+                    cid = cid_retry
+                else:
+                    raise e
 
         order_id = str(res["id"])
         strat, sub_lot = self.ledger.parse_client_order_id(cid)
@@ -1112,6 +1164,7 @@ class BingXLiveWsGateway:
         elif order.side.upper() == "SELL":
             self.live_active_ask_id = order_id
             self.active_asks_by_symbol[order.symbol] = order_id
+        logger.info(f"ORDEN ENVIADA a BingX: {order.symbol} ({target_sym}) {order.side.upper()} {order.qty} @ ${order.price} [ID: {order_id}, CID: {cid}]")
         return order_id
 
     async def prune_stale_orders(
@@ -1241,12 +1294,13 @@ class BingXLiveWsGateway:
     async def cancel_order_ws(self, order_id: str, symbol: str) -> bool:
         """Cancela la orden activa en BingX en tiempo real."""
         try:
+            target_sym = self.resolve_bingx_symbol(symbol)
             if hasattr(self.exchange, "cancel_order_ws") and callable(getattr(self.exchange, "cancel_order_ws")):
-                res = self.exchange.cancel_order_ws(id=order_id, symbol=symbol)
+                res = self.exchange.cancel_order_ws(id=order_id, symbol=target_sym)
                 if inspect.isawaitable(res):
                     await res
             elif hasattr(self.exchange, "cancel_order") and callable(getattr(self.exchange, "cancel_order")):
-                res = self.exchange.cancel_order(id=order_id, symbol=symbol)
+                res = self.exchange.cancel_order(id=order_id, symbol=target_sym)
                 if inspect.isawaitable(res):
                     await res
             if self.live_active_bid_id == order_id:
@@ -1383,26 +1437,55 @@ class BingXLiveWsGateway:
             bal = await self.exchange.fetch_balance()
             total_usdt = 0.0
             if isinstance(bal, dict):
-                if "total" in bal and isinstance(bal["total"], dict) and "USDT" in bal["total"] and float(bal["total"]["USDT"] or 0.0) > 0:
-                    total_usdt = float(bal["total"]["USDT"] or 0.0)
-                elif "total" in bal and isinstance(bal["total"], dict) and "VST" in bal["total"]:
-                    total_usdt = float(bal["total"]["VST"] or 0.0)
-                elif "USDT" in bal and isinstance(bal["USDT"], dict) and "total" in bal["USDT"] and float(bal["USDT"]["total"] or 0.0) > 0:
-                    total_usdt = float(bal["USDT"]["total"] or 0.0)
-                elif "VST" in bal and isinstance(bal["VST"], dict) and "total" in bal["VST"]:
-                    total_usdt = float(bal["VST"]["total"] or 0.0)
-                elif "info" in bal and isinstance(bal["info"], dict):
-                    info = bal["info"]
-                    total_usdt = float(info.get("balance") or info.get("equity") or 0.0)
+                # BingX swap en CCXT mapea availableMargin a 'total' descontando el margen congelado en órdenes abiertas.
+                # Extraemos primero de 'info.data' donde BingX reporta el equity real (balance + unrealizedProfit)
+                # sin penalizar el margen congelado de órdenes limit vivas.
+                if "info" in bal and isinstance(bal["info"], dict) and "data" in bal["info"] and isinstance(bal["info"]["data"], list):
+                    for item in bal["info"]["data"]:
+                        if isinstance(item, dict) and item.get("asset") in ("USDT", "VST"):
+                            eq_val = float(item.get("equity") or item.get("balance") or 0.0)
+                            if eq_val > 0.0:
+                                total_usdt = eq_val
+                                break
+                if total_usdt <= 0.0:
+                    if "total" in bal and isinstance(bal["total"], dict) and "USDT" in bal["total"] and float(bal["total"]["USDT"] or 0.0) > 0:
+                        total_usdt = float(bal["total"]["USDT"] or 0.0)
+                    elif "total" in bal and isinstance(bal["total"], dict) and "VST" in bal["total"]:
+                        total_usdt = float(bal["total"]["VST"] or 0.0)
+                    elif "USDT" in bal and isinstance(bal["USDT"], dict) and "total" in bal["USDT"] and float(bal["USDT"]["total"] or 0.0) > 0:
+                        total_usdt = float(bal["USDT"]["total"] or 0.0)
+                    elif "VST" in bal and isinstance(bal["VST"], dict) and "total" in bal["VST"]:
+                        total_usdt = float(bal["VST"]["total"] or 0.0)
+                    elif "info" in bal and isinstance(bal["info"], dict):
+                        info = bal["info"]
+                        total_usdt = float(info.get("balance") or info.get("equity") or 0.0)
 
             if not hasattr(portfolio, "exchange_equities"):
                 portfolio.exchange_equities = {}
+            if not hasattr(portfolio, "initial_exchange_equities"):
+                portfolio.initial_exchange_equities = {}
+
             if total_usdt > 0.0:
+                is_first_sync = "bingx" not in portfolio.initial_exchange_equities or portfolio.initial_exchange_equities["bingx"] <= 0.0
+                if is_first_sync:
+                    portfolio.initial_exchange_equities["bingx"] = round(total_usdt, 2)
+
                 portfolio.exchange_equities["bingx"] = total_usdt
                 if getattr(portfolio, "trading_mode", "") == "LIVE_MULTI":
                     portfolio.current_equity_usd = round(sum(portfolio.exchange_equities.values()), 2)
+                    if portfolio.initial_exchange_equities:
+                        combined_initial = round(sum(portfolio.initial_exchange_equities.values()), 2)
+                        if combined_initial > 0 and (portfolio.base_capital_usd in (100.0, 5000.0) or len(portfolio.initial_exchange_equities) >= 2):
+                            portfolio.base_capital_usd = combined_initial
+                            portfolio.daily_high_watermark_usd = max(portfolio.base_capital_usd, portfolio.current_equity_usd)
+                elif getattr(portfolio, "trading_mode", "") == "LIVE_BINGX":
+                    portfolio.current_equity_usd = round(total_usdt, 2)
+                    if is_first_sync or portfolio.base_capital_usd in (100.0, 5000.0):
+                        portfolio.base_capital_usd = round(total_usdt, 2)
+                        portfolio.daily_high_watermark_usd = max(portfolio.base_capital_usd, portfolio.current_equity_usd)
                 else:
                     portfolio.current_equity_usd = round(total_usdt, 2)
+
                 if portfolio.current_equity_usd > portfolio.daily_high_watermark_usd:
                     portfolio.daily_high_watermark_usd = portfolio.current_equity_usd
 
@@ -1739,15 +1822,15 @@ class SymbolMarketSpec:
 
 SYMBOL_SPECS: dict[str, SymbolMarketSpec] = {
     "BTC/USDT:USDT": SymbolMarketSpec("BTC/USDT:USDT", tick_size=0.10, step_size=0.001, base_asset="BTC", asset_class="CRYPTO", exchange="binance", min_notional=100.0, min_spread_bps=10.0),
-    "ETH/USDT:USDT": SymbolMarketSpec("ETH/USDT:USDT", tick_size=0.01, step_size=0.001, base_asset="ETH", asset_class="CRYPTO", exchange="binance", min_notional=20.0, min_spread_bps=10.0),
+    "ETH/USDT:USDT": SymbolMarketSpec("ETH/USDT:USDT", tick_size=0.01, step_size=0.001, base_asset="ETH", asset_class="CRYPTO", exchange="bingx", min_notional=2.0, min_spread_bps=10.0),
     "SOL/USDT:USDT": SymbolMarketSpec("SOL/USDT:USDT", tick_size=0.01, step_size=0.1, base_asset="SOL", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
     "BNB/USDT:USDT": SymbolMarketSpec("BNB/USDT:USDT", tick_size=0.01, step_size=0.01, base_asset="BNB", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
-    "DOGE/USDT:USDT": SymbolMarketSpec("DOGE/USDT:USDT", tick_size=0.00001, step_size=1.0, base_asset="DOGE", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "DOGE/USDT:USDT": SymbolMarketSpec("DOGE/USDT:USDT", tick_size=0.00001, step_size=1.0, base_asset="DOGE", asset_class="CRYPTO", exchange="bingx", min_notional=2.0, min_spread_bps=10.0),
     "XRP/USDT:USDT": SymbolMarketSpec("XRP/USDT:USDT", tick_size=0.0001, step_size=0.1, base_asset="XRP", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
     "SUI/USDT:USDT": SymbolMarketSpec("SUI/USDT:USDT", tick_size=0.0001, step_size=0.1, base_asset="SUI", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
-    "AVAX/USDT:USDT": SymbolMarketSpec("AVAX/USDT:USDT", tick_size=0.001, step_size=1.0, base_asset="AVAX", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
-    "LINK/USDT:USDT": SymbolMarketSpec("LINK/USDT:USDT", tick_size=0.001, step_size=0.01, base_asset="LINK", asset_class="CRYPTO", exchange="binance", min_notional=20.0, min_spread_bps=10.0),
-    "PEPE/USDT:USDT": SymbolMarketSpec("PEPE/USDT:USDT", tick_size=0.0000001, step_size=1.0, base_asset="1000PEPE", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "AVAX/USDT:USDT": SymbolMarketSpec("AVAX/USDT:USDT", tick_size=0.001, step_size=1.0, base_asset="AVAX", asset_class="CRYPTO", exchange="bingx", min_notional=2.0, min_spread_bps=10.0),
+    "LINK/USDT:USDT": SymbolMarketSpec("LINK/USDT:USDT", tick_size=0.001, step_size=0.01, base_asset="LINK", asset_class="CRYPTO", exchange="bingx", min_notional=2.0, min_spread_bps=10.0),
+    "PEPE/USDT:USDT": SymbolMarketSpec("PEPE/USDT:USDT", tick_size=0.0000001, step_size=1.0, base_asset="1000PEPE", asset_class="CRYPTO", exchange="bingx", min_notional=2.0, min_spread_bps=10.0),
     "NEAR/USDT:USDT": SymbolMarketSpec("NEAR/USDT:USDT", tick_size=0.001, step_size=1.0, base_asset="NEAR", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
     "ARB/USDT:USDT": SymbolMarketSpec("ARB/USDT:USDT", tick_size=0.00001, step_size=0.1, base_asset="ARB", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
     # BingX TradFi Commodities (soportadas también en Binance USDⓈ-M)
@@ -2354,10 +2437,27 @@ class DryRunExecutionEngine:
         """
         Selecciona dinámicamente las Top-k monedas más activas según su ActivityScore,
         garantizando que BTC permanezca como ancla sistémica.
+        En LIVE_MULTI, garantiza una asignación balanceada seleccionando los pares más activos
+        tanto de Binance como de BingX, para que ambos exchanges coticen y operen en paralelo continuo.
         """
         scores = {sym: self.compute_activity_score(sym) for sym in self.symbols}
         if "BTC/USDT:USDT" in scores:
             scores["BTC/USDT:USDT"] = max(scores["BTC/USDT:USDT"], 0.001)
+
+        if getattr(self, "trading_mode", "") == "LIVE_MULTI":
+            tradfi_open = is_tradfi_market_open()
+            bin_syms = [s for s in self.symbols if SYMBOL_SPECS.get(s) and SYMBOL_SPECS[s].exchange == "binance"]
+            bx_syms = [s for s in self.symbols if SYMBOL_SPECS.get(s) and SYMBOL_SPECS[s].exchange == "bingx"]
+            if not tradfi_open:
+                bx_syms = [s for s in bx_syms if SYMBOL_SPECS[s].asset_class != "TRADFI_COMMODITY"]
+                bin_syms = [s for s in bin_syms if SYMBOL_SPECS[s].asset_class != "TRADFI_COMMODITY"]
+
+            top_bin = sorted(bin_syms, key=lambda s: scores.get(s, 0.0), reverse=True)[:3]
+            top_bx = sorted(bx_syms, key=lambda s: scores.get(s, 0.0), reverse=True)[:3]
+            if "BTC/USDT:USDT" not in top_bin and "BTC/USDT:USDT" in bin_syms:
+                top_bin = ["BTC/USDT:USDT"] + [s for s in top_bin if s != "BTC/USDT:USDT"][:2]
+            return list(dict.fromkeys(top_bin + top_bx))
+
         sorted_syms = sorted(self.symbols, key=lambda s: scores.get(s, 0.0), reverse=True)
         return sorted_syms[:k]
 
@@ -2367,7 +2467,11 @@ class DryRunExecutionEngine:
         dividida por el límite de concentración del margen del capital base tanto en PAPER_L2 como en LIVE.
         """
         sym = symbol or self.primary_symbol
-        base_cap = max(self.portfolio.base_capital_usd, 1.0)
+        spec = SYMBOL_SPECS.get(sym)
+        if getattr(self, "trading_mode", "") == "LIVE_MULTI" and spec and hasattr(self.portfolio, "exchange_equities") and self.portfolio.exchange_equities:
+            base_cap = max(float(self.portfolio.exchange_equities.get(spec.exchange, self.portfolio.base_capital_usd)), 1.0)
+        else:
+            base_cap = max(self.portfolio.base_capital_usd, 1.0)
         pair_ratio = getattr(self.gatekeeper, "max_single_pair_margin_ratio", 0.20)
         max_allowed_pos = base_cap * pair_ratio
         if max_allowed_pos <= 1e-8:
@@ -2902,8 +3006,28 @@ class DryRunExecutionEngine:
         Reinicia el estado institucional de 0:
         Limpia trades recientes, resetea contadores de victorias/derrotas, PnL bruto y neto,
         curva de equidad, cinta de ballenas, retornos y cuarentena DSR.
+        Establece el capital inicial calibrado de ambos exchanges en modo LIVE para evitar ganancias fantasma.
         """
-        cap = float(base_capital_usd or os.getenv("BASE_CAPITAL_USD", "5000.0"))
+        is_live = self.trading_mode in ("LIVE_MULTI", "LIVE_BINANCE", "LIVE_BINGX")
+        has_custom_live_cap = is_live and (base_capital_usd is not None and float(base_capital_usd) > 0 and float(base_capital_usd) not in (100.0, 5000.0))
+
+        if not is_live and base_capital_usd is not None and float(base_capital_usd) > 0:
+            cap = float(base_capital_usd)
+        elif has_custom_live_cap:
+            cap = float(base_capital_usd)
+        elif self.trading_mode == "LIVE_MULTI" and hasattr(self.portfolio, "exchange_equities") and self.portfolio.exchange_equities:
+            cap = round(sum(self.portfolio.exchange_equities.values()), 2)
+            self.portfolio.initial_exchange_equities = {k: round(v, 2) for k, v in self.portfolio.exchange_equities.items()}
+        elif self.trading_mode == "LIVE_BINANCE" and hasattr(self.portfolio, "exchange_equities") and "binance" in self.portfolio.exchange_equities:
+            cap = round(self.portfolio.exchange_equities["binance"], 2)
+            self.portfolio.initial_exchange_equities = {"binance": cap}
+        elif self.trading_mode == "LIVE_BINGX" and hasattr(self.portfolio, "exchange_equities") and "bingx" in self.portfolio.exchange_equities:
+            cap = round(self.portfolio.exchange_equities["bingx"], 2)
+            self.portfolio.initial_exchange_equities = {"bingx": cap}
+        else:
+            cap = float(base_capital_usd) if (base_capital_usd is not None and float(base_capital_usd) > 0) else float(os.getenv("BASE_CAPITAL_USD", "5000.0"))
+            self.portfolio.initial_exchange_equities = {}
+
         self.portfolio.base_capital_usd = cap
         self.portfolio.current_equity_usd = cap
         self.portfolio.daily_high_watermark_usd = cap
@@ -2931,6 +3055,14 @@ class DryRunExecutionEngine:
         self.whale_and_liq_tape.clear()
         self.pending_markouts.clear()
         self.completed_markouts.clear()
+        self.equity_comparison.clear()
+        self.equity_comparison.append({
+            "timestamp": int(time.time() * 1000),
+            "timestamp_ms": int(time.time() * 1000),
+            "bot_equity_usd": cap,
+            "benchmark_equity_usd": cap,
+            "trade_pnl_bar": 0.0,
+        })
 
         for ctx in self.symbol_contexts.values():
             ctx.rotations_filled_today = 0
@@ -3157,6 +3289,15 @@ class DryRunExecutionEngine:
             self.portfolio.trading_mode = "LIVE_MULTI"
             await self.live_gateway.sync_portfolio_state(self.portfolio)
             await self.bingx_gateway.sync_portfolio_state(self.portfolio)
+            if hasattr(self.portfolio, "exchange_equities") and self.portfolio.exchange_equities:
+                total_live = round(sum(self.portfolio.exchange_equities.values()), 2)
+                self.portfolio.initial_exchange_equities = {k: round(v, 2) for k, v in self.portfolio.exchange_equities.items()}
+                self.portfolio.base_capital_usd = total_live
+                self.portfolio.current_equity_usd = total_live
+                self.portfolio.daily_high_watermark_usd = total_live
+                self.portfolio.realized_pnl_today_usd = 0.0
+                self.equity_history = deque([total_live], maxlen=1000)
+                logger.info(f"Capital inicial calibrado para LIVE_MULTI: ${total_live:.2f} ({self.portfolio.initial_exchange_equities})")
             self.live_gateway.start_sync_loop(self.portfolio)
             self.bingx_gateway.start_sync_loop(self.portfolio)
 
@@ -3343,12 +3484,21 @@ class DryRunExecutionEngine:
                                 await active_live_gw.update_symbol_leverage_if_needed(sym, optimal_lev)
 
                         # Cálculo de quote_qty dinámico según Half-Kelly, apalancamiento seleccionado y precio de mercado
+                        if self.trading_mode == "LIVE_MULTI" and hasattr(self.portfolio, "exchange_equities") and self.portfolio.exchange_equities:
+                            exchange_cap = float(self.portfolio.exchange_equities.get(ctx.spec.exchange, self.portfolio.base_capital_usd))
+                        elif self.trading_mode == "LIVE_BINANCE" and hasattr(self.portfolio, "exchange_equities") and "binance" in self.portfolio.exchange_equities:
+                            exchange_cap = float(self.portfolio.exchange_equities["binance"])
+                        elif self.trading_mode == "LIVE_BINGX" and hasattr(self.portfolio, "exchange_equities") and "bingx" in self.portfolio.exchange_equities:
+                            exchange_cap = float(self.portfolio.exchange_equities["bingx"])
+                        else:
+                            exchange_cap = self.portfolio.base_capital_usd
+
                         w_i = half_kelly_weights.get(sym, 0.15)
                         pair_cap_ratio = getattr(self.gatekeeper, "max_single_pair_margin_ratio", 0.20)
                         lev_mult = max(1.0, optimal_lev / 3.0)
                         target_notional = min(
-                            self.portfolio.base_capital_usd * w_i * lev_mult,
-                            self.portfolio.base_capital_usd * pair_cap_ratio * lev_mult,
+                            exchange_cap * w_i * lev_mult,
+                            exchange_cap * pair_cap_ratio * lev_mult,
                         )
 
                         # Validación de MIN_NOTIONAL de exchange (BingX: $2.0, Binance: BTC $100, ETH $20, otros $5)
@@ -3356,7 +3506,7 @@ class DryRunExecutionEngine:
                             exchange_min_notional = 2.0
                         else:
                             exchange_min_notional = ctx.spec.min_notional
-                        max_possible_pair_notional = self.portfolio.base_capital_usd * pair_cap_ratio * lev_mult
+                        max_possible_pair_notional = exchange_cap * pair_cap_ratio * lev_mult
 
                         # Si el min_notional de exchange excede el margen máximo permitido para el par,
                         # omitir cotización en este par y concentrar capital en pares de $5
@@ -3491,7 +3641,7 @@ class DryRunExecutionEngine:
                                             if sym == self.primary_symbol:
                                                 active_live_gw.live_active_bid_id = b_id
                                         except Exception as e:
-                                            logger.debug(f"Error despachando bid escalera en {sym}: {e}")
+                                            logger.warning(f"Error despachando bid escalera en {sym} ({ctx.spec.exchange}): {e}")
 
                                     asks_to_dispatch = (quote_res.ask_ladder or ([quote_res.ask_order] if quote_res.ask_order else []))[:3]
                                     for a_order in asks_to_dispatch:
@@ -3502,7 +3652,7 @@ class DryRunExecutionEngine:
                                             if sym == self.primary_symbol:
                                                 active_live_gw.live_active_ask_id = a_id
                                         except Exception as e:
-                                            logger.debug(f"Error despachando ask escalera en {sym}: {e}")
+                                            logger.warning(f"Error despachando ask escalera en {sym} ({ctx.spec.exchange}): {e}")
                         else:
                             # Modo PAPER_L2: Reemplazo de órdenes obsoletas (stale orders) si se desvían > 3 ticks
                             max_drift = max(3.0 * ctx.spec.tick_size, 0.5 * quote_res.optimal_spread)
@@ -3873,6 +4023,7 @@ class DryRunExecutionEngine:
                 gws_to_inspect.append(self.bingx_gateway)
 
             for gw in gws_to_inspect:
+                gw_exchange = "bingx" if gw == self.bingx_gateway else "binance"
                 for ord_id, meta in list(gw.active_orders_meta.items()):
                     px = float(meta.get("price") or 0.0)
                     q = float(meta.get("qty") or 0.0)
@@ -3882,6 +4033,7 @@ class DryRunExecutionEngine:
                     open_orders_list.append({
                         "order_id": str(ord_id),
                         "symbol": meta.get("symbol", self.primary_symbol),
+                        "exchange": gw_exchange,
                         "side": meta.get("side", "BUY"),
                         "level": lvl,
                         "price": round(px, 2 if px >= 1.0 else 5),
@@ -4050,6 +4202,8 @@ class DryRunExecutionEngine:
                 "profit_sweep_ready": should_trigger_profit_sweep(self.portfolio),
                 "rotations_filled": self.total_rotations_filled,
                 "simulated_vault_usd": getattr(self, "simulated_vault_usd", 0.0),
+                "exchange_equities": getattr(self.portfolio, "exchange_equities", {}),
+                "initial_exchange_equities": getattr(self.portfolio, "initial_exchange_equities", {}),
             },
             "mandate_gates": {
                 "gate_1_isolated_margin": "LOCKED_ISOLATED",
