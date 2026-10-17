@@ -31,7 +31,8 @@ import {
   BarChart3,
   Volume2,
   VolumeX,
-  Sparkles
+  Sparkles,
+  RotateCcw
 } from 'lucide-react';
 
 // Exact Normal CDF Phi(x)
@@ -859,9 +860,9 @@ export default function App() {
   const [profitSweepReady, setProfitSweepReady] = useState<boolean>(false);
   const [sweptSpotVault, setSweptSpotVault] = useState<number>(0.0);
 
-  // Operational Mode State: PAPER_L2 vs LIVE_BINANCE vs LIVE_BINGX
-  const [tradingMode, setTradingMode] = useState<'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX'>('PAPER_L2');
-  const [pendingLiveMode, setPendingLiveMode] = useState<'LIVE_BINANCE' | 'LIVE_BINGX'>('LIVE_BINANCE');
+  // Operational Mode State: PAPER_L2 vs LIVE_BINANCE vs LIVE_BINGX vs LIVE_MULTI
+  const [tradingMode, setTradingMode] = useState<'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI'>('PAPER_L2');
+  const [pendingLiveMode, setPendingLiveMode] = useState<'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI'>('LIVE_BINANCE');
   const [isLiveConfirmOpen, setIsLiveConfirmOpen] = useState<boolean>(false);
   const [modeSwitchError, setModeSwitchError] = useState<string | null>(null);
   const [modeSwitchSuccess, setModeSwitchSuccess] = useState<string | null>(null);
@@ -1424,9 +1425,9 @@ export default function App() {
     }
   };
 
-  const handleSwitchMode = async (targetMode: 'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX') => {
+  const handleSwitchMode = async (targetMode: 'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI') => {
     if (targetMode === tradingMode) return;
-    if (targetMode === 'LIVE_BINANCE' || targetMode === 'LIVE_BINGX') {
+    if (targetMode === 'LIVE_BINANCE' || targetMode === 'LIVE_BINGX' || targetMode === 'LIVE_MULTI') {
       setPendingLiveMode(targetMode);
       setModeSwitchError(null);
       setIsLiveConfirmOpen(true);
@@ -1472,7 +1473,12 @@ export default function App() {
       } else {
         setTradingMode(pendingLiveMode);
         setIsLiveConfirmOpen(false);
-        const exchangeLabel = pendingLiveMode === 'LIVE_BINGX' ? 'BINGX SWAP & COMMODITIES' : 'BINANCE USDⓈ-M';
+        const exchangeLabel =
+          pendingLiveMode === 'LIVE_MULTI'
+            ? 'BINANCE + BINGX DUAL/PARALELO'
+            : pendingLiveMode === 'LIVE_BINGX'
+            ? 'BINGX SWAP & COMMODITIES'
+            : 'BINANCE USDⓈ-M';
         setModeSwitchSuccess(`Modo LIVE CAPITAL (${exchangeLabel}) activado exitosamente.`);
         setTimeout(() => setModeSwitchSuccess(null), 5000);
       }
@@ -1480,6 +1486,26 @@ export default function App() {
       setModeSwitchError(err.message || 'Error de red conectando al servidor de telemetría.');
     } finally {
       setIsSwitchingMode(false);
+    }
+  };
+
+  const handleResetStateFromZero = async () => {
+    if (!window.confirm('¿Confirmar reinicio institucional desde 0? Se limpiarán trades, PnL acumulado, órdenes y cuarentena DSR.')) return;
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/reset-state`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base_capital_usd: 5000.0 }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setModeSwitchSuccess('Estado institucional reiniciado exitosamente desde 0.');
+        setTimeout(() => setModeSwitchSuccess(null), 4000);
+      } else {
+        setModeSwitchError(data.detail || 'Error al reiniciar estado.');
+      }
+    } catch (err: any) {
+      setModeSwitchError(err.message || 'Error al conectar con /api/reset-state.');
     }
   };
 
@@ -1730,9 +1756,11 @@ export default function App() {
                             ? 'bg-[#00F59B]/10 text-[#00F59B] border-[#00F59B]/20'
                             : tradingMode === 'LIVE_BINANCE'
                             ? 'bg-[#A855F7]/10 text-[#A855F7] border-[#A855F7]/20'
-                            : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                            : tradingMode === 'LIVE_BINGX'
+                            ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                            : 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'
                         }`}>
-                          {tradingMode === 'PAPER_L2' ? 'PAPER L2' : tradingMode === 'LIVE_BINANCE' ? 'BINANCE' : 'BINGX'}
+                          {tradingMode === 'PAPER_L2' ? 'PAPER L2' : tradingMode === 'LIVE_BINANCE' ? 'BINANCE' : tradingMode === 'LIVE_BINGX' ? 'BINGX' : 'DUAL PARALELO'}
                         </span>
                       </div>
                       <p className="text-[11px] font-mono text-slate-400 truncate">
@@ -1741,11 +1769,11 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Selector tri-modal protegido */}
-                  <div className="grid grid-cols-3 gap-1 p-1 bg-[#080A0F] rounded-lg border border-[#1C2230] text-[10px] font-mono">
+                  {/* Selector cuadri-modal protegido */}
+                  <div className="grid grid-cols-4 gap-1 p-1 bg-[#080A0F] rounded-lg border border-[#1C2230] text-[10px] font-mono">
                     <button
                       onClick={() => handleSwitchMode('PAPER_L2')}
-                      className={`py-1.5 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
+                      className={`py-1.5 px-0.5 rounded font-bold flex items-center justify-center gap-1 transition-all ${
                         tradingMode === 'PAPER_L2'
                           ? 'bg-[#00F59B]/20 text-[#00F59B] border border-[#00F59B]/40 shadow-sm'
                           : 'text-slate-400 hover:text-[#00F59B]'
@@ -1757,7 +1785,7 @@ export default function App() {
                     </button>
                     <button
                       onClick={() => handleSwitchMode('LIVE_BINANCE')}
-                      className={`py-1.5 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
+                      className={`py-1.5 px-0.5 rounded font-bold flex items-center justify-center gap-1 transition-all ${
                         tradingMode === 'LIVE_BINANCE'
                           ? 'bg-[#A855F7]/20 text-[#A855F7] border border-[#A855F7]/40 shadow-sm'
                           : 'text-slate-400 hover:text-[#A855F7]'
@@ -1769,7 +1797,7 @@ export default function App() {
                     </button>
                     <button
                       onClick={() => handleSwitchMode('LIVE_BINGX')}
-                      className={`py-1.5 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
+                      className={`py-1.5 px-0.5 rounded font-bold flex items-center justify-center gap-1 transition-all ${
                         tradingMode === 'LIVE_BINGX'
                           ? 'bg-amber-500/20 text-amber-400 border border-amber-500/40 shadow-sm'
                           : 'text-slate-400 hover:text-amber-400'
@@ -1779,26 +1807,48 @@ export default function App() {
                       <Zap className="w-2.5 h-2.5" />
                       <span>BINGX</span>
                     </button>
+                    <button
+                      onClick={() => handleSwitchMode('LIVE_MULTI')}
+                      className={`py-1.5 px-0.5 rounded font-bold flex items-center justify-center gap-1 transition-all ${
+                        tradingMode === 'LIVE_MULTI'
+                          ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/40 shadow-sm'
+                          : 'text-slate-400 hover:text-cyan-400'
+                      }`}
+                      title="Modo Paralelo Binance + BingX"
+                    >
+                      <Sparkles className="w-2.5 h-2.5" />
+                      <span>DUAL</span>
+                    </button>
                   </div>
 
-                  {/* Botón Compacto EMERGENCY FLATTEN */}
-                  {!gate4KillSwitch ? (
+                  {/* Acciones: EMERGENCY FLATTEN + REINICIAR DE 0 */}
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {!gate4KillSwitch ? (
+                      <button
+                        onClick={handleTriggerEmergencyFlatten}
+                        className="py-1.5 px-2 rounded-lg bg-rose-600/90 hover:bg-rose-600 text-white font-mono text-[11px] font-bold transition-all shadow-md shadow-rose-950/40 flex items-center justify-center gap-1"
+                      >
+                        <Power className="w-3 h-3" />
+                        FLATTEN
+                      </button>
+                    ) : (
+                      <button
+                        onClick={handleResetKillSwitch}
+                        className="py-1.5 px-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-mono text-[11px] font-bold transition-all flex items-center justify-center gap-1"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        Reset Kill
+                      </button>
+                    )}
                     <button
-                      onClick={handleTriggerEmergencyFlatten}
-                      className="w-full py-1.5 px-3 rounded-lg bg-rose-600/90 hover:bg-rose-600 text-white font-mono text-xs font-bold transition-all shadow-md shadow-rose-950/40 flex items-center justify-center gap-1.5"
+                      onClick={handleResetStateFromZero}
+                      className="py-1.5 px-2 rounded-lg bg-[#151A26] hover:bg-[#1E2536] border border-[#2A3449] hover:border-cyan-500/50 text-cyan-300 font-mono text-[11px] font-bold transition-all flex items-center justify-center gap-1"
+                      title="Reiniciar contadores de trades, PnL y cuarentena DSR desde 0"
                     >
-                      <Power className="w-3.5 h-3.5" />
-                      EMERGENCY FLATTEN
+                      <RotateCcw className="w-3 h-3 text-cyan-400" />
+                      REINICIAR 0
                     </button>
-                  ) : (
-                    <button
-                      onClick={handleResetKillSwitch}
-                      className="w-full py-1.5 px-3 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-mono text-xs font-bold transition-all flex items-center justify-center gap-1.5"
-                    >
-                      <RefreshCw className="w-3.5 h-3.5" />
-                      Resetear Kill-Switch
-                    </button>
-                  )}
+                  </div>
                 </div>
 
                 {/* 2. Grilla 2x3 de Tarjetas Cuadradas Minimalistas */}
@@ -3025,7 +3075,9 @@ export default function App() {
             <div className="flex items-center justify-between border-b border-slate-800 pb-3 mb-4">
               <div className="flex items-center gap-3">
                 <div className={`p-2.5 border rounded-xl ${
-                  pendingLiveMode === 'LIVE_BINGX'
+                  pendingLiveMode === 'LIVE_MULTI'
+                    ? 'bg-cyan-500/15 border-cyan-500/30 text-cyan-400'
+                    : pendingLiveMode === 'LIVE_BINGX'
                     ? 'bg-amber-500/15 border-amber-500/30 text-amber-400'
                     : 'bg-purple-500/15 border-purple-500/30 text-purple-400'
                 }`}>
@@ -3033,10 +3085,12 @@ export default function App() {
                 </div>
                 <div>
                   <h3 className="font-bold text-base text-white tracking-tight">
-                    Confirmación de Seguridad: Capital Real ({pendingLiveMode === 'LIVE_BINGX' ? 'BingX' : 'Binance'})
+                    Confirmación de Seguridad: Capital Real ({pendingLiveMode === 'LIVE_MULTI' ? 'Binance + BingX Dual' : pendingLiveMode === 'LIVE_BINGX' ? 'BingX' : 'Binance'})
                   </h3>
                   <p className="text-xs text-slate-400 font-mono">
-                    {pendingLiveMode === 'LIVE_BINGX'
+                    {pendingLiveMode === 'LIVE_MULTI'
+                      ? 'Ejecución Concurrente en Paralelo: Cripto en Binance + Commodities en BingX'
+                      : pendingLiveMode === 'LIVE_BINGX'
                       ? 'BingX Perpetual Futures & TradFi Commodities (bingx swap)'
                       : 'Binance USDⓈ-M Futures (binanceusdm)'}
                   </p>
@@ -3056,7 +3110,7 @@ export default function App() {
 
             <div className="space-y-4 mb-6">
               <p className="text-xs text-slate-300 leading-relaxed">
-                Está a punto de conmutar la ejecución hacia <strong>Capital Real en {pendingLiveMode === 'LIVE_BINGX' ? 'BingX Swap' : 'Binance Futures'}</strong>.
+                Está a punto de conmutar la ejecución hacia <strong>Capital Real en {pendingLiveMode === 'LIVE_MULTI' ? 'Binance y BingX en Paralelo' : pendingLiveMode === 'LIVE_BINGX' ? 'BingX Swap' : 'Binance Futures'}</strong>.
                 Por directriz algorítmica y mandatos deterministas, se verifica la integridad del sistema:
               </p>
 
@@ -3142,7 +3196,9 @@ export default function App() {
                 disabled={isSwitchingMode || gate4KillSwitch}
                 onClick={confirmSwitchToLive}
                 className={`px-4 py-2 rounded-xl text-white font-mono text-xs font-bold transition-all shadow-lg flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${
-                  pendingLiveMode === 'LIVE_BINGX'
+                  pendingLiveMode === 'LIVE_MULTI'
+                    ? 'bg-gradient-to-r from-cyan-600 to-emerald-600 hover:from-cyan-500 hover:to-emerald-500 shadow-cyan-950/40'
+                    : pendingLiveMode === 'LIVE_BINGX'
                     ? 'bg-gradient-to-r from-amber-600 to-emerald-600 hover:from-amber-500 hover:to-emerald-500 shadow-amber-950/40'
                     : 'bg-gradient-to-r from-purple-600 to-emerald-600 hover:from-purple-500 hover:to-emerald-500 shadow-purple-950/40'
                 }`}

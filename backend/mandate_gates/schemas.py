@@ -128,6 +128,14 @@ class PortfolioState(BaseModel):
     rolling_variance_sigma2: float = Field(
         ..., ge=0.0, description="Varianza instantánea de retornos (sigma^2)"
     )
+    exchange_equities: dict[str, float] = Field(
+        default_factory=dict,
+        description="Patrimonio neto segregado por exchange {exchange: equity_usd}",
+    )
+    trading_mode: str = Field(
+        default="PAPER_L2",
+        description="Modo de ejecución activo (PAPER_L2, LIVE_BINANCE, LIVE_BINGX, LIVE_MULTI)",
+    )
 
     @property
     def total_open_notional_usd(self) -> float:

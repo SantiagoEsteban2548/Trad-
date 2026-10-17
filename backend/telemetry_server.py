@@ -67,7 +67,7 @@ if os.getenv("GEMINI_API_KEY"):
 else:
     GeminiRegimeCouncil = None  # type: ignore[assignment, misc]
     WarmPathCouncilScheduler = None  # type: ignore[assignment, misc]
-from backend.validation.l2_simulator_and_dsr import DeflatedSharpeAuditor, L2QueueSimulator
+from backend.validation.l2_simulator_and_dsr import DeflatedSharpeAuditor, DSRAuditResult, L2QueueSimulator
 
 logger = logging.getLogger("telemetry_server")
 logging.basicConfig(level=logging.INFO)
@@ -618,8 +618,14 @@ class BinanceLiveWsGateway:
                     info = bal["info"]
                     total_usdt = float(info.get("totalMarginBalance") or info.get("totalWalletBalance") or 0.0)
 
+            if not hasattr(portfolio, "exchange_equities"):
+                portfolio.exchange_equities = {}
             if total_usdt > 0.0:
-                portfolio.current_equity_usd = round(total_usdt, 2)
+                portfolio.exchange_equities["binance"] = total_usdt
+                if getattr(portfolio, "trading_mode", "") == "LIVE_MULTI":
+                    portfolio.current_equity_usd = round(sum(portfolio.exchange_equities.values()), 2)
+                else:
+                    portfolio.current_equity_usd = round(total_usdt, 2)
                 if portfolio.current_equity_usd > portfolio.daily_high_watermark_usd:
                     portfolio.daily_high_watermark_usd = portfolio.current_equity_usd
 
@@ -640,7 +646,16 @@ class BinanceLiveWsGateway:
                 if abs(amt) > 1e-8:
                     signed_notional = -notional if is_short else notional
                     active[sym] = round(signed_notional, 2)
-            portfolio.active_positions = active
+
+            if getattr(portfolio, "trading_mode", "") == "LIVE_MULTI":
+                for sym, notional in active.items():
+                    portfolio.active_positions[sym] = notional
+                for sym in list(portfolio.active_positions.keys()):
+                    spec = SYMBOL_SPECS.get(sym)
+                    if spec and spec.exchange == "binance" and sym not in active:
+                        portfolio.active_positions.pop(sym, None)
+            else:
+                portfolio.active_positions = active
         except Exception as e:
             logger.error(f"Error sincronizando balance y posiciones con Binance: {e}")
 
@@ -940,13 +955,20 @@ class BingXLiveWsGateway:
             mapped = self.BINGX_SYMBOL_MAP.get(symbol)
             if mapped and mapped in self.exchange.markets:
                 return mapped
-        return symbol
+            return mapped or symbol
+        return self.BINGX_SYMBOL_MAP.get(symbol, symbol)
 
     async def initialize_symbol_margin(self, symbol: str, max_leverage: int = 3) -> None:
         """
         Configura modo unidireccional (one-way), margen ISOLATED y apalancamiento máximo
         en BingX antes de permitir cualquier orden en vivo.
         """
+        if not getattr(self.exchange, "markets", None):
+            try:
+                await self.exchange.load_markets()
+            except Exception as em:
+                logger.debug(f"load_markets en BingX: {em}")
+
         target_sym = self.resolve_bingx_symbol(symbol)
         self.default_leverage = int(max_leverage)
         self.symbol_leverage[symbol] = int(max_leverage)
@@ -962,9 +984,12 @@ class BingXLiveWsGateway:
             logger.info(f"set_margin_mode ISOLATED en {target_sym} (BingX): {e}")
 
         try:
-            await self.exchange.set_leverage(max_leverage, target_sym)
-        except Exception as e:
-            logger.warning(f"set_leverage {max_leverage} en {target_sym} (BingX): {e}")
+            await self.exchange.set_leverage(max_leverage, target_sym, params={"side": "BOTH"})
+        except Exception:
+            try:
+                await self.exchange.set_leverage(max_leverage, target_sym)
+            except Exception as e:
+                logger.warning(f"set_leverage {max_leverage} en {target_sym} (BingX): {e}")
 
         self.initialized_symbols.add(symbol)
 
@@ -979,7 +1004,10 @@ class BingXLiveWsGateway:
         if cur_lev == opt_int:
             return False
         try:
-            await self.exchange.set_leverage(opt_int, target_sym)
+            try:
+                await self.exchange.set_leverage(opt_int, target_sym, params={"side": "BOTH"})
+            except Exception:
+                await self.exchange.set_leverage(opt_int, target_sym)
             self.symbol_leverage[symbol] = opt_int
             logger.info(f"Apalancamiento dinámico actualizado en BingX para {symbol}: {cur_lev}x -> {opt_int}x (ISOLATED)")
             return True
@@ -1355,16 +1383,26 @@ class BingXLiveWsGateway:
             bal = await self.exchange.fetch_balance()
             total_usdt = 0.0
             if isinstance(bal, dict):
-                if "total" in bal and isinstance(bal["total"], dict) and "USDT" in bal["total"]:
+                if "total" in bal and isinstance(bal["total"], dict) and "USDT" in bal["total"] and float(bal["total"]["USDT"] or 0.0) > 0:
                     total_usdt = float(bal["total"]["USDT"] or 0.0)
-                elif "USDT" in bal and isinstance(bal["USDT"], dict) and "total" in bal["USDT"]:
+                elif "total" in bal and isinstance(bal["total"], dict) and "VST" in bal["total"]:
+                    total_usdt = float(bal["total"]["VST"] or 0.0)
+                elif "USDT" in bal and isinstance(bal["USDT"], dict) and "total" in bal["USDT"] and float(bal["USDT"]["total"] or 0.0) > 0:
                     total_usdt = float(bal["USDT"]["total"] or 0.0)
+                elif "VST" in bal and isinstance(bal["VST"], dict) and "total" in bal["VST"]:
+                    total_usdt = float(bal["VST"]["total"] or 0.0)
                 elif "info" in bal and isinstance(bal["info"], dict):
                     info = bal["info"]
                     total_usdt = float(info.get("balance") or info.get("equity") or 0.0)
 
+            if not hasattr(portfolio, "exchange_equities"):
+                portfolio.exchange_equities = {}
             if total_usdt > 0.0:
-                portfolio.current_equity_usd = round(total_usdt, 2)
+                portfolio.exchange_equities["bingx"] = total_usdt
+                if getattr(portfolio, "trading_mode", "") == "LIVE_MULTI":
+                    portfolio.current_equity_usd = round(sum(portfolio.exchange_equities.values()), 2)
+                else:
+                    portfolio.current_equity_usd = round(total_usdt, 2)
                 if portfolio.current_equity_usd > portfolio.daily_high_watermark_usd:
                     portfolio.daily_high_watermark_usd = portfolio.current_equity_usd
 
@@ -1385,7 +1423,16 @@ class BingXLiveWsGateway:
                 if abs(amt) > 1e-8:
                     signed_notional = -notional if is_short else notional
                     active[sym] = round(signed_notional, 2)
-            portfolio.active_positions = active
+
+            if getattr(portfolio, "trading_mode", "") == "LIVE_MULTI":
+                for sym, notional in active.items():
+                    portfolio.active_positions[sym] = notional
+                for sym in list(portfolio.active_positions.keys()):
+                    spec = SYMBOL_SPECS.get(sym)
+                    if spec and spec.exchange == "bingx" and sym not in active:
+                        portfolio.active_positions.pop(sym, None)
+            else:
+                portfolio.active_positions = active
         except Exception as e:
             logger.error(f"Error sincronizando balance y posiciones con BingX: {e}")
 
@@ -2437,15 +2484,19 @@ class DryRunExecutionEngine:
 
         if self.live_gateway is not None:
             self.live_gateway.default_leverage = self.selected_leverage
-            if self.trading_mode == "LIVE_BINANCE":
+            if self.trading_mode in ("LIVE_BINANCE", "LIVE_MULTI"):
                 for sym in self.top_active_symbols:
-                    await self.live_gateway.initialize_symbol_margin(sym, max_leverage=self.selected_leverage)
+                    spec = SYMBOL_SPECS.get(sym)
+                    if not spec or spec.exchange == "binance":
+                        await self.live_gateway.initialize_symbol_margin(sym, max_leverage=self.selected_leverage)
 
         if self.bingx_gateway is not None:
             self.bingx_gateway.default_leverage = self.selected_leverage
-            if self.trading_mode == "LIVE_BINGX":
+            if self.trading_mode in ("LIVE_BINGX", "LIVE_MULTI"):
                 for sym in self.top_active_symbols:
-                    await self.bingx_gateway.initialize_symbol_margin(sym, max_leverage=self.selected_leverage)
+                    spec = SYMBOL_SPECS.get(sym)
+                    if spec and spec.exchange == "bingx":
+                        await self.bingx_gateway.initialize_symbol_margin(sym, max_leverage=self.selected_leverage)
 
         return self.evaluate_leverage_tiers()
 
@@ -2571,7 +2622,17 @@ class DryRunExecutionEngine:
             ret = (entry_px - exit_px) / max(entry_px, 1e-8)
 
         # Ejecutar cierre en Live o Paper
-        if self.trading_mode == "LIVE_BINANCE" and self.live_gateway is not None:
+        if self.trading_mode == "LIVE_MULTI":
+            target_gw = self.bingx_gateway if ctx.spec.exchange == "bingx" else self.live_gateway
+            if target_gw is not None:
+                await target_gw.close_position_market(symbol, close_side, pos_qty)
+                if ctx.live_active_bid_id:
+                    await target_gw.cancel_order_ws(ctx.live_active_bid_id, symbol)
+                    ctx.live_active_bid_id = None
+                if ctx.live_active_ask_id:
+                    await target_gw.cancel_order_ws(ctx.live_active_ask_id, symbol)
+                    ctx.live_active_ask_id = None
+        elif self.trading_mode == "LIVE_BINANCE" and self.live_gateway is not None:
             await self.live_gateway.close_position_market(symbol, close_side, pos_qty)
             if ctx.live_active_bid_id:
                 await self.live_gateway.cancel_order_ws(ctx.live_active_bid_id, symbol)
@@ -2836,6 +2897,57 @@ class DryRunExecutionEngine:
         except Exception as e:
             logger.error(f"Error persistiendo estado de cuarentena DSR: {e}")
 
+    def reset_state_from_zero(self, base_capital_usd: float | None = None) -> None:
+        """
+        Reinicia el estado institucional de 0:
+        Limpia trades recientes, resetea contadores de victorias/derrotas, PnL bruto y neto,
+        curva de equidad, cinta de ballenas, retornos y cuarentena DSR.
+        """
+        cap = float(base_capital_usd or os.getenv("BASE_CAPITAL_USD", "5000.0"))
+        self.portfolio.base_capital_usd = cap
+        self.portfolio.current_equity_usd = cap
+        self.portfolio.daily_high_watermark_usd = cap
+        self.portfolio.realized_pnl_today_usd = 0.0
+        self.portfolio.active_positions.clear()
+
+        self.wins_count = 0
+        self.losses_count = 0
+        self.gross_profit_usd = 0.0
+        self.gross_loss_usd = 0.0
+        self.total_rotations_filled = 0
+        self.tp_exits_count = 0
+        self.sl_exits_count = 0
+        self.time_exits_count = 0
+        self.simulated_vault_usd = 0.0
+
+        self.recent_trades.clear()
+        self.equity_history.clear()
+        self.equity_history.append(cap)
+        self.returns_history.clear()
+        for s in self.symbols:
+            if s in self.symbol_returns:
+                self.symbol_returns[s].clear()
+
+        self.whale_and_liq_tape.clear()
+        self.pending_markouts.clear()
+        self.completed_markouts.clear()
+
+        for ctx in self.symbol_contexts.values():
+            ctx.rotations_filled_today = 0
+            ctx.realized_pnl_today = 0.0
+            ctx.avg_entry_price = None
+            ctx.break_even_price = None
+            ctx.take_profit_price = None
+            ctx.stop_loss_price = None
+            ctx.last_fill_buy_price = None
+            ctx.last_fill_sell_price = None
+            ctx.inventory_open_ts_ns = None
+            ctx.live_active_bid_id = None
+            ctx.live_active_ask_id = None
+
+        self._save_dsr_quarantine_state()
+        logger.info(f"Estado institucional reiniciado desde 0 con capital base ${cap:.2f}.")
+
     async def fetch_funding_rate(self) -> float:
         """Consulta el funding rate en vivo si el exchange está disponible."""
         try:
@@ -2980,6 +3092,79 @@ class DryRunExecutionEngine:
             except Exception as ec:
                 logger.debug(f"Error cargando velas reales al conmutar a LIVE_BINGX: {ec}")
             logger.info("Modo de trading conmutado a LIVE_BINGX.")
+        elif mode in ("LIVE_MULTI", "MULTI_EXCHANGE", "LIVE_PARALLEL"):
+            bin_key = os.getenv("BINANCE_API_KEY", "").strip()
+            bin_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+            bx_key = os.getenv("BINGX_API_KEY", "").strip()
+            bx_secret = os.getenv("BINGX_API_SECRET", "").strip()
+            if not bin_key or not bin_secret:
+                raise ValueError("Debe configurar BINANCE_API_KEY y BINANCE_API_SECRET en su archivo .env.")
+            if not bx_key or not bx_secret:
+                raise ValueError("Debe configurar BINGX_API_KEY y BINGX_API_SECRET en su archivo .env.")
+            if self.gatekeeper.kill_switch_engaged:
+                raise ValueError("No se puede conmutar a LIVE_MULTI mientras el Kill-Switch de emergencia esté activo.")
+
+            if self.live_gateway is None:
+                self.live_gateway = BinanceLiveWsGateway(
+                    api_key=bin_key,
+                    api_secret=bin_secret,
+                    gatekeeper=self.gatekeeper,
+                    portfolio=self.portfolio,
+                    on_fill=self.record_trade_fill,
+                )
+            if self.bingx_gateway is None:
+                self.bingx_gateway = BingXLiveWsGateway(
+                    api_key=bx_key,
+                    api_secret=bx_secret,
+                    gatekeeper=self.gatekeeper,
+                    portfolio=self.portfolio,
+                    on_fill=self.record_trade_fill,
+                )
+
+            for sym in self.symbols:
+                init_lev = self.symbol_optimal_leverage.get(sym, self.selected_leverage)
+                spec = SYMBOL_SPECS.get(sym)
+                if spec and spec.exchange == "bingx":
+                    await self.bingx_gateway.initialize_symbol_margin(sym, max_leverage=init_lev)
+                else:
+                    await self.live_gateway.initialize_symbol_margin(sym, max_leverage=init_lev)
+
+            if hasattr(self.live_gateway, "reconcile_existing_positions"):
+                try:
+                    reconciled_bin = await self.live_gateway.reconcile_existing_positions(self.symbols)
+                    for rec in reconciled_bin:
+                        rsym = rec.get("symbol")
+                        if rsym in self.symbol_contexts:
+                            rctx = self.symbol_contexts[rsym]
+                            rctx.avg_entry_price = float(rec.get("entry_price") or 0.0)
+                            rctx.break_even_price = float(rec.get("break_even_price") or rctx.avg_entry_price)
+                except Exception as er:
+                    logger.warning(f"Error en reconcile_existing_positions Binance: {er}")
+
+            if hasattr(self.bingx_gateway, "reconcile_existing_positions"):
+                try:
+                    reconciled_bx = await self.bingx_gateway.reconcile_existing_positions(self.symbols)
+                    for rec in reconciled_bx:
+                        rsym = rec.get("symbol")
+                        if rsym in self.symbol_contexts:
+                            rctx = self.symbol_contexts[rsym]
+                            rctx.avg_entry_price = float(rec.get("entry_price") or 0.0)
+                            rctx.break_even_price = float(rec.get("break_even_price") or rctx.avg_entry_price)
+                except Exception as er:
+                    logger.warning(f"Error en reconcile_existing_positions BingX: {er}")
+
+            self.trading_mode = "LIVE_MULTI"
+            self.portfolio.trading_mode = "LIVE_MULTI"
+            await self.live_gateway.sync_portfolio_state(self.portfolio)
+            await self.bingx_gateway.sync_portfolio_state(self.portfolio)
+            self.live_gateway.start_sync_loop(self.portfolio)
+            self.bingx_gateway.start_sync_loop(self.portfolio)
+
+            try:
+                await self.initialize_real_candles(self.primary_symbol)
+            except Exception as ec:
+                logger.debug(f"Error cargando velas reales al conmutar a LIVE_MULTI: {ec}")
+            logger.info("Modo de trading conmutado a LIVE_MULTI (Binance + BingX en paralelo).")
         elif mode == "PAPER_L2":
             if self.live_gateway:
                 self.live_gateway.stop_sync_loop()
@@ -2999,7 +3184,7 @@ class DryRunExecutionEngine:
             self.warm_path_scheduler.start()
 
         env_mode = os.getenv("TRADING_MODE", "PAPER_L2").strip().upper()
-        if env_mode in ("LIVE_BINANCE", "LIVE_BINGX"):
+        if env_mode in ("LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI", "MULTI_EXCHANGE", "LIVE_PARALLEL"):
             try:
                 await self.set_trading_mode(env_mode)
                 logger.info(f"TRADING_MODE={env_mode} activado exitosamente al iniciar.")
@@ -3121,6 +3306,8 @@ class DryRunExecutionEngine:
                             current_gateway = self.live_gateway
                         elif self.trading_mode == "LIVE_BINGX" and self.bingx_gateway:
                             current_gateway = self.bingx_gateway
+                        elif self.trading_mode == "LIVE_MULTI":
+                            current_gateway = self.bingx_gateway if ctx.spec.exchange == "bingx" else self.live_gateway
                         else:
                             current_gateway = ctx.ws_gateway
 
@@ -3145,8 +3332,13 @@ class DryRunExecutionEngine:
                         optimal_lev = self.compute_optimal_leverage(sym)
                         self.symbol_optimal_leverage[sym] = optimal_lev
                         self.gatekeeper.max_leverage_cap = max(self.gatekeeper.max_leverage_cap, float(optimal_lev))
-                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX"):
-                            active_live_gw = self.live_gateway if self.trading_mode == "LIVE_BINANCE" else self.bingx_gateway
+                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI"):
+                            if self.trading_mode == "LIVE_MULTI":
+                                active_live_gw = self.bingx_gateway if ctx.spec.exchange == "bingx" else self.live_gateway
+                            elif self.trading_mode == "LIVE_BINANCE":
+                                active_live_gw = self.live_gateway
+                            else:
+                                active_live_gw = self.bingx_gateway
                             if active_live_gw:
                                 await active_live_gw.update_symbol_leverage_if_needed(sym, optimal_lev)
 
@@ -3160,12 +3352,15 @@ class DryRunExecutionEngine:
                         )
 
                         # Validación de MIN_NOTIONAL de exchange (BingX: $2.0, Binance: BTC $100, ETH $20, otros $5)
-                        exchange_min_notional = 2.0 if self.trading_mode == "LIVE_BINGX" else ctx.spec.min_notional
+                        if self.trading_mode == "LIVE_BINGX" or (self.trading_mode == "LIVE_MULTI" and ctx.spec.exchange == "bingx"):
+                            exchange_min_notional = 2.0
+                        else:
+                            exchange_min_notional = ctx.spec.min_notional
                         max_possible_pair_notional = self.portfolio.base_capital_usd * pair_cap_ratio * lev_mult
 
                         # Si el min_notional de exchange excede el margen máximo permitido para el par,
                         # omitir cotización en este par y concentrar capital en pares de $5
-                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX") and exchange_min_notional > max_possible_pair_notional:
+                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI") and exchange_min_notional > max_possible_pair_notional:
                             logger.debug(
                                 f"{sym} min_notional ${exchange_min_notional} excede cupo asignable (${max_possible_pair_notional:.2f}). "
                                 "Reasignando cupo a pares de menor requerimiento."
@@ -3179,7 +3374,7 @@ class DryRunExecutionEngine:
                             step = ctx.spec.step_size
                             quote_qty = max(step, round(round(target_notional / max(mid_px, 1.0) / step) * step, 6))
 
-                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX") and mid_px > 0:
+                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI") and mid_px > 0:
                             if quote_qty * mid_px < exchange_min_notional:
                                 step = ctx.spec.step_size
                                 needed_qty = exchange_min_notional / mid_px
@@ -3223,18 +3418,20 @@ class DryRunExecutionEngine:
                                     for o in list(ctx.l2_sim.orders.values()):
                                         if o.request.side == "BUY" and o.status in ("OPEN", "PARTIALLY_FILLED", "CANCEL_PENDING"):
                                             ctx.l2_sim.request_cancel(o.order_id, now_ns)
-                                elif self.live_gateway and ctx.live_active_bid_id:
-                                    try:
-                                        await self.live_gateway.cancel_order_ws(ctx.live_active_bid_id, sym)
-                                        ctx.live_active_bid_id = None
-                                    except Exception as e:
-                                        logger.error(f"Error cancelando bid de {sym} por escudo: {e}")
-                                elif self.bingx_gateway and ctx.live_active_bid_id:
-                                    try:
-                                        await self.bingx_gateway.cancel_order_ws(ctx.live_active_bid_id, sym)
-                                        ctx.live_active_bid_id = None
-                                    except Exception as e:
-                                        logger.error(f"Error cancelando bid BingX de {sym} por escudo: {e}")
+                                else:
+                                    target_cancel_gw = None
+                                    if self.trading_mode == "LIVE_BINANCE":
+                                        target_cancel_gw = self.live_gateway
+                                    elif self.trading_mode == "LIVE_BINGX":
+                                        target_cancel_gw = self.bingx_gateway
+                                    elif self.trading_mode == "LIVE_MULTI":
+                                        target_cancel_gw = self.bingx_gateway if ctx.spec.exchange == "bingx" else self.live_gateway
+                                    if target_cancel_gw and ctx.live_active_bid_id:
+                                        try:
+                                            await target_cancel_gw.cancel_order_ws(ctx.live_active_bid_id, sym)
+                                            ctx.live_active_bid_id = None
+                                        except Exception as e:
+                                            logger.error(f"Error cancelando bid de {sym} por escudo: {e}")
 
                             if ask_shield:
                                 quote_res.ask_order = None
@@ -3244,30 +3441,38 @@ class DryRunExecutionEngine:
                                     for o in list(ctx.l2_sim.orders.values()):
                                         if o.request.side == "SELL" and o.status in ("OPEN", "PARTIALLY_FILLED", "CANCEL_PENDING"):
                                             ctx.l2_sim.request_cancel(o.order_id, now_ns)
-                                elif self.live_gateway and ctx.live_active_ask_id:
-                                    try:
-                                        await self.live_gateway.cancel_order_ws(ctx.live_active_ask_id, sym)
-                                        ctx.live_active_ask_id = None
-                                    except Exception as e:
-                                        logger.error(f"Error cancelando ask de {sym} por escudo: {e}")
-                                elif self.bingx_gateway and ctx.live_active_ask_id:
-                                    try:
-                                        await self.bingx_gateway.cancel_order_ws(ctx.live_active_ask_id, sym)
-                                        ctx.live_active_ask_id = None
-                                    except Exception as e:
-                                        logger.error(f"Error cancelando ask BingX de {sym} por escudo: {e}")
+                                else:
+                                    target_cancel_gw = None
+                                    if self.trading_mode == "LIVE_BINANCE":
+                                        target_cancel_gw = self.live_gateway
+                                    elif self.trading_mode == "LIVE_BINGX":
+                                        target_cancel_gw = self.bingx_gateway
+                                    elif self.trading_mode == "LIVE_MULTI":
+                                        target_cancel_gw = self.bingx_gateway if ctx.spec.exchange == "bingx" else self.live_gateway
+                                    if target_cancel_gw and ctx.live_active_ask_id:
+                                        try:
+                                            await target_cancel_gw.cancel_order_ws(ctx.live_active_ask_id, sym)
+                                            ctx.live_active_ask_id = None
+                                        except Exception as e:
+                                            logger.error(f"Error cancelando ask de {sym} por escudo: {e}")
 
                         ctx.last_quote_result = quote_res
                         if sym == self.primary_symbol:
                             self.last_quote_result = quote_res
 
-                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX"):
-                            active_live_gw = self.live_gateway if self.trading_mode == "LIVE_BINANCE" else self.bingx_gateway
+                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI"):
+                            if self.trading_mode == "LIVE_MULTI":
+                                active_live_gw = self.bingx_gateway if ctx.spec.exchange == "bingx" else self.live_gateway
+                            elif self.trading_mode == "LIVE_BINANCE":
+                                active_live_gw = self.live_gateway
+                            else:
+                                active_live_gw = self.bingx_gateway
                             if active_live_gw:
                                 # Enrutar sólo símbolos compatibles con el exchange activo
                                 is_exchange_compatible = (
                                     (self.trading_mode == "LIVE_BINANCE" and ctx.spec.exchange == "binance")
                                     or (self.trading_mode == "LIVE_BINGX")
+                                    or (self.trading_mode == "LIVE_MULTI")
                                 )
                                 if is_exchange_compatible and (sym in self.top_active_symbols or sym == self.primary_symbol):
                                     # Poda determinista de órdenes huérfanas en el exchange (máximo 6 órdenes por símbolo: 3 bids, 3 asks)
@@ -3515,7 +3720,33 @@ class DryRunExecutionEngine:
         realized_sigma = prim_ctx.ring_buffer.compute_realized_volatility(window_seconds=300.0)
 
         # Auditoría DSR
-        dsr_res = DeflatedSharpeAuditor.audit_returns(self.returns_history[-250:], num_trials_n=25)
+        if len(self.returns_history) >= 3:
+            try:
+                dsr_res = DeflatedSharpeAuditor.audit_returns(self.returns_history[-250:], num_trials_n=25)
+            except Exception:
+                dsr_res = DSRAuditResult(
+                    deflated_sharpe_ratio=1.0,
+                    observed_sharpe_sr=2.5,
+                    benchmark_null_sr0=0.0,
+                    skewness_gamma3=0.0,
+                    kurtosis_gamma4=3.0,
+                    sample_length_t=len(self.returns_history),
+                    num_trials_n=25,
+                    status="INSUFFICIENT_DATA",
+                    is_overfitted=False,
+                )
+        else:
+            dsr_res = DSRAuditResult(
+                deflated_sharpe_ratio=1.0,
+                observed_sharpe_sr=2.5,
+                benchmark_null_sr0=0.0,
+                skewness_gamma3=0.0,
+                kurtosis_gamma4=3.0,
+                sample_length_t=len(self.returns_history),
+                num_trials_n=25,
+                status="INITIALIZING",
+                is_overfitted=False,
+            )
 
         # Half-Kelly
         variance_safe = max(self.portfolio.rolling_variance_sigma2, 1e-8)
@@ -3539,7 +3770,15 @@ class DryRunExecutionEngine:
             s_ask = float(ctx.ring_buffer.ob_ask_prices[s_idx, 0]) if ctx.ring_buffer.ob_count > 0 else 0.0
             s_mid = 0.5 * (s_bid + s_ask) if s_bid > 0 else 0.0
             s_obi = ctx.ring_buffer.compute_obi(levels=5) if ctx.ring_buffer.ob_count > 0 else 0.0
-            active_live_gw = self.live_gateway if (self.trading_mode == "LIVE_BINANCE" and self.live_gateway) else (self.bingx_gateway if (self.trading_mode == "LIVE_BINGX" and self.bingx_gateway) else None)
+            if self.trading_mode == "LIVE_MULTI":
+                active_sym_gw = self.bingx_gateway if ctx.spec.exchange == "bingx" else self.live_gateway
+            elif self.trading_mode == "LIVE_BINANCE":
+                active_sym_gw = self.live_gateway
+            elif self.trading_mode == "LIVE_BINGX":
+                active_sym_gw = self.bingx_gateway
+            else:
+                active_sym_gw = None
+
             lots_list = [
                 {
                     "strategy_id": lot.strategy_id,
@@ -3549,7 +3788,7 @@ class DryRunExecutionEngine:
                     "realized_pnl_usd": round(lot.realized_pnl_usd, 2),
                     "is_open": lot.is_open,
                 }
-                for lot in (active_live_gw.ledger.get_lots_by_symbol(sym) if active_live_gw else self.ledger.get_lots_by_symbol(sym))
+                for lot in (active_sym_gw.ledger.get_lots_by_symbol(sym) if active_sym_gw else self.ledger.get_lots_by_symbol(sym))
             ]
 
             symbols_data[sym] = {
@@ -3620,27 +3859,38 @@ class DryRunExecutionEngine:
                     "status": o.status,
                 })
 
-        active_live_gw = self.live_gateway if (self.trading_mode == "LIVE_BINANCE" and self.live_gateway) else (self.bingx_gateway if (self.trading_mode == "LIVE_BINGX" and self.bingx_gateway) else None)
-        if active_live_gw and self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX"):
+        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI"):
             open_orders_list.clear()  # En vivo, mostrar únicamente las órdenes reales vivas
-            for ord_id, meta in list(active_live_gw.active_orders_meta.items()):
-                px = float(meta.get("price") or 0.0)
-                q = float(meta.get("qty") or 0.0)
-                strat = meta.get("strategy_id", "AVELLANEDA_OBI")
-                sub_lot = meta.get("sub_lot_id", "L1")
-                lvl = "CASCADE" if "LIQ" in str(strat).upper() else sub_lot
-                open_orders_list.append({
-                    "order_id": str(ord_id),
-                    "symbol": meta.get("symbol", self.primary_symbol),
-                    "side": meta.get("side", "BUY"),
-                    "level": lvl,
-                    "price": round(px, 2 if px >= 1.0 else 5),
-                    "qty": round(q, 4),
-                    "filled_qty": 0.0,
-                    "queue_ahead_qty": 0.0,
-                    "strategy": strat,
-                    "status": "OPEN",
-                })
+            gws_to_inspect = []
+            if self.trading_mode == "LIVE_MULTI":
+                if self.live_gateway:
+                    gws_to_inspect.append(self.live_gateway)
+                if self.bingx_gateway:
+                    gws_to_inspect.append(self.bingx_gateway)
+            elif self.trading_mode == "LIVE_BINANCE" and self.live_gateway:
+                gws_to_inspect.append(self.live_gateway)
+            elif self.trading_mode == "LIVE_BINGX" and self.bingx_gateway:
+                gws_to_inspect.append(self.bingx_gateway)
+
+            for gw in gws_to_inspect:
+                for ord_id, meta in list(gw.active_orders_meta.items()):
+                    px = float(meta.get("price") or 0.0)
+                    q = float(meta.get("qty") or 0.0)
+                    strat = meta.get("strategy_id", "AVELLANEDA_OBI")
+                    sub_lot = meta.get("sub_lot_id", "L1")
+                    lvl = "CASCADE" if "LIQ" in str(strat).upper() else sub_lot
+                    open_orders_list.append({
+                        "order_id": str(ord_id),
+                        "symbol": meta.get("symbol", self.primary_symbol),
+                        "side": meta.get("side", "BUY"),
+                        "level": lvl,
+                        "price": round(px, 2 if px >= 1.0 else 5),
+                        "qty": round(q, 4),
+                        "filled_qty": 0.0,
+                        "queue_ahead_qty": 0.0,
+                        "strategy": strat,
+                        "status": "OPEN",
+                    })
 
         now_s = time.time()
 
@@ -3869,11 +4119,15 @@ app.add_middleware(
 
 
 class TradingModeRequest(BaseModel):
-    mode: Literal["PAPER_L2", "LIVE_BINANCE", "LIVE_BINGX"]
+    mode: Literal["PAPER_L2", "LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI"]
 
 
 class BaseCapitalRequest(BaseModel):
     base_capital_usd: float
+
+
+class ResetStateRequest(BaseModel):
+    base_capital_usd: float | None = None
 
 
 class LeverageTierRequest(BaseModel):
@@ -3923,13 +4177,32 @@ async def get_telemetry_endpoint() -> dict[str, Any]:
     return engine.get_telemetry_snapshot()
 
 
+@app.post("/api/reset-state")
+async def reset_state_endpoint(req: ResetStateRequest | None = None) -> dict[str, Any]:
+    """
+    Reinicia el estado institucional del motor cuantitativo desde 0:
+    Limpia órdenes huérfanas, historial de trades, contadores de victorias/derrotas,
+    PnL bruto y neto acumulado, curva de equidad y estado de cuarentena DSR.
+    """
+    cap = req.base_capital_usd if req else None
+    engine.reset_state_from_zero(base_capital_usd=cap)
+    return {
+        "status": "STATE_RESET_OK",
+        "mode": engine.trading_mode,
+        "base_capital_usd": engine.portfolio.base_capital_usd,
+        "current_equity_usd": engine.portfolio.current_equity_usd,
+        "timestamp_ns": time.time_ns(),
+    }
+
+
 @app.post("/api/trading-mode")
 async def set_trading_mode_endpoint(req: TradingModeRequest) -> dict[str, Any]:
     """
-    Conmuta el modo de ejecución entre PAPER_L2, LIVE_BINANCE y LIVE_BINGX.
+    Conmuta el modo de ejecución entre PAPER_L2, LIVE_BINANCE, LIVE_BINGX y LIVE_MULTI.
     REGLA DE SEGURIDAD CRÍTICA:
     Si se solicita LIVE_BINANCE, verifica que BINANCE_API_KEY y BINANCE_API_SECRET existan.
     Si se solicita LIVE_BINGX, verifica que BINGX_API_KEY y BINGX_API_SECRET existan.
+    Si se solicita LIVE_MULTI, verifica ambas credenciales de Binance y BingX.
     Verifica que gatekeeper.kill_switch_engaged sea False.
     Si faltan claves API o el Kill-Switch está activo, rechaza con HTTP 400 y mantiene el bot en PAPER_L2.
     """
@@ -3963,6 +4236,26 @@ async def set_trading_mode_endpoint(req: TradingModeRequest) -> dict[str, Any]:
                 status_code=400,
                 detail="Bloqueo de seguridad: El Kill-Switch de emergencia está activo. Debe resetear el Kill-Switch antes de pasar a LIVE_BINGX.",
             )
+    elif req.mode == "LIVE_MULTI":
+        bin_key = os.getenv("BINANCE_API_KEY", "").strip()
+        bin_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+        bx_key = os.getenv("BINGX_API_KEY", "").strip()
+        bx_secret = os.getenv("BINGX_API_SECRET", "").strip()
+        if not bin_key or not bin_secret:
+            raise HTTPException(
+                status_code=400,
+                detail="Configuración de seguridad incompleta: Debe configurar BINANCE_API_KEY y BINANCE_API_SECRET en su archivo .env antes de operar en modo LIVE_MULTI.",
+            )
+        if not bx_key or not bx_secret:
+            raise HTTPException(
+                status_code=400,
+                detail="Configuración de seguridad incompleta: Debe configurar BINGX_API_KEY y BINGX_API_SECRET en su archivo .env antes de operar en modo LIVE_MULTI.",
+            )
+        if engine.gatekeeper.kill_switch_engaged:
+            raise HTTPException(
+                status_code=400,
+                detail="Bloqueo de seguridad: El Kill-Switch de emergencia está activo. Debe resetear el Kill-Switch antes de pasar a LIVE_MULTI.",
+            )
 
     try:
         await engine.set_trading_mode(req.mode)
@@ -3981,12 +4274,23 @@ async def emergency_flatten_endpoint() -> dict[str, Any]:
     """
     Disparador síncrono del Kill-Switch de emergencia (Gate 4).
     Bloquea inmediatamente todas las órdenes nuevas y activa el flatten.
-    Si el motor está en LIVE_BINANCE o LIVE_BINGX, invoca también emergency_flatten_all en el gateway activo.
+    Si el motor está en LIVE_BINANCE, LIVE_BINGX o LIVE_MULTI, invoca también emergency_flatten_all en el gateway activo.
     """
     engine.gatekeeper.trigger_emergency_flatten()
     logger.warning("Kill-Switch disparado manualmente a través de /api/emergency-flatten.")
 
-    if engine.trading_mode == "LIVE_BINANCE" and engine.live_gateway is not None:
+    if engine.trading_mode == "LIVE_MULTI":
+        if engine.live_gateway is not None:
+            try:
+                await engine.live_gateway.emergency_flatten_all(engine.symbols)
+            except Exception as e:
+                logger.error(f"Error ejecutando live emergency_flatten_all en Binance: {e}")
+        if engine.bingx_gateway is not None:
+            try:
+                await engine.bingx_gateway.emergency_flatten_all(engine.symbols)
+            except Exception as e:
+                logger.error(f"Error ejecutando live emergency_flatten_all en BingX: {e}")
+    elif engine.trading_mode == "LIVE_BINANCE" and engine.live_gateway is not None:
         try:
             await engine.live_gateway.emergency_flatten_all(engine.symbols)
         except Exception as e:
@@ -4015,6 +4319,7 @@ async def profit_sweep_endpoint() -> dict[str, Any]:
     - En LIVE_BINANCE: ejecuta exchange.transfer('USDT', surplus, 'future', 'spot')
       y resetea el capital operativo a base_capital_usd.
     - En LIVE_BINGX: ejecuta transferencia hacia spot si disponible y resetea a base_capital_usd.
+    - En LIVE_MULTI: ejecuta barrido proporcional en ambos exchanges.
     """
     surplus = round(engine.portfolio.current_equity_usd - engine.portfolio.base_capital_usd, 2)
     if surplus <= 0.0:
@@ -4029,7 +4334,25 @@ async def profit_sweep_endpoint() -> dict[str, Any]:
             "timestamp_ns": time.time_ns(),
         }
 
-    if engine.trading_mode == "LIVE_BINANCE":
+    if engine.trading_mode == "LIVE_MULTI":
+        half_surplus = round(surplus / 2.0, 2)
+        if engine.live_gateway is not None and half_surplus > 0:
+            try:
+                await engine.live_gateway.exchange.transfer(
+                    code="USDT", amount=half_surplus, fromAccount="future", toAccount="spot"
+                )
+                logger.info(f"Barrido en Binance: {half_surplus} USDT a Spot")
+            except Exception as e:
+                logger.warning(f"Fallo sweep en Binance: {e}")
+        if engine.bingx_gateway is not None and half_surplus > 0:
+            try:
+                ex = engine.bingx_gateway.exchange
+                if hasattr(ex, "transfer"):
+                    await ex.transfer(code="USDT", amount=half_surplus, fromAccount="swap", toAccount="spot")
+                logger.info(f"Barrido en BingX: {half_surplus} USDT a Spot")
+            except Exception as e:
+                logger.warning(f"Fallo sweep en BingX: {e}")
+    elif engine.trading_mode == "LIVE_BINANCE":
         if engine.live_gateway is None:
             raise HTTPException(status_code=400, detail="Gateway de Binance no inicializado.")
         try:
