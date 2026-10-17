@@ -51,6 +51,7 @@ class AvellanedaStoikovOBIEngine:
         "min_profitable_spread_bps",
         "min_notional",
         "momentum_shift_bps",
+        "max_spread_bps_ladder",
     )
 
     def __init__(
@@ -64,6 +65,7 @@ class AvellanedaStoikovOBIEngine:
         gatekeeper: MandateGatekeeper,
         min_profitable_spread_bps: float | None = None,
         min_notional: float = 5.0,
+        max_spread_bps_ladder: tuple[float, float, float] = (25.0, 50.0, 85.0),
     ) -> None:
         self.symbol = symbol.upper()
         self.tick_size = tick_size
@@ -73,6 +75,7 @@ class AvellanedaStoikovOBIEngine:
         self.gatekeeper = gatekeeper
         self.active_bid_order_id: str | None = None
         self.active_ask_order_id: str | None = None
+        self.max_spread_bps_ladder = tuple(float(x) for x in max_spread_bps_ladder)
         # Piso de spread rentable: mínimo 10.0 bps en cripto y 6.5 bps en commodities TradFi (Oro / Plata)
         if min_profitable_spread_bps is not None:
             self.min_profitable_spread_bps = float(min_profitable_spread_bps)
@@ -133,22 +136,33 @@ class AvellanedaStoikovOBIEngine:
         vpin: float | None = None,
         entry_price: float | None = None,
         break_even_price: float | None = None,
+        venue_best_bid: float | None = None,
+        venue_best_ask: float | None = None,
+        lead_lag_tfi: float | None = None,
     ) -> AvellanedaQuoteResult:
-        if ring_buffer.ob_count == 0:
+        if ring_buffer.ob_count == 0 and (venue_best_bid is None or venue_best_ask is None):
             return AvellanedaQuoteResult(0.0, 0.0, None, None, False, False, 0.0, 0.0, [], [])
 
         effective_entry = break_even_price if (break_even_price is not None and break_even_price > 0) else entry_price
 
-        latest_idx = (ring_buffer.ob_head - 1) % ring_buffer.capacity
-        best_bid = float(ring_buffer.ob_bid_prices[latest_idx, 0])
-        best_ask = float(ring_buffer.ob_ask_prices[latest_idx, 0])
+        if ring_buffer.ob_count > 0:
+            latest_idx = (ring_buffer.ob_head - 1) % ring_buffer.capacity
+            raw_bb = float(ring_buffer.ob_bid_prices[latest_idx, 0])
+            raw_ba = float(ring_buffer.ob_ask_prices[latest_idx, 0])
+        else:
+            raw_bb = float(venue_best_bid or 1.0)
+            raw_ba = float(venue_best_ask or 1.0)
+
+        # Si el exchange de ejecución (ej. BingX) provee su libro directo, priorizarlo para no cruzar
+        best_bid = float(venue_best_bid) if (venue_best_bid is not None and venue_best_bid > 0) else raw_bb
+        best_ask = float(venue_best_ask) if (venue_best_ask is not None and venue_best_ask > 0) else raw_ba
         mid_price = 0.5 * (best_bid + best_ask)
 
-        obi = ring_buffer.compute_obi(levels=5)
-        raw_sigma = ring_buffer.compute_realized_volatility(window_seconds=300.0)
+        obi = ring_buffer.compute_obi(levels=5) if ring_buffer.ob_count > 0 else 0.0
+        raw_sigma = ring_buffer.compute_realized_volatility(window_seconds=300.0) if ring_buffer.ob_count > 0 else 0.0005
         sigma = max(raw_sigma, self.MIN_SIGMA_FLOOR)
 
-        calc_vpin = vpin if vpin is not None else (ring_buffer.compute_vpin() if hasattr(ring_buffer, "compute_vpin") else 0.0)
+        calc_vpin = vpin if vpin is not None else (ring_buffer.compute_vpin() if hasattr(ring_buffer, "compute_vpin") and ring_buffer.ob_count > 0 else 0.0)
 
         reservation_price, optimal_spread = self.compute_reservation_and_spread(
             mid_price=mid_price,
@@ -162,8 +176,18 @@ class AvellanedaStoikovOBIEngine:
 
         bid_cancelled = False
         ask_cancelled = False
+        suppress_bid = False
         suppress_ask = False
         vol_shift = 0.0
+
+        # Señal Lead-Lag entre Binance (Líder) y BingX (Seguidor)
+        if lead_lag_tfi is not None:
+            if lead_lag_tfi > 0.60:
+                # Flujo fuertemente comprador en el líder: retirar ASK para evitar selección adversa
+                suppress_ask = True
+            elif lead_lag_tfi < -0.60:
+                # Flujo fuertemente vendedor en el líder: retirar BID para evitar ser atropellado
+                suppress_bid = True
 
         # Estrechar el umbral del OBI Shield en un 25% si VPIN > 0.75 para proteger el libro
         effective_obi_threshold = self.config.obi_shield_threshold * (0.75 if calc_vpin > 0.75 else 1.0)
@@ -188,12 +212,9 @@ class AvellanedaStoikovOBIEngine:
 
         now_ns = time.time_ns()
         now_ms_tag = int(time.time() * 1000) % 100_000_000
-        tfi = ring_buffer.compute_tfi(window_ns=500_000_000) if hasattr(ring_buffer, "compute_tfi") else 0.0
+        tfi = ring_buffer.compute_tfi(window_ns=500_000_000) if hasattr(ring_buffer, "compute_tfi") and ring_buffer.ob_count > 0 else 0.0
 
         # Auto-Colapso de Escalera por MIN_NOTIONAL ($100 USDT en BTC, $20 en ETH, $5 en el resto):
-        # Si el nocional de cualquier nivel individual (L1: 45%, L2: 35%, L3: 20%) queda por debajo
-        # del min_notional del símbolo, colapsa automáticamente la escalera en 1 sola orden L1
-        # con el 100% del cupo del par para evitar rechazos -4164 de Binance / BingX.
         total_quote_notional = self.quote_qty * mid_price
         if (
             total_quote_notional * 0.20 >= self.min_notional
@@ -201,73 +222,96 @@ class AvellanedaStoikovOBIEngine:
             and total_quote_notional * 0.45 >= self.min_notional
         ):
             ladder_tiers = [
-                (0.45, 1.0, "L1"),
-                (0.35, 2.0, "L2"),
-                (0.20, 3.5, "L3"),
+                (0.45, 1.0, "L1", self.max_spread_bps_ladder[0]),
+                (0.35, 2.0, "L2", self.max_spread_bps_ladder[1]),
+                (0.20, 3.5, "L3", self.max_spread_bps_ladder[2]),
             ]
         else:
             ladder_tiers = [
-                (1.00, 1.0, "L1"),
+                (1.00, 1.0, "L1", self.max_spread_bps_ladder[0]),
             ]
 
         # Break-Even Real y Momentum Trailing Exit:
-        # Si q > 0 (LONG), la orden ASK reduce posición. Exige precio >= entry * (1 + 8 bps) [o 6 bps en TradFi].
-        # Si el flujo (OBI > +0.45 o TFI > +0.50) continúa a favor, corre el TP hacia arriba (+5 bps).
-        # Si q < 0 (SHORT), la orden BID reduce posición. Exige precio <= entry * (1 - 8 bps).
-        # Si el flujo (OBI < -0.45 o TFI < -0.50) continúa a favor, corre el TP hacia abajo (-5 bps).
         be_bps_delta = self.MIN_FEE_BPS + self.MIN_PROFIT_BPS_OVER_BREAKEVEN  # 8.0 bps en cripto
         if any(c in self.symbol for c in ("XAU", "XAG", "GOLD", "SILVER")):
             be_bps_delta = 6.0  # 6.0 bps en TradFi commodities
 
         bid_ladder: list[OrderRequest] = []
-        for weight, mult, sub_lot in ladder_tiers:
-            level_half_spread = half_spread * mult
-            raw_level_bid = reservation_price - level_half_spread - vol_shift
-            safe_level_bid = max(min(raw_level_bid, best_ask - self.tick_size), self.tick_size)
+        if not suppress_bid:
+            prev_bid_half_spread = 0.0
+            for weight, mult, sub_lot, max_tier_bps in ladder_tiers:
+                level_half_spread = half_spread * mult
+                # Techo dinámico de spread (L1: 25 bps, L2: 50 bps, L3: 85 bps)
+                max_half_spread_cap = 0.5 * mid_price * (max_tier_bps / 10_000.0)
+                level_half_spread = min(level_half_spread, max_half_spread_cap)
+                min_half_floor = 0.5 * mid_price * (self.min_profitable_spread_bps / 10_000.0)
+                level_half_spread = max(level_half_spread, min_half_floor)
 
-            # Si estamos en SHORT, este BID es orden de cierre: imponer Break-Even real y Momentum Trailing
-            if normalized_inventory_q < -1e-4 and effective_entry and effective_entry > 0:
-                max_be_bid = effective_entry * (1.0 - (be_bps_delta / 10_000.0))
-                safe_level_bid = min(safe_level_bid, max_be_bid)
-                # Momentum Trailing Exit a favor de la tendencia bajista si OBI < -0.45 o TFI < -0.50
-                if (obi < -0.45 or tfi < -0.50) and (best_ask < effective_entry or mid_price < effective_entry):
-                    trail_shift = mid_price * (self.momentum_shift_bps / 10_000.0)
-                    safe_level_bid = max(safe_level_bid - trail_shift, self.tick_size)
+                # Si hay señal Lead-Lag alcista en L1 (TFI > 0.60), pegar L1 al best_bid para captura inmediata
+                if sub_lot == "L1" and lead_lag_tfi is not None and lead_lag_tfi > 0.60:
+                    raw_level_bid = best_bid
+                else:
+                    if level_half_spread <= prev_bid_half_spread:
+                        level_half_spread = prev_bid_half_spread + self.tick_size
+                    prev_bid_half_spread = level_half_spread
+                    raw_level_bid = reservation_price - level_half_spread - vol_shift
+                safe_level_bid = max(min(raw_level_bid, best_ask - self.tick_size), self.tick_size)
 
-            raw_qty = max(self.quote_qty * weight, self.step_size)
-            if safe_level_bid > 0 and raw_qty * safe_level_bid < self.min_notional:
-                needed_qty = math.ceil(self.min_notional / safe_level_bid / self.step_size) * self.step_size
-                raw_qty = max(raw_qty, needed_qty)
-            level_qty = truncate_decimal_step(raw_qty, self.step_size)
-            cid = f"AV_{sub_lot}_B_{now_ms_tag}_{uuid.uuid4().hex[:4]}"
+                # Si estamos en SHORT, este BID es orden de cierre: imponer Break-Even real y Momentum Trailing
+                if normalized_inventory_q < -1e-4 and effective_entry and effective_entry > 0:
+                    max_be_bid = effective_entry * (1.0 - (be_bps_delta / 10_000.0))
+                    safe_level_bid = min(safe_level_bid, max_be_bid)
+                    if (obi < -0.45 or tfi < -0.50) and (best_ask < effective_entry or mid_price < effective_entry):
+                        trail_shift = mid_price * (self.momentum_shift_bps / 10_000.0)
+                        safe_level_bid = max(safe_level_bid - trail_shift, self.tick_size)
 
-            cand_bid = OrderRequest.build_maker_order(
-                symbol=self.symbol,
-                side="BUY",
-                raw_price=safe_level_bid,
-                raw_qty=level_qty,
-                tick_size=self.tick_size,
-                step_size=self.step_size,
-                strategy_id=self.STRATEGY_ID,
-                timestamp_ns=now_ns,
-                client_order_id=cid,
-            )
-            bid_ok, _ = self.gatekeeper.validate_order(cand_bid, portfolio_state)
-            if bid_ok:
-                bid_ladder.append(cand_bid)
+                raw_qty = max(self.quote_qty * weight, self.step_size)
+                if safe_level_bid > 0 and raw_qty * safe_level_bid < self.min_notional:
+                    needed_qty = math.ceil(self.min_notional / safe_level_bid / self.step_size) * self.step_size
+                    raw_qty = max(raw_qty, needed_qty)
+                level_qty = truncate_decimal_step(raw_qty, self.step_size)
+                cid = f"AV_{sub_lot}_B_{now_ms_tag}_{uuid.uuid4().hex[:4]}"
+
+                cand_bid = OrderRequest.build_maker_order(
+                    symbol=self.symbol,
+                    side="BUY",
+                    raw_price=safe_level_bid,
+                    raw_qty=level_qty,
+                    tick_size=self.tick_size,
+                    step_size=self.step_size,
+                    strategy_id=self.STRATEGY_ID,
+                    timestamp_ns=now_ns,
+                    client_order_id=cid,
+                )
+                bid_ok, _ = self.gatekeeper.validate_order(cand_bid, portfolio_state)
+                if bid_ok:
+                    bid_ladder.append(cand_bid)
 
         ask_ladder: list[OrderRequest] = []
         if not suppress_ask:
-            for weight, mult, sub_lot in ladder_tiers:
+            prev_ask_half_spread = 0.0
+            for weight, mult, sub_lot, max_tier_bps in ladder_tiers:
                 level_half_spread = half_spread * mult
-                raw_level_ask = reservation_price + level_half_spread
+                # Techo dinámico de spread (L1: 25 bps, L2: 50 bps, L3: 85 bps)
+                max_half_spread_cap = 0.5 * mid_price * (max_tier_bps / 10_000.0)
+                level_half_spread = min(level_half_spread, max_half_spread_cap)
+                min_half_floor = 0.5 * mid_price * (self.min_profitable_spread_bps / 10_000.0)
+                level_half_spread = max(level_half_spread, min_half_floor)
+
+                # Si hay señal Lead-Lag bajista en L1 (TFI < -0.60), pegar L1 al best_ask para captura inmediata
+                if sub_lot == "L1" and lead_lag_tfi is not None and lead_lag_tfi < -0.60:
+                    raw_level_ask = best_ask
+                else:
+                    if level_half_spread <= prev_ask_half_spread:
+                        level_half_spread = prev_ask_half_spread + self.tick_size
+                    prev_ask_half_spread = level_half_spread
+                    raw_level_ask = reservation_price + level_half_spread
                 safe_level_ask = max(raw_level_ask, best_bid + self.tick_size)
 
                 # Si estamos en LONG, este ASK es orden de cierre: imponer Break-Even real y Momentum Trailing
                 if normalized_inventory_q > 1e-4 and effective_entry and effective_entry > 0:
                     min_be_ask = effective_entry * (1.0 + (be_bps_delta / 10_000.0))
                     safe_level_ask = max(safe_level_ask, min_be_ask)
-                    # Momentum Trailing Exit a favor de la tendencia alcista si OBI > 0.45 o TFI > 0.50
                     if (obi > 0.45 or tfi > 0.50) and (best_bid > effective_entry or mid_price > effective_entry):
                         trail_shift = mid_price * (self.momentum_shift_bps / 10_000.0)
                         safe_level_ask = safe_level_ask + trail_shift

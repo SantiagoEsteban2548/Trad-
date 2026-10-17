@@ -34,6 +34,9 @@ class WebSocketMultiplexer:
         exchange_id: str = "binance",
         exchange_config: dict[str, Any] | None = None,
         buffer_capacity: int = 10_000,
+        secondary_exchange_id: str | None = None,
+        secondary_exchange_config: dict[str, Any] | None = None,
+        secondary_symbols: list[str] | None = None,
     ) -> None:
         self.symbols: list[str] = symbols
         self.exchange_id: str = exchange_id
@@ -54,6 +57,26 @@ class WebSocketMultiplexer:
         self.buffers: dict[str, MarketRingBuffer] = {
             symbol: MarketRingBuffer(capacity=buffer_capacity) for symbol in symbols
         }
+
+        # Soporte para segundo exchange (e.g. BingX para arbitraje Lead-Lag)
+        self.secondary_exchange_id = secondary_exchange_id
+        self.secondary_symbols = secondary_symbols or []
+        self.venue_top_of_book: dict[str, tuple[float, float]] = {}
+        if secondary_exchange_id:
+            try:
+                sec_class = getattr(ccxtpro, secondary_exchange_id)
+                sec_cfg: dict[str, Any] = {
+                    "enableRateLimit": True,
+                    "options": {"defaultType": "swap"},
+                }
+                if secondary_exchange_config:
+                    sec_cfg.update(secondary_exchange_config)
+                self.secondary_exchange: ccxtpro.Exchange | None = sec_class(sec_cfg)
+            except Exception as e:
+                logger.warning(f"No se pudo inicializar secondary exchange {secondary_exchange_id}: {e}")
+                self.secondary_exchange = None
+        else:
+            self.secondary_exchange = None
 
         self.running: bool = False
         self._tasks: list[asyncio.Task] = []
@@ -94,6 +117,17 @@ class WebSocketMultiplexer:
         # 4. Tarea periódica de renovación de listenKey (cada 30 minutos)
         self._tasks.append(asyncio.create_task(self._listen_key_keepalive_loop()))
 
+        # 5. Suscripción secundaria de libros L2 (BingX) para conocer best_bid/best_ask y arbitraje Lead-Lag
+        if self.secondary_exchange and self.secondary_symbols:
+            for s_sym in self.secondary_symbols:
+                self._tasks.append(
+                    asyncio.create_task(
+                        self._run_with_backoff(
+                            f"SEC_OB_{s_sym}", lambda s=s_sym: self._secondary_order_book_stream(s)
+                        )
+                    )
+                )
+
     async def stop(self) -> None:
         """Detiene limpiamente todas las tareas y cierra la conexión WebSocket."""
         self.running = False
@@ -103,7 +137,31 @@ class WebSocketMultiplexer:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         await self.exchange.close()
+        if self.secondary_exchange:
+            try:
+                await self.secondary_exchange.close()
+            except Exception:
+                pass
         logger.info("Multiplexer WS detenido correctamente.")
+
+    async def _secondary_order_book_stream(self, symbol: str) -> None:
+        watch_symbol = self._resolve_watch_symbol(symbol)
+        while self.running and self.secondary_exchange:
+            try:
+                ob = await self.secondary_exchange.watch_order_book(watch_symbol, limit=5)
+                raw_bids = ob.get("bids", [])
+                raw_asks = ob.get("asks", [])
+                if raw_bids and raw_asks:
+                    best_bid = float(raw_bids[0][0])
+                    best_ask = float(raw_asks[0][0])
+                    if best_bid > 0.0 and best_ask > 0.0:
+                        self.venue_top_of_book[symbol] = (best_bid, best_ask)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"secondary orderbook stream {symbol}: {e}")
+                await asyncio.sleep(2.0)
+
 
     # -------------------------------------------------------------------------
     # Bucles de Transmisión por Instrumento

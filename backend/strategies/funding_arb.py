@@ -28,6 +28,29 @@ class DeltaNeutralArbPackage:
     perp_futures_leg: OrderRequest
 
 
+@dataclass(slots=True, frozen=True)
+class CrossExchangeFundingSnapshot:
+    symbol: str
+    binance_funding_rate: float
+    bingx_funding_rate: float
+    binance_bid_price: float
+    binance_ask_price: float
+    bingx_bid_price: float
+    bingx_ask_price: float
+    funding_interval_hours: int = 8
+
+
+@dataclass(slots=True, frozen=True)
+class CrossExchangeArbPackage:
+    symbol: str
+    annualized_yield_diff: float
+    rate_spread_bps: float
+    long_exchange: str
+    short_exchange: str
+    long_leg: OrderRequest
+    short_leg: OrderRequest
+
+
 class FundingRateArbitrageEngine:
     """
     Motor C: Arbitraje Delta-Neutral de Tasa de Financiación y Basis Spot-Perpetuo.
@@ -146,3 +169,107 @@ class FundingRateArbitrageEngine:
             spot_hedge_leg=spot_leg,
             perp_futures_leg=perp_leg,
         )
+
+    @staticmethod
+    def compute_cross_exchange_metrics(
+        snapshot: CrossExchangeFundingSnapshot,
+    ) -> tuple[float, float, str, str]:
+        periods_per_day = 24.0 / max(snapshot.funding_interval_hours, 1)
+        rate_diff = snapshot.binance_funding_rate - snapshot.bingx_funding_rate
+
+        if rate_diff >= 0.0:
+            short_exchange = "BINANCE"
+            long_exchange = "BINGX"
+            net_rate = rate_diff
+        else:
+            short_exchange = "BINGX"
+            long_exchange = "BINANCE"
+            net_rate = -rate_diff
+
+        annualized_yield_diff = net_rate * periods_per_day * 365.0
+        rate_spread_bps = net_rate * 10_000.0
+
+        return annualized_yield_diff, rate_spread_bps, long_exchange, short_exchange
+
+    def evaluate_cross_exchange_opportunity(
+        self,
+        snapshot: CrossExchangeFundingSnapshot,
+        target_notional_usd: float,
+        portfolio_state: PortfolioState,
+        timestamp_ns: int | None = None,
+    ) -> CrossExchangeArbPackage | None:
+        (
+            annualized_yield_diff,
+            rate_spread_bps,
+            long_exchange,
+            short_exchange,
+        ) = self.compute_cross_exchange_metrics(snapshot)
+
+        if annualized_yield_diff < self.config.min_annualized_funding_yield:
+            return None
+
+        ref_price = 0.5 * (snapshot.binance_bid_price + snapshot.bingx_bid_price)
+        if ref_price <= 0.0:
+            return None
+
+        ts_ns = timestamp_ns if timestamp_ns is not None else time.time_ns()
+        raw_qty = target_notional_usd / ref_price
+        matched_qty = truncate_decimal_step(raw_qty, self.step_size)
+        if matched_qty <= 0.0:
+            return None
+
+        if long_exchange == "BINANCE":
+            long_price = snapshot.binance_bid_price
+            short_price = snapshot.bingx_ask_price
+        else:
+            long_price = snapshot.bingx_bid_price
+            short_price = snapshot.binance_ask_price
+
+        long_leg = OrderRequest.build_maker_order(
+            symbol=f"{snapshot.symbol}:{long_exchange}",
+            side="BUY",
+            raw_price=long_price,
+            raw_qty=matched_qty,
+            tick_size=self.tick_size,
+            step_size=self.step_size,
+            strategy_id=self.STRATEGY_ID,
+            timestamp_ns=ts_ns,
+        )
+
+        short_leg = OrderRequest.build_maker_order(
+            symbol=f"{snapshot.symbol}:{short_exchange}",
+            side="SELL",
+            raw_price=short_price,
+            raw_qty=matched_qty,
+            tick_size=self.tick_size,
+            step_size=self.step_size,
+            strategy_id=self.STRATEGY_ID,
+            timestamp_ns=ts_ns,
+        )
+
+        ok_long, _ = self.gatekeeper.validate_order(long_leg, portfolio_state)
+        if not ok_long:
+            return None
+
+        simulated_positions = dict(portfolio_state.active_positions)
+        simulated_positions[long_leg.symbol] = (
+            abs(simulated_positions.get(long_leg.symbol, 0.0)) + long_leg.notional_usd
+        )
+        projected_state = portfolio_state.model_copy(
+            update={"active_positions": simulated_positions}
+        )
+
+        ok_short, _ = self.gatekeeper.validate_order(short_leg, projected_state)
+        if not ok_short:
+            return None
+
+        return CrossExchangeArbPackage(
+            symbol=snapshot.symbol,
+            annualized_yield_diff=annualized_yield_diff,
+            rate_spread_bps=rate_spread_bps,
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+            long_leg=long_leg,
+            short_leg=short_leg,
+        )
+

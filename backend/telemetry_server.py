@@ -58,13 +58,13 @@ from backend.strategies.leverage_controller import AutonomousLeverageController
 import os
 from backend.strategies.regime_config import RegimeConfig
 
-# Warm Path: Gemini Regime Council integration (if GEMINI_API_KEY is present)
-if os.getenv("GEMINI_API_KEY"):
+# Warm Path: Gemini Regime Council integration
+try:
     from backend.regime_council.gemini_debate import (
         GeminiRegimeCouncil,
         WarmPathCouncilScheduler,
     )
-else:
+except ImportError:
     GeminiRegimeCouncil = None  # type: ignore[assignment, misc]
     WarmPathCouncilScheduler = None  # type: ignore[assignment, misc]
 from backend.validation.l2_simulator_and_dsr import DeflatedSharpeAuditor, DSRAuditResult, L2QueueSimulator
@@ -460,6 +460,54 @@ class BinanceLiveWsGateway:
                 logger.warning(f"reduceOnly rechazado en Binance ({symbol}): {e}")
             else:
                 logger.error(f"Error en close_position_market ({symbol} {close_side} {qty}) en Binance: {e}")
+            return None
+
+    async def close_position_maker(self, symbol: str, close_side: str, qty: float, price: float) -> str | None:
+        """
+        Coloca una orden LIMIT reduceOnly en modo Post-Only (GTX) para Take-Profit en Binance,
+        capturando comisión Maker y protegiendo el margen de ganancia.
+        """
+        try:
+            open_pos = 0.0
+            if self.portfolio and symbol in self.portfolio.active_positions:
+                open_pos = self.portfolio.active_positions[symbol]
+            else:
+                try:
+                    positions = await self.exchange.fetch_positions([symbol])
+                    for p in positions:
+                        if p.get("symbol") == symbol:
+                            amt = float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0.0)
+                            open_pos = amt
+                            break
+                except Exception:
+                    pass
+
+            if abs(open_pos) <= 1e-8:
+                return None
+
+            if close_side.lower() == "sell" and open_pos < -1e-8:
+                return None
+            if close_side.lower() == "buy" and open_pos > 1e-8:
+                return None
+
+            safe_qty = min(abs(float(qty)), abs(open_pos))
+            target_sym = self.resolve_binance_symbol(symbol)
+            safe_price = float(self.exchange.price_to_precision(target_sym, price))
+            safe_qty_str = float(self.exchange.amount_to_precision(target_sym, safe_qty))
+
+            res = await self.exchange.create_order(
+                symbol=target_sym,
+                type="limit",
+                side=close_side.lower(),
+                amount=safe_qty_str,
+                price=safe_price,
+                params={"reduceOnly": True, "timeInForce": "GTX", "postOnly": True, "positionSide": "BOTH"},
+            )
+            order_id = str(res.get("id", ""))
+            logger.info(f"Take-Profit Maker colocado en Binance {symbol}: {close_side} {safe_qty_str} @ ${safe_price} [ID: {order_id}]")
+            return order_id
+        except Exception as e:
+            logger.debug(f"close_position_maker omitido/rechazado en Binance ({symbol}): {e}")
             return None
 
     async def cancel_order_ws(self, order_id: str, symbol: str) -> bool:
@@ -1304,6 +1352,54 @@ class BingXLiveWsGateway:
                 logger.error(f"Error en close_position_market ({symbol} {close_side} {qty}) en BingX: {e}")
             return None
 
+    async def close_position_maker(self, symbol: str, close_side: str, qty: float, price: float) -> str | None:
+        """
+        Coloca una orden LIMIT reduceOnly en modo Post-Only para Take-Profit en BingX,
+        capturando comisión Maker y optimizando el Profit Factor.
+        """
+        try:
+            target_sym = self.resolve_bingx_symbol(symbol)
+            open_pos = 0.0
+            if self.portfolio and symbol in self.portfolio.active_positions:
+                open_pos = self.portfolio.active_positions[symbol]
+            else:
+                try:
+                    positions = await self.exchange.fetch_positions([target_sym])
+                    for p in positions:
+                        if p.get("symbol") in (target_sym, symbol):
+                            amt = float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0.0)
+                            open_pos = amt
+                            break
+                except Exception:
+                    pass
+
+            if abs(open_pos) <= 1e-8:
+                return None
+
+            if close_side.lower() == "sell" and open_pos < -1e-8:
+                return None
+            if close_side.lower() == "buy" and open_pos > 1e-8:
+                return None
+
+            safe_qty = min(abs(float(qty)), abs(open_pos))
+            safe_price = float(self.exchange.price_to_precision(target_sym, price))
+            safe_qty_str = float(self.exchange.amount_to_precision(target_sym, safe_qty))
+
+            res = await self.exchange.create_order(
+                symbol=target_sym,
+                type="limit",
+                side=close_side.lower(),
+                amount=safe_qty_str,
+                price=safe_price,
+                params={"reduceOnly": True, "postOnly": True, "positionSide": "BOTH"},
+            )
+            order_id = str(res.get("id", ""))
+            logger.info(f"Take-Profit Maker colocado en BingX {symbol}: {close_side} {safe_qty_str} @ ${safe_price} [ID: {order_id}]")
+            return order_id
+        except Exception as e:
+            logger.debug(f"close_position_maker omitido/rechazado en BingX ({symbol}): {e}")
+            return None
+
     async def cancel_order_ws(self, order_id: str, symbol: str) -> bool:
         """Cancela la orden activa en BingX en tiempo real con fallback a REST si WS no está soportado."""
         try:
@@ -1893,6 +1989,12 @@ class SymbolExecutionContext:
     realized_pnl_today: float = 0.0
     live_active_bid_id: str | None = None
     live_active_ask_id: str | None = None
+    active_ladder_bids: dict[str, str] = field(default_factory=dict)
+    active_ladder_asks: dict[str, str] = field(default_factory=dict)
+    active_ladder_bid_prices: dict[str, float] = field(default_factory=dict)
+    active_ladder_ask_prices: dict[str, float] = field(default_factory=dict)
+    tp_maker_order_id: str | None = None
+    tp_maker_submit_ts_s: float | None = None
     inventory_open_ts_ns: int | None = None
     avg_entry_price: float | None = None
     break_even_price: float | None = None
@@ -1939,11 +2041,14 @@ class DryRunExecutionEngine:
         self.primary_symbol = self.symbols[0]
         self.config_path = config_path
 
-        # 1. Ingesta WebSocket multiplexada concurrente vía CCXT Pro
+        # 1. Ingesta WebSocket multiplexada concurrente vía CCXT Pro (Binance Primario + BingX Secundario para Lead-Lag)
+        bingx_symbols = [s for s in self.symbols if SYMBOL_SPECS.get(s) and SYMBOL_SPECS[s].exchange == "bingx"]
         self.multiplexer = WebSocketMultiplexer(
             symbols=self.symbols,
             exchange_id="binance",
             buffer_capacity=10_000,
+            secondary_exchange_id="bingx",
+            secondary_symbols=bingx_symbols,
         )
 
         # 2. Cortafuegos determinista unificado MandateGatekeeper
@@ -2713,6 +2818,8 @@ class DryRunExecutionEngine:
             ctx.avg_entry_price = None
             ctx.take_profit_price = None
             ctx.stop_loss_price = None
+            ctx.tp_maker_order_id = None
+            ctx.tp_maker_submit_ts_s = None
             return None
 
         is_long = curr_pos > 0.0
@@ -2763,9 +2870,59 @@ class DryRunExecutionEngine:
             ret = (entry_px - exit_px) / max(entry_px, 1e-8)
 
         # Ejecutar cierre en Live o Paper
-        if self.trading_mode == "LIVE_MULTI":
-            target_gw = self.bingx_gateway if ctx.spec.exchange == "bingx" else self.live_gateway
+        if self.trading_mode in ("LIVE_MULTI", "LIVE_BINANCE", "LIVE_BINGX"):
+            if self.trading_mode == "LIVE_MULTI":
+                target_gw = self.bingx_gateway if ctx.spec.exchange == "bingx" else self.live_gateway
+            elif self.trading_mode == "LIVE_BINANCE":
+                target_gw = self.live_gateway
+            else:
+                target_gw = self.bingx_gateway
+
             if target_gw is not None:
+                now_s = time.time()
+                # Mejora 4: Si es TAKE_PROFIT, intentar primero orden LIMIT Post-Only reduceOnly (Modo Maker)
+                # durante una ventana de hasta 4.0s para capturar comisiones Maker y ahorrar 3-5 bps.
+                if exit_reason == "TAKE_PROFIT":
+                    if ctx.tp_maker_order_id is None:
+                        for b_oid in list(ctx.active_ladder_bids.values()):
+                            try:
+                                await target_gw.cancel_order_ws(b_oid, symbol)
+                            except Exception:
+                                pass
+                        for a_oid in list(ctx.active_ladder_asks.values()):
+                            try:
+                                await target_gw.cancel_order_ws(a_oid, symbol)
+                            except Exception:
+                                pass
+                        ctx.active_ladder_bids.clear()
+                        ctx.active_ladder_asks.clear()
+
+                        maker_id = await target_gw.close_position_maker(symbol, close_side, pos_qty, exit_px)
+                        if maker_id:
+                            ctx.tp_maker_order_id = maker_id
+                            ctx.tp_maker_submit_ts_s = now_s
+                            return None  # Esperar fill pasivo como Maker
+
+                    elapsed_tp_s = now_s - (ctx.tp_maker_submit_ts_s or now_s)
+                    if elapsed_tp_s < 4.0:
+                        return None
+                    else:
+                        try:
+                            await target_gw.cancel_order_ws(ctx.tp_maker_order_id, symbol)
+                        except Exception:
+                            pass
+                        ctx.tp_maker_order_id = None
+                        ctx.tp_maker_submit_ts_s = None
+
+                # En caso de STOP_LOSS, TIME_STOP o ventana Maker vencida:
+                if ctx.tp_maker_order_id is not None:
+                    try:
+                        await target_gw.cancel_order_ws(ctx.tp_maker_order_id, symbol)
+                    except Exception:
+                        pass
+                    ctx.tp_maker_order_id = None
+                    ctx.tp_maker_submit_ts_s = None
+
                 await target_gw.close_position_market(symbol, close_side, pos_qty)
                 if ctx.live_active_bid_id:
                     await target_gw.cancel_order_ws(ctx.live_active_bid_id, symbol)
@@ -2773,22 +2930,20 @@ class DryRunExecutionEngine:
                 if ctx.live_active_ask_id:
                     await target_gw.cancel_order_ws(ctx.live_active_ask_id, symbol)
                     ctx.live_active_ask_id = None
-        elif self.trading_mode == "LIVE_BINANCE" and self.live_gateway is not None:
-            await self.live_gateway.close_position_market(symbol, close_side, pos_qty)
-            if ctx.live_active_bid_id:
-                await self.live_gateway.cancel_order_ws(ctx.live_active_bid_id, symbol)
-                ctx.live_active_bid_id = None
-            if ctx.live_active_ask_id:
-                await self.live_gateway.cancel_order_ws(ctx.live_active_ask_id, symbol)
-                ctx.live_active_ask_id = None
-        elif self.trading_mode == "LIVE_BINGX" and self.bingx_gateway is not None:
-            await self.bingx_gateway.close_position_market(symbol, close_side, pos_qty)
-            if ctx.live_active_bid_id:
-                await self.bingx_gateway.cancel_order_ws(ctx.live_active_bid_id, symbol)
-                ctx.live_active_bid_id = None
-            if ctx.live_active_ask_id:
-                await self.bingx_gateway.cancel_order_ws(ctx.live_active_ask_id, symbol)
-                ctx.live_active_ask_id = None
+                for b_oid in list(ctx.active_ladder_bids.values()):
+                    try:
+                        await target_gw.cancel_order_ws(b_oid, symbol)
+                    except Exception:
+                        pass
+                for a_oid in list(ctx.active_ladder_asks.values()):
+                    try:
+                        await target_gw.cancel_order_ws(a_oid, symbol)
+                    except Exception:
+                        pass
+                ctx.active_ladder_bids.clear()
+                ctx.active_ladder_asks.clear()
+                ctx.active_ladder_bid_prices.clear()
+                ctx.active_ladder_ask_prices.clear()
         else:
             for o in list(ctx.l2_sim.orders.values()):
                 if o.status in ("OPEN", "PARTIALLY_FILLED", "CANCEL_PENDING"):
@@ -2803,6 +2958,8 @@ class DryRunExecutionEngine:
         ctx.last_fill_buy_price = None
         ctx.last_fill_sell_price = None
         ctx.last_exit_reason = exit_reason
+        ctx.tp_maker_order_id = None
+        ctx.tp_maker_submit_ts_s = None
 
         if exit_reason == "TAKE_PROFIT":
             self.tp_exits_count += 1
@@ -3575,6 +3732,16 @@ class DryRunExecutionEngine:
 
                         # Cotización Avellaneda-Stoikov + OBI Shield + Escalera 3 Niveles + VPIN Toxicity Guard + Break-Even Floor
                         sym_vpin = ctx.ring_buffer.compute_vpin() if hasattr(ctx.ring_buffer, "compute_vpin") else 0.0
+
+                        # Señal Lead-Lag para cotización en BingX (usando microprice y TFI adelantado de Binance):
+                        venue_bid = None
+                        venue_ask = None
+                        lead_lag_tfi = None
+                        if ctx.spec.exchange == "bingx" and hasattr(self.multiplexer, "venue_top_of_book") and sym in self.multiplexer.venue_top_of_book:
+                            venue_bid, venue_ask = self.multiplexer.venue_top_of_book[sym]
+                            if hasattr(ctx.ring_buffer, "compute_trade_flow_imbalance"):
+                                lead_lag_tfi = ctx.ring_buffer.compute_trade_flow_imbalance()
+
                         quote_res = await ctx.avellaneda.on_l2_update(
                             ctx.ring_buffer,
                             self.portfolio,
@@ -3584,6 +3751,9 @@ class DryRunExecutionEngine:
                             vpin=sym_vpin,
                             entry_price=ctx.avg_entry_price,
                             break_even_price=getattr(ctx, "break_even_price", None),
+                            venue_best_bid=venue_bid,
+                            venue_best_ask=venue_ask,
+                            lead_lag_tfi=lead_lag_tfi,
                         )
 
                         # Escudo de Contagio Sistémico sobre Altcoins (sym != BTC)
@@ -3662,34 +3832,103 @@ class DryRunExecutionEngine:
                                     or (self.trading_mode == "LIVE_MULTI")
                                 )
                                 if is_exchange_compatible and (sym in self.top_active_symbols or sym == self.primary_symbol):
-                                    # Poda determinista de órdenes huérfanas en el exchange (máximo 6 órdenes por símbolo: 3 bids, 3 asks)
+                                    requote_threshold_bps = 4.0
+
+                                    # Despacho concurrente de cotizaciones en escalera Bids (L1, L2, L3) con Banda de Histéresis FIFO
+                                    bids_to_dispatch = (quote_res.bid_ladder or ([quote_res.bid_order] if quote_res.bid_order else []))[:3]
+                                    if quote_res.bid_cancelled:
+                                        for b_sub, b_oid in list(ctx.active_ladder_bids.items()):
+                                            try:
+                                                await active_live_gw.cancel_order_ws(b_oid, sym)
+                                            except Exception:
+                                                pass
+                                        ctx.active_ladder_bids.clear()
+                                        ctx.active_ladder_bid_prices.clear()
+                                    else:
+                                        for idx, b_order in enumerate(bids_to_dispatch):
+                                            sub_lot = (
+                                                b_order.client_order_id.split("_")[1]
+                                                if "_" in (b_order.client_order_id or "")
+                                                else f"L{idx+1}"
+                                            )
+                                            existing_id = ctx.active_ladder_bids.get(sub_lot)
+                                            existing_px = ctx.active_ladder_bid_prices.get(sub_lot)
+
+                                            if existing_id and existing_px:
+                                                drift_bps = abs(b_order.price - existing_px) / max(existing_px, 1e-8) * 10_000.0
+                                                if drift_bps <= requote_threshold_bps:
+                                                    # Mantener viva la orden existente en la cabeza de la cola FIFO
+                                                    continue
+                                                else:
+                                                    try:
+                                                        await active_live_gw.cancel_order_ws(existing_id, sym)
+                                                    except Exception:
+                                                        pass
+                                                    ctx.active_ladder_bids.pop(sub_lot, None)
+                                                    ctx.active_ladder_bid_prices.pop(sub_lot, None)
+
+                                            try:
+                                                b_id = await active_live_gw.place_order_ws(b_order)
+                                                ctx.active_ladder_bids[sub_lot] = b_id
+                                                ctx.active_ladder_bid_prices[sub_lot] = b_order.price
+                                                ctx.avellaneda.active_bid_order_id = b_id
+                                                ctx.live_active_bid_id = b_id
+                                                if sym == self.primary_symbol:
+                                                    active_live_gw.live_active_bid_id = b_id
+                                            except Exception as e:
+                                                logger.warning(f"Error despachando bid escalera ({sub_lot}) en {sym} ({ctx.spec.exchange}): {e}")
+
+                                    # Despacho concurrente de cotizaciones en escalera Asks (L1, L2, L3) con Banda de Histéresis FIFO
+                                    asks_to_dispatch = (quote_res.ask_ladder or ([quote_res.ask_order] if quote_res.ask_order else []))[:3]
+                                    if quote_res.ask_cancelled:
+                                        for a_sub, a_oid in list(ctx.active_ladder_asks.items()):
+                                            try:
+                                                await active_live_gw.cancel_order_ws(a_oid, sym)
+                                            except Exception:
+                                                pass
+                                        ctx.active_ladder_asks.clear()
+                                        ctx.active_ladder_ask_prices.clear()
+                                    else:
+                                        for idx, a_order in enumerate(asks_to_dispatch):
+                                            sub_lot = (
+                                                a_order.client_order_id.split("_")[1]
+                                                if "_" in (a_order.client_order_id or "")
+                                                else f"L{idx+1}"
+                                            )
+                                            existing_id = ctx.active_ladder_asks.get(sub_lot)
+                                            existing_px = ctx.active_ladder_ask_prices.get(sub_lot)
+
+                                            if existing_id and existing_px:
+                                                drift_bps = abs(a_order.price - existing_px) / max(existing_px, 1e-8) * 10_000.0
+                                                if drift_bps <= requote_threshold_bps:
+                                                    continue
+                                                else:
+                                                    try:
+                                                        await active_live_gw.cancel_order_ws(existing_id, sym)
+                                                    except Exception:
+                                                        pass
+                                                    ctx.active_ladder_asks.pop(sub_lot, None)
+                                                    ctx.active_ladder_ask_prices.pop(sub_lot, None)
+
+                                            try:
+                                                a_id = await active_live_gw.place_order_ws(a_order)
+                                                ctx.active_ladder_asks[sub_lot] = a_id
+                                                ctx.active_ladder_ask_prices[sub_lot] = a_order.price
+                                                ctx.avellaneda.active_ask_order_id = a_id
+                                                ctx.live_active_ask_id = a_id
+                                                if sym == self.primary_symbol:
+                                                    active_live_gw.live_active_ask_id = a_id
+                                            except Exception as e:
+                                                logger.warning(f"Error despachando ask escalera ({sub_lot}) en {sym} ({ctx.spec.exchange}): {e}")
+
+                                    # Poda determinista de órdenes huérfanas pasando los IDs válidos preservados
+                                    valid_live_ids = set(ctx.active_ladder_bids.values()) | set(ctx.active_ladder_asks.values())
+                                    if ctx.tp_maker_order_id:
+                                        valid_live_ids.add(ctx.tp_maker_order_id)
                                     try:
-                                        await active_live_gw.prune_stale_orders(sym, max_orders_per_side=3)
+                                        await active_live_gw.prune_stale_orders(sym, valid_order_ids=valid_live_ids, max_orders_per_side=3)
                                     except Exception as ep:
                                         logger.debug(f"prune_stale_orders en {sym}: {ep}")
-
-                                    # Despacho concurrente de cotizaciones en escalera (L1, L2, L3)
-                                    bids_to_dispatch = (quote_res.bid_ladder or ([quote_res.bid_order] if quote_res.bid_order else []))[:3]
-                                    for b_order in bids_to_dispatch:
-                                        try:
-                                            b_id = await active_live_gw.place_order_ws(b_order)
-                                            ctx.avellaneda.active_bid_order_id = b_id
-                                            ctx.live_active_bid_id = b_id
-                                            if sym == self.primary_symbol:
-                                                active_live_gw.live_active_bid_id = b_id
-                                        except Exception as e:
-                                            logger.warning(f"Error despachando bid escalera en {sym} ({ctx.spec.exchange}): {e}")
-
-                                    asks_to_dispatch = (quote_res.ask_ladder or ([quote_res.ask_order] if quote_res.ask_order else []))[:3]
-                                    for a_order in asks_to_dispatch:
-                                        try:
-                                            a_id = await active_live_gw.place_order_ws(a_order)
-                                            ctx.avellaneda.active_ask_order_id = a_id
-                                            ctx.live_active_ask_id = a_id
-                                            if sym == self.primary_symbol:
-                                                active_live_gw.live_active_ask_id = a_id
-                                        except Exception as e:
-                                            logger.warning(f"Error despachando ask escalera en {sym} ({ctx.spec.exchange}): {e}")
                         else:
                             # Modo PAPER_L2: Reemplazo de órdenes obsoletas (stale orders) si se desvían > 3 ticks
                             max_drift = max(3.0 * ctx.spec.tick_size, 0.5 * quote_res.optimal_spread)
@@ -4707,6 +4946,47 @@ async def inject_stress_event_endpoint(req: StressEventRequest) -> dict[str, Any
         "mock_tradfi_closed": GLOBAL_MOCK_TRADFI_CLOSED,
         "latency_spike_active": GLOBAL_CHAOS_LATENCY_ACTIVE,
         "timestamp_ns": time.time_ns(),
+    }
+
+
+class GeminiKeyRequest(BaseModel):
+    api_key: str
+
+
+@app.post("/api/gemini-key")
+async def set_gemini_key_endpoint(req: GeminiKeyRequest) -> dict[str, Any]:
+    """Permite configurar o actualizar en caliente la API Key de Gemini para el Warm Path Council."""
+    new_key = req.api_key.strip()
+    if not new_key:
+        raise HTTPException(status_code=400, detail="API key no puede estar vacía.")
+
+    os.environ["GEMINI_API_KEY"] = new_key
+    updated = False
+
+    if engine.warm_path_council is not None:
+        engine.warm_path_council.update_api_key(new_key)
+        updated = True
+    elif GeminiRegimeCouncil is not None and WarmPathCouncilScheduler is not None:
+        try:
+            engine.warm_path_council = GeminiRegimeCouncil(
+                api_key=new_key,
+                config_output_path=CONFIG_PATH,
+            )
+            engine.warm_path_scheduler = WarmPathCouncilScheduler(
+                council=engine.warm_path_council,
+                summary_provider_fn=engine.get_15m_microstructure_summary,
+                interval_seconds=900.0,
+            )
+            if engine.running:
+                engine.warm_path_scheduler.start()
+            updated = True
+        except Exception as e:
+            logger.warning(f"Error instanciando WarmPathCouncil: {e}")
+
+    return {
+        "status": "SUCCESS",
+        "message": "Gemini API key configurada correctamente.",
+        "council_active": updated,
     }
 
 

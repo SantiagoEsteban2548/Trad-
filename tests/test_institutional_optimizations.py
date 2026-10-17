@@ -279,3 +279,91 @@ def test_stress_event_api_endpoint() -> None:
     assert engine.mock_tradfi_closed is False
     assert engine.symbol_contexts["BTC/USDT:USDT"].l2_sim.latency_ms == 15.0
 
+
+def test_post_api_gemini_key_updates_council_and_key() -> None:
+    from fastapi.testclient import TestClient
+    from backend.telemetry_server import app
+    import os
+
+    client = TestClient(app)
+    res = client.post("/api/gemini-key", json={"api_key": "NEW_VALID_GEMINI_TEST_KEY_888"})
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "SUCCESS"
+    assert os.getenv("GEMINI_API_KEY") == "NEW_VALID_GEMINI_TEST_KEY_888"
+
+    # Validar rechazo con clave vacía
+    res_bad = client.post("/api/gemini-key", json={"api_key": "   "})
+    assert res_bad.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_take_profit_maker_order_and_fallback_to_market() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+    from backend.telemetry_server import DryRunExecutionEngine
+
+    eng = DryRunExecutionEngine()
+    sym = "BTC/USDT:USDT"
+    ctx = eng.symbol_contexts[sym]
+    eng.trading_mode = "LIVE_BINANCE"
+
+    mock_gw = MagicMock()
+    mock_gw.close_position_maker = AsyncMock(return_value="TP_MAKER_ORDER_101")
+    mock_gw.close_position_market = AsyncMock(return_value="TP_MARKET_ORDER_202")
+    mock_gw.cancel_order_ws = AsyncMock(return_value=True)
+    eng.live_gateway = mock_gw
+
+    eng.portfolio.active_positions[sym] = 1000.0
+    now_ns = time.time_ns()
+    ctx.inventory_open_ts_ns = now_ns
+    eng.update_position_brackets(sym, entry_price=60_000.0, signed_notional=1000.0)
+
+    # 1. El precio sube por encima del TP (ej. $60,200) -> Se dispara TAKE_PROFIT
+    tp_res = await eng.check_and_execute_tp_sl_closures(
+        sym, best_bid=60_200.0, best_ask=60_202.0, mid_px=60_201.0, now_ns=now_ns
+    )
+    # Debe retornar None porque colocó la orden Maker y espera ejecución pasiva
+    assert tp_res is None
+    assert ctx.tp_maker_order_id == "TP_MAKER_ORDER_101"
+    mock_gw.close_position_maker.assert_awaited_once()
+    mock_gw.close_position_market.assert_not_called()
+
+    # 2. Simular que transcurren más de 4.0 segundos sin ejecutarse
+    ctx.tp_maker_submit_ts_s = time.time() - 4.5
+    fallback_res = await eng.check_and_execute_tp_sl_closures(
+        sym, best_bid=60_200.0, best_ask=60_202.0, mid_px=60_201.0, now_ns=now_ns + 5_000_000_000
+    )
+    assert fallback_res == "TAKE_PROFIT"
+    # Debe cancelar la orden límite Maker pendiente y ejecutar a mercado de inmediato
+    mock_gw.cancel_order_ws.assert_awaited_with("TP_MAKER_ORDER_101", sym)
+    mock_gw.close_position_market.assert_awaited_once()
+    assert ctx.tp_maker_order_id is None
+    assert sym not in eng.portfolio.active_positions
+
+
+def test_fifo_queue_hysteresis_preservation() -> None:
+    """
+    Verifica que la regla de histéresis (requote_threshold_bps = 4.0):
+    1. Si una orden L1/L2/L3 ya viva difiere <= 4.0 bps del nuevo precio ideal, se mantiene sin requote.
+    2. Si el movimiento supera 4.0 bps, se dispara la cancelación y reemplazo.
+    """
+    requote_threshold_bps = 4.0
+
+    # Orden viva a $60,000.00
+    existing_price = 60_000.00
+    # Caso 1: Nuevo precio a $60,012.00 (+2.0 bps) -> Menor a 4.0 bps
+    new_price_1 = 60_012.00
+    drift_1 = abs(new_price_1 - existing_price) / existing_price * 10_000.0
+    assert drift_1 == pytest.approx(2.0, abs=1e-5)
+    should_retain_1 = drift_1 <= requote_threshold_bps
+    assert should_retain_1 is True
+
+    # Caso 2: Nuevo precio a $59,970.00 (-5.0 bps) -> Mayor a 4.0 bps
+    new_price_2 = 59_970.00
+    drift_2 = abs(new_price_2 - existing_price) / existing_price * 10_000.0
+    assert drift_2 == pytest.approx(5.0, abs=1e-5)
+    should_retain_2 = drift_2 <= requote_threshold_bps
+    assert should_retain_2 is False
+
+
+

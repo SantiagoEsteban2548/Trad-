@@ -179,3 +179,30 @@ def test_atomic_file_write_never_corrupts_data(tmp_path: Path) -> None:
     saved_obj = json.loads(target_file.read_text(encoding="utf-8"))
     assert saved_obj["market_regime"] == "FUNDING_ARB_FAVORABLE"
     assert saved_obj["avellaneda_gamma"] == 0.20
+
+
+def test_deterministic_local_fallback_when_gemini_unavailable(
+    tmp_path: Path, sample_microstructure_summary: MicrostructureSummary15m
+) -> None:
+    target_file = tmp_path / "config" / "regime_config.json"
+    # Client initialized without key or failing
+    council = GeminiRegimeCouncil(api_key=None, config_output_path=target_file)
+
+    decision = council.run_debate_cycle(sample_microstructure_summary)
+    assert decision is not None
+    assert decision.market_regime in ("LOW_VOL_RANGE", "HIGH_VOL_LIQ_HUNT")
+    assert 0.05 <= decision.avellaneda_gamma <= 1.50
+    assert 0.0 <= decision.max_leverage_cap <= 3.5
+    assert "Local fallback" in decision.risk_rationale
+    assert target_file.exists()
+
+
+def test_update_api_key_dynamically(tmp_path: Path) -> None:
+    target_file = tmp_path / "config" / "regime_config.json"
+    council = GeminiRegimeCouncil(api_key=None, config_output_path=target_file)
+    assert council.api_key is None
+
+    council.update_api_key("NEW_TEST_VALID_KEY")
+    assert council.api_key == "NEW_TEST_VALID_KEY"
+    assert council.client is not None
+

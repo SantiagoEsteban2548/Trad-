@@ -8,7 +8,11 @@ from backend.ingestion.ring_buffer import MarketRingBuffer
 from backend.mandate_gates.gatekeeper import MandateGatekeeper
 from backend.mandate_gates.schemas import PortfolioState
 from backend.strategies.avellaneda_obi import AvellanedaStoikovOBIEngine
-from backend.strategies.funding_arb import FundingArbSnapshot, FundingRateArbitrageEngine
+from backend.strategies.funding_arb import (
+    CrossExchangeFundingSnapshot,
+    FundingArbSnapshot,
+    FundingRateArbitrageEngine,
+)
 from backend.strategies.liq_cascade import LiquidationCascadeHunter
 from backend.strategies.regime_config import RegimeConfig
 
@@ -213,3 +217,51 @@ def test_funding_arb_validates_both_legs_in_gatekeeper(
         portfolio_state=portfolio_state,
     )
     assert rejected_pkg is None
+
+
+def test_cross_exchange_funding_arb_yield_and_gatekeeper(
+    portfolio_state: PortfolioState, regime_config: RegimeConfig
+) -> None:
+    gatekeeper = MandateGatekeeper()
+    arb_engine = FundingRateArbitrageEngine(
+        tick_size=0.10,
+        step_size=0.001,
+        config=regime_config,
+        gatekeeper=gatekeeper,
+    )
+
+    # Binance pays +0.03% (longs pay shorts), BingX pays -0.01% (shorts pay longs)
+    # Net spread = 0.0003 - (-0.0001) = 0.0004 per 8h
+    # Annualized = 0.0004 * 3 * 365 = 0.438 (43.8% APY)
+    snapshot = CrossExchangeFundingSnapshot(
+        symbol="BTC/USDT:USDT",
+        binance_funding_rate=0.0003,
+        bingx_funding_rate=-0.0001,
+        binance_bid_price=50_000.0,
+        binance_ask_price=50_005.0,
+        bingx_bid_price=49_998.0,
+        bingx_ask_price=50_003.0,
+        funding_interval_hours=8,
+    )
+
+    pkg = arb_engine.evaluate_cross_opportunity(
+        snapshot=snapshot,
+        target_notional_usd=1_500.0,
+        portfolio_state=portfolio_state,
+    ) if hasattr(arb_engine, "evaluate_cross_opportunity") else arb_engine.evaluate_cross_exchange_opportunity(
+        snapshot=snapshot,
+        target_notional_usd=1_500.0,
+        portfolio_state=portfolio_state,
+    )
+
+    assert pkg is not None
+    assert pkg.annualized_yield_diff == pytest.approx(0.438, abs=1e-5)
+    assert pkg.short_exchange == "BINANCE"
+    assert pkg.long_exchange == "BINGX"
+    assert pkg.short_leg.side == "SELL"
+    assert pkg.long_leg.side == "BUY"
+    assert pkg.short_leg.symbol == "BTC/USDT:USDT:BINANCE"
+    assert pkg.long_leg.symbol == "BTC/USDT:USDT:BINGX"
+    assert pkg.short_leg.time_in_force == "GTX"
+    assert pkg.long_leg.time_in_force == "GTX"
+

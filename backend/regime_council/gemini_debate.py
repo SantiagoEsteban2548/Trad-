@@ -139,10 +139,24 @@ class GeminiRegimeCouncil:
         primary_model: str = PRIMARY_MODEL,
         fallback_model: str = FALLBACK_MODEL,
     ) -> None:
-        self.client: genai.Client = genai.Client(api_key=api_key)
+        self.api_key: str | None = api_key
+        try:
+            self.client: genai.Client | None = genai.Client(api_key=api_key) if api_key else None
+        except Exception as exc:
+            logger.warning(f"No se pudo inicializar genai.Client: {exc}")
+            self.client = None
         self.output_path: Path = Path(config_output_path)
         self.primary_model: str = primary_model
         self.fallback_model: str = fallback_model
+
+    def update_api_key(self, api_key: str) -> None:
+        self.api_key = api_key
+        try:
+            self.client = genai.Client(api_key=api_key)
+            logger.info("API Key de Gemini actualizada dinámicamente con éxito.")
+        except Exception as exc:
+            logger.warning(f"Fallo al actualizar genai.Client con nueva API key: {exc}")
+            self.client = None
 
     def _call_model_with_fallback(
         self,
@@ -150,6 +164,9 @@ class GeminiRegimeCouncil:
         system_instruction: str,
         response_schema: type[BaseModel] | None = None,
     ) -> tuple[str, Any]:
+        if self.client is None:
+            raise RuntimeError("genai.Client no está inicializado (API key no configurada o inválida).")
+
         cfg_kwargs: dict[str, Any] = {
             "temperature": self.TEMPERATURE,
             "system_instruction": system_instruction,
@@ -181,50 +198,101 @@ class GeminiRegimeCouncil:
 
         raise RuntimeError("No se pudo obtener respuesta de ningún modelo configurado.")
 
+    def _generate_local_fallback_decision(self, summary: MicrostructureSummary15m) -> RegimeDecision:
+        avg_vol = (
+            sum(s.realized_vol_5m for s in summary.symbols_data) / max(len(summary.symbols_data), 1)
+            if summary.symbols_data
+            else 0.35
+        )
+        max_vol = (
+            max(s.realized_vol_5m for s in summary.symbols_data)
+            if summary.symbols_data
+            else 0.35
+        )
+
+        if avg_vol > 0.70 or max_vol > 1.20:
+            regime: MarketRegimeType = "HIGH_VOL_LIQ_HUNT"
+            gamma = 0.45
+            kappa = 1.2
+            obi_cancel = 0.55
+            max_lev = 1.5
+            approved = [s.symbol for s in summary.symbols_data if s.realized_vol_5m < 1.0]
+            rationale = (
+                f"Local fallback: high realized volatility ({avg_vol:.2f}). "
+                "Increased risk aversion gamma=0.45, capped leverage to 1.5x."
+            )
+        else:
+            regime: MarketRegimeType = "LOW_VOL_RANGE"
+            gamma = 0.15
+            kappa = 2.0
+            obi_cancel = 0.65
+            max_lev = 3.0
+            approved = [s.symbol for s in summary.symbols_data]
+            rationale = (
+                f"Local fallback: normal volatility regime ({avg_vol:.2f}). "
+                "Standard market making parameters active."
+            )
+
+        return RegimeDecision(
+            market_regime=regime,
+            avellaneda_gamma=gamma,
+            order_book_intensity_kappa=kappa,
+            obi_cancel_threshold=obi_cancel,
+            approved_symbols=approved,
+            max_leverage_cap=max_lev,
+            risk_rationale=rationale,
+        )
+
     def run_debate_cycle(self, summary: MicrostructureSummary15m) -> RegimeDecision:
         summary_json_str = summary.model_dump_json(indent=2)
         logger.info("Iniciando ciclo de debate adversarial de 15 minutos...")
 
-        hunter_prompt = (
-            f"Analiza la siguiente microestructura de mercado de los últimos 15 minutos:\n"
-            f"{summary_json_str}\n\n"
-            f"Propón los pares viables y parámetros de Avellaneda-Stoikov (gamma, kappa, spread)."
-        )
-        model_used, hunter_resp = self._call_model_with_fallback(
-            contents=hunter_prompt,
-            system_instruction=SYSTEM_PROMPT_ALPHA_HUNTER,
-        )
-        hunter_text = hunter_resp.text or ""
-
-        prosecutor_prompt = (
-            f"DATOS DE MERCADO:\n{summary_json_str}\n\n"
-            f"PROPUESTA DEL ALPHA HUNTER:\n{hunter_text}\n\n"
-            f"Identifica riesgos fatales, flujo tóxico, liquidez fantasma y exige ajustes."
-        )
-        model_used, prosecutor_resp = self._call_model_with_fallback(
-            contents=prosecutor_prompt,
-            system_instruction=SYSTEM_PROMPT_RISK_PROSECUTOR,
-        )
-        prosecutor_text = prosecutor_resp.text or ""
-
-        arbiter_prompt = (
-            f"RESUMEN DE MERCADO (15m):\n{summary_json_str}\n\n"
-            f"PROPUESTA DEL ALPHA HUNTER:\n{hunter_text}\n\n"
-            f"REFUTACIÓN DEL RISK PROSECUTOR:\n{prosecutor_text}\n\n"
-            f"Emite el veredicto final preservando capital bajo duda estadística."
-        )
-        model_used, arbiter_resp = self._call_model_with_fallback(
-            contents=arbiter_prompt,
-            system_instruction=SYSTEM_PROMPT_CHIEF_ARBITER,
-            response_schema=RegimeDecision,
-        )
-
-        raw_text = arbiter_resp.text or "{}"
         try:
-            decision = RegimeDecision.model_validate_json(raw_text)
-        except Exception:
-            data = json.loads(raw_text)
-            decision = RegimeDecision.model_validate(data)
+            hunter_prompt = (
+                f"Analiza la siguiente microestructura de mercado de los últimos 15 minutos:\n"
+                f"{summary_json_str}\n\n"
+                f"Propón los pares viables y parámetros de Avellaneda-Stoikov (gamma, kappa, spread)."
+            )
+            model_used, hunter_resp = self._call_model_with_fallback(
+                contents=hunter_prompt,
+                system_instruction=SYSTEM_PROMPT_ALPHA_HUNTER,
+            )
+            hunter_text = hunter_resp.text or ""
+
+            prosecutor_prompt = (
+                f"DATOS DE MERCADO:\n{summary_json_str}\n\n"
+                f"PROPUESTA DEL ALPHA HUNTER:\n{hunter_text}\n\n"
+                f"Identifica riesgos fatales, flujo tóxico, liquidez fantasma y exige ajustes."
+            )
+            model_used, prosecutor_resp = self._call_model_with_fallback(
+                contents=prosecutor_prompt,
+                system_instruction=SYSTEM_PROMPT_RISK_PROSECUTOR,
+            )
+            prosecutor_text = prosecutor_resp.text or ""
+
+            arbiter_prompt = (
+                f"RESUMEN DE MERCADO (15m):\n{summary_json_str}\n\n"
+                f"PROPUESTA DEL ALPHA HUNTER:\n{hunter_text}\n\n"
+                f"REFUTACIÓN DEL RISK PROSECUTOR:\n{prosecutor_text}\n\n"
+                f"Emite el veredicto final preservando capital bajo duda estadística."
+            )
+            model_used, arbiter_resp = self._call_model_with_fallback(
+                contents=arbiter_prompt,
+                system_instruction=SYSTEM_PROMPT_CHIEF_ARBITER,
+                response_schema=RegimeDecision,
+            )
+
+            raw_text = arbiter_resp.text or "{}"
+            try:
+                decision = RegimeDecision.model_validate_json(raw_text)
+            except Exception:
+                data = json.loads(raw_text)
+                decision = RegimeDecision.model_validate(data)
+        except Exception as exc:
+            logger.warning(
+                f"Debate Gemini no disponible ({exc}). Activando fallo heurístico local cuantitativo..."
+            )
+            decision = self._generate_local_fallback_decision(summary)
 
         self.save_decision_atomically(decision)
         return decision
