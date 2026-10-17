@@ -26,3 +26,7 @@ Thumbs.db
 
 # Large data cache (downloaded Binance raw candles)
 data/cache/*.json
+*.db
+*.db-wal
+*.db-shm
+backend/data/*.db

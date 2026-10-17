@@ -410,3 +410,127 @@ class MarketRingBuffer:
             "z_score": z_score,
             "dominant_side": dominant_side,
         }
+
+    def compute_ofi(self, window_ticks: int = 20) -> float:
+        """
+        Calcula el Order Flow Imbalance (OFI) Diferencial de Cont-Kukanov-Stoikov (2014)
+        a partir de variaciones entre snapshots sucesivos de nivel 1 en el libro L2.
+        Detecta el retiro o adición oculta de liquidez antes de que impacten órdenes taker.
+        Retorna valor normalizado en [-1.0, 1.0].
+        """
+        if self.ob_count < 2:
+            return 0.0
+
+        n_ticks = min(window_ticks, self.ob_count - 1)
+        if n_ticks <= 0:
+            return 0.0
+
+        # Índices ordenados de los últimos n_ticks + 1 snapshots en orden cronológico
+        indices = [(self.ob_head - 1 - i) % self.capacity for i in range(n_ticks + 1)]
+        indices.reverse()  # Cronológico: [t-N, t-N+1, ..., t]
+
+        delta_ofi_sum = 0.0
+        depth_sum = 0.0
+
+        for i in range(1, len(indices)):
+            prev_idx = indices[i - 1]
+            curr_idx = indices[i]
+
+            p_b_prev = float(self.ob_bid_prices[prev_idx, 0])
+            q_b_prev = float(self.ob_bid_qtys[prev_idx, 0])
+            p_b_curr = float(self.ob_bid_prices[curr_idx, 0])
+            q_b_curr = float(self.ob_bid_qtys[curr_idx, 0])
+
+            p_a_prev = float(self.ob_ask_prices[prev_idx, 0])
+            q_a_prev = float(self.ob_ask_qtys[prev_idx, 0])
+            p_a_curr = float(self.ob_ask_prices[curr_idx, 0])
+            q_a_curr = float(self.ob_ask_qtys[curr_idx, 0])
+
+            # Cont-Kukanov-Stoikov (2014) Level-1 Order Flow Events:
+            # Bid side event (ΔI_b):
+            if p_b_curr > p_b_prev:
+                delta_i_b = q_b_curr
+            elif p_b_curr == p_b_prev:
+                delta_i_b = q_b_curr - q_b_prev
+            else:
+                delta_i_b = -q_b_prev
+
+            # Ask side event (ΔI_a):
+            if p_a_curr < p_a_prev:
+                delta_i_a = q_a_curr
+            elif p_a_curr == p_a_prev:
+                delta_i_a = q_a_curr - q_a_prev
+            else:
+                delta_i_a = -q_a_prev
+
+            delta_ofi = delta_i_b - delta_i_a
+            delta_ofi_sum += delta_ofi
+            depth_sum += 0.5 * (q_b_curr + q_a_curr)
+
+        if depth_sum <= 1e-9:
+            return 0.0
+
+        ofi_norm = delta_ofi_sum / depth_sum
+        return float(np.clip(ofi_norm, -1.0, 1.0))
+
+    def compute_dynamic_kappa(
+        self,
+        window_seconds: float = 300.0,
+        default_kappa: float = 1.50,
+        min_kappa: float = 0.20,
+        max_kappa: float = 5.0,
+    ) -> float:
+        """
+        Estima la intensidad de llegada de órdenes (kappa) en tiempo real para el activo.
+        Mide:
+        1. Frecuencia observada de cruces del spread (trade_rate = trades/sec)
+        2. Profundidad media del top-of-book (mean_depth)
+        3. Spread medio relativo en bps
+        Retorna kappa acotado entre [min_kappa, max_kappa].
+        """
+        if self.ob_count < 2 or self.trade_count < 2:
+            return float(default_kappa)
+
+        # 1. Ventana temporal de trades
+        latest_trade_idx = (self.trade_head - 1) % self.capacity
+        now_ns = int(self.trade_timestamps_ns[latest_trade_idx])
+        cutoff_ns = now_ns - int(window_seconds * 1_000_000_000)
+
+        if self.trade_count < self.capacity:
+            mask = self.trade_timestamps_ns[: self.trade_count] >= cutoff_ns
+            n_trades = int(np.sum(mask))
+        else:
+            mask = self.trade_timestamps_ns >= cutoff_ns
+            n_trades = int(np.sum(mask))
+
+        if n_trades < 2:
+            return float(default_kappa)
+
+        trade_rate = float(n_trades / max(window_seconds, 1.0))
+
+        # 2. Profundidad y spread medio en los últimos snapshots
+        k_snaps = min(100, self.ob_count)
+        indices = [(self.ob_head - 1 - i) % self.capacity for i in range(k_snaps)]
+
+        bids_p = self.ob_bid_prices[indices, 0]
+        asks_p = self.ob_ask_prices[indices, 0]
+        bids_q = self.ob_bid_qtys[indices, 0]
+        asks_q = self.ob_ask_qtys[indices, 0]
+
+        spreads = asks_p - bids_p
+        valid_spreads = spreads[spreads > 0]
+        mean_spread = float(np.mean(valid_spreads)) if len(valid_spreads) > 0 else 1.0
+
+        mean_depth = float(np.mean(0.5 * (bids_q + asks_q)))
+        if mean_depth <= 1e-6:
+            mean_depth = 1.0
+
+        mid_prices = 0.5 * (bids_p + asks_p)
+        mean_mid = float(np.mean(mid_prices)) if len(mid_prices) > 0 else 1.0
+        rel_spread_bps = float((mean_spread / max(mean_mid, 1e-4)) * 10_000.0)
+
+        # En Avellaneda-Stoikov: kappa = intensidad de llegada de órdenes a mayor distancia.
+        # Mayor actividad de trades y menor spread relativo => mayor kappa (spreads más ajustados).
+        # Menor actividad y spreads abiertos => menor kappa (spreads defensivos).
+        raw_kappa = (trade_rate / max(rel_spread_bps * 0.1, 0.5)) * (default_kappa / 3.0)
+        return float(np.clip(raw_kappa, min_kappa, max_kappa))

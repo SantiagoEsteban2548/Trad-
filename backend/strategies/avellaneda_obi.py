@@ -24,6 +24,7 @@ class AvellanedaQuoteResult:
     sigma: float
     bid_ladder: list[OrderRequest] | None = None
     ask_ladder: list[OrderRequest] | None = None
+    ofi: float = 0.0
 
 
 class AvellanedaStoikovOBIEngine:
@@ -96,6 +97,7 @@ class AvellanedaStoikovOBIEngine:
         sigma: float,
         inventory_holding_time_s: float = 0.0,
         vpin: float = 0.0,
+        dynamic_kappa: float | None = None,
     ) -> tuple[float, float]:
         gamma = self.config.gamma
         # Urgencia por antigüedad de inventario (holding_time_decay):
@@ -109,7 +111,8 @@ class AvellanedaStoikovOBIEngine:
         if vpin > 0.75:
             gamma = gamma * 1.40
 
-        kappa = self.config.kappa
+        # Calibración online de kappa_i (intensidad de llegada por activo)
+        kappa = float(dynamic_kappa) if (dynamic_kappa is not None and dynamic_kappa > 0) else self.config.kappa
         tau = self.config.time_horizon_tau
 
         sigma_price = max(sigma, self.MIN_SIGMA_FLOOR) * mid_price
@@ -139,6 +142,7 @@ class AvellanedaStoikovOBIEngine:
         venue_best_bid: float | None = None,
         venue_best_ask: float | None = None,
         lead_lag_tfi: float | None = None,
+        dynamic_kappa: float | None = None,
     ) -> AvellanedaQuoteResult:
         if ring_buffer.ob_count == 0 and (venue_best_bid is None or venue_best_ask is None):
             return AvellanedaQuoteResult(0.0, 0.0, None, None, False, False, 0.0, 0.0, [], [])
@@ -164,12 +168,18 @@ class AvellanedaStoikovOBIEngine:
 
         calc_vpin = vpin if vpin is not None else (ring_buffer.compute_vpin() if hasattr(ring_buffer, "compute_vpin") and ring_buffer.ob_count > 0 else 0.0)
 
+        # Calibración dinámica online de kappa_i si no se pasó explícitamente
+        effective_kappa = dynamic_kappa
+        if effective_kappa is None and hasattr(ring_buffer, "compute_dynamic_kappa") and ring_buffer.ob_count >= 2 and ring_buffer.trade_count >= 2:
+            effective_kappa = ring_buffer.compute_dynamic_kappa(default_kappa=self.config.kappa)
+
         reservation_price, optimal_spread = self.compute_reservation_and_spread(
             mid_price=mid_price,
             normalized_inventory_q=normalized_inventory_q,
             sigma=sigma,
             inventory_holding_time_s=inventory_holding_time_s,
             vpin=calc_vpin,
+            dynamic_kappa=effective_kappa,
         )
 
         half_spread = 0.5 * optimal_spread
@@ -189,6 +199,24 @@ class AvellanedaStoikovOBIEngine:
                 # Flujo fuertemente vendedor en el líder: retirar BID para evitar ser atropellado
                 suppress_bid = True
 
+        # Order Flow Imbalance (OFI) Diferencial de Cont-Kukanov-Stoikov
+        ofi = ring_buffer.compute_ofi(window_ticks=20) if (hasattr(ring_buffer, "compute_ofi") and ring_buffer.ob_count >= 2) else 0.0
+        ofi_shift = 0.0
+        if ofi < -0.65:
+            # Fuerte retiro institucional en Bids o presión en Asks: cancelar orden activa y ampliar shift defensivo
+            if self.active_bid_order_id is not None:
+                await ws_gateway.cancel_order_ws(self.active_bid_order_id, self.symbol)
+                bid_cancelled = True
+                self.active_bid_order_id = None
+            ofi_shift = abs(ofi) * sigma * mid_price * self.config.obi_volatility_shift_mult
+        elif ofi > 0.65:
+            # Fuerte empuje comprador institucional: cancelar orden activa en Ask y suprimir ASK
+            if self.active_ask_order_id is not None:
+                await ws_gateway.cancel_order_ws(self.active_ask_order_id, self.symbol)
+                ask_cancelled = True
+                self.active_ask_order_id = None
+            suppress_ask = True
+
         # Estrechar el umbral del OBI Shield en un 25% si VPIN > 0.75 para proteger el libro
         effective_obi_threshold = self.config.obi_shield_threshold * (0.75 if calc_vpin > 0.75 else 1.0)
 
@@ -201,7 +229,9 @@ class AvellanedaStoikovOBIEngine:
                     bid_cancelled = True
                 self.active_bid_order_id = None
 
-            vol_shift = self.config.obi_volatility_shift_mult * sigma * mid_price
+            vol_shift = self.config.obi_volatility_shift_mult * sigma * mid_price + ofi_shift
+        elif ofi_shift > 0.0:
+            vol_shift = ofi_shift
 
         if obi > effective_obi_threshold:
             if self.active_ask_order_id is not None:
@@ -352,5 +382,6 @@ class AvellanedaStoikovOBIEngine:
             sigma=sigma,
             bid_ladder=bid_ladder,
             ask_ladder=ask_ladder,
+            ofi=ofi,
         )
 

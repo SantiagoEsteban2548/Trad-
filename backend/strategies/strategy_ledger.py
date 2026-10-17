@@ -207,6 +207,7 @@ class VirtualStrategyLedger:
             "entry_price": lot.entry_price,
             "realized_pnl_usd": pnl_realized,
             "is_closed": abs(lot.inventory_q) <= 1e-8,
+            "is_increasing": is_increasing,
         }
 
     def get_net_inventory(self, symbol: str) -> float:
