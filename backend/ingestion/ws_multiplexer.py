@@ -109,10 +109,34 @@ class WebSocketMultiplexer:
     # Bucles de Transmisión por Instrumento
     # -------------------------------------------------------------------------
 
+    def _safe_price(self, symbol: str, val: Any) -> float:
+        f_val = float(val or 0.0)
+        if f_val <= 0.0:
+            return 0.0
+        try:
+            return float(self.exchange.price_to_precision(symbol, f_val))
+        except Exception:
+            return f_val
+
+    def _safe_amount(self, symbol: str, val: Any) -> float:
+        f_val = float(val or 0.0)
+        if f_val <= 0.0:
+            return 0.0
+        try:
+            return float(self.exchange.amount_to_precision(symbol, f_val))
+        except Exception:
+            return f_val
+
+    def _resolve_watch_symbol(self, symbol: str) -> str:
+        if symbol == "PEPE/USDT:USDT":
+            return "1000PEPE/USDT:USDT"
+        return symbol
+
     async def _order_book_stream(self, symbol: str) -> None:
         ring = self.buffers[symbol]
+        watch_symbol = self._resolve_watch_symbol(symbol)
         while self.running:
-            ob = await self.exchange.watch_order_book(symbol, limit=5)
+            ob = await self.exchange.watch_order_book(watch_symbol, limit=5)
             ts_ns = time.time_ns()
 
             raw_bids = ob.get("bids", [])
@@ -120,30 +144,37 @@ class WebSocketMultiplexer:
             if len(raw_bids) < 5 or len(raw_asks) < 5:
                 continue
 
-            bid_p = [float(self.exchange.price_to_precision(symbol, b[0])) for b in raw_bids[:5]]
-            bid_q = [float(self.exchange.amount_to_precision(symbol, b[1])) for b in raw_bids[:5]]
-            ask_p = [float(self.exchange.price_to_precision(symbol, a[0])) for a in raw_asks[:5]]
-            ask_q = [float(self.exchange.amount_to_precision(symbol, a[1])) for a in raw_asks[:5]]
+            bid_p = [self._safe_price(watch_symbol, b[0]) for b in raw_bids[:5]]
+            bid_q = [self._safe_amount(watch_symbol, b[1]) for b in raw_bids[:5]]
+            ask_p = [self._safe_price(watch_symbol, a[0]) for a in raw_asks[:5]]
+            ask_q = [self._safe_amount(watch_symbol, a[1]) for a in raw_asks[:5]]
+
+            if any(p <= 0.0 for p in bid_p) or any(p <= 0.0 for p in ask_p):
+                continue
 
             ring.push_order_book(bid_p, bid_q, ask_p, ask_q, ts_ns)
 
     async def _trades_stream(self, symbol: str) -> None:
         ring = self.buffers[symbol]
+        watch_symbol = self._resolve_watch_symbol(symbol)
         while self.running:
-            trades = await self.exchange.watch_trades(symbol)
+            trades = await self.exchange.watch_trades(watch_symbol)
             ts_ns = time.time_ns()
             for trade in trades:
-                p = float(self.exchange.price_to_precision(symbol, trade["price"]))
-                q = float(self.exchange.amount_to_precision(symbol, trade["amount"]))
+                p = self._safe_price(watch_symbol, trade.get("price"))
+                q = self._safe_amount(watch_symbol, trade.get("amount"))
+                if p <= 0.0 or q <= 0.0:
+                    continue
                 side_maker = trade.get("side") == "sell" or trade.get("info", {}).get("m", False)
                 ring.push_trade(p, q, side_maker, ts_ns)
 
     async def _liquidations_stream(self, symbol: str) -> None:
         ring = self.buffers[symbol]
+        watch_symbol = self._resolve_watch_symbol(symbol)
         while self.running:
             try:
                 if hasattr(self.exchange, "watch_liquidations"):
-                    liqs = await self.exchange.watch_liquidations(symbol)
+                    liqs = await self.exchange.watch_liquidations(watch_symbol)
                     ts_ns = time.time_ns()
                     for liq in liqs:
                         side = liq.get("side", "BUY")
@@ -180,7 +211,16 @@ class WebSocketMultiplexer:
                 backoff = self._backoff_base
             except asyncio.CancelledError:
                 break
+            except (ccxtpro.BadSymbol,) as err:
+                logger.info(f"Símbolo no soportado en {self.exchange_id} ({name}): {err}. Pausando stream en este exchange.")
+                await asyncio.sleep(300.0)
+                break
             except (ccxtpro.NetworkError, ccxtpro.ExchangeError) as err:
+                err_str = str(err)
+                if "does not have market symbol" in err_str:
+                    logger.info(f"Símbolo omitido en {self.exchange_id} ({name}): {err_str}")
+                    await asyncio.sleep(300.0)
+                    break
                 logger.warning(
                     f"Desconexión en {name}: {err}. Reconectando en {backoff:.2f}s..."
                 )

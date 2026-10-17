@@ -58,6 +58,16 @@ class L2QueueSimulator:
         self.orders: dict[str, SimulatedL2Order] = {}
         self._seq: int = 0
 
+    @property
+    def latency_ms(self) -> float:
+        return self.latency_ns / 1_000_000.0
+
+    @latency_ms.setter
+    def latency_ms(self, val: float) -> None:
+        if val < 0.0:
+            raise ValueError("La latencia no puede ser negativa.")
+        self.latency_ns = int(val * 1_000_000)
+
     def submit_gtx_order(
         self,
         order: OrderRequest,

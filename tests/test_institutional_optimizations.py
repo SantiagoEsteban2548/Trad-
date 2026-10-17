@@ -147,3 +147,135 @@ def test_dsr_quarantine_persistence_and_restore(tmp_path: Path) -> None:
     assert engine_restored._last_fill_buy_price == 64_800.0
     assert engine_restored._last_fill_sell_price == 64_820.0
     assert engine_restored.returns_history == [0.0012, 0.0015, -0.0004, 0.0021]
+
+
+def test_compute_vpin_calculation() -> None:
+    buf = MarketRingBuffer(capacity=100)
+    # 1. Sin trades suficientes retorna baseline neutral 0.25
+    assert buf.compute_vpin() == 0.25
+
+    # 2. Inyectar flujo altamente tóxico unidireccional (todos seller-initiated agresivos)
+    now_ns = time.time_ns()
+    for i in range(25):
+        # is_buyer_maker=False significa que el comprador fue maker y el vendedor fue taker agresivo
+        buf.push_trade(price=65000.0 - i, qty=2.0, is_buyer_maker=True, timestamp_ns=now_ns + (i * 10_000_000))
+
+    vpin = buf.compute_vpin(bucket_volume=5.0, num_buckets=5)
+    assert 0.0 <= vpin <= 1.0
+    # Con flujo puro en una sola dirección el desequilibrio de volumen por bucket es muy alto (>0.70)
+    assert vpin >= 0.70
+
+
+def test_post_trade_markout_curve_calculation() -> None:
+    engine = DryRunExecutionEngine()
+    sym = "BTC/USDT:USDT"
+    t0 = 1700000000.0
+
+    # 1. Registrar fill de compra a $60,000
+    trade = engine.record_trade_fill(
+        symbol=sym,
+        strategy="AVELLANEDA_OBI",
+        side="BUY",
+        entry_price=60000.0,
+        exit_or_mid_price=60000.0,
+        qty=0.01,
+        return_pct=0.0,
+        pnl_usd=0.0,
+        timestamp_ns=int(t0 * 1e9),
+    )
+    assert len(engine.pending_markouts) >= 1
+    pending_item = engine.pending_markouts[-1]
+    assert pending_item["symbol"] == sym
+    assert pending_item["mid_t0"] == 60000.0
+
+    # 2. Simular que a +1.5s el mid sube a $60,012 (+2.0 bps)
+    ctx = engine.symbol_contexts[sym]
+    idx = (ctx.ring_buffer.ob_head - 1) % ctx.ring_buffer.capacity
+    ctx.ring_buffer.ob_bid_prices[idx, 0] = 60010.0
+    ctx.ring_buffer.ob_ask_prices[idx, 0] = 60014.0  # mid = 60012.0
+
+    engine.update_post_trade_markouts(now_s=t0 + 1.5)
+    assert "1s" in pending_item["markouts"]
+    assert pending_item["markouts"]["1s"] == 2.0
+
+    # 3. Simular que a +5.5s el mid sube a $60,018 (+3.0 bps)
+    ctx.ring_buffer.ob_bid_prices[idx, 0] = 60016.0
+    ctx.ring_buffer.ob_ask_prices[idx, 0] = 60020.0  # mid = 60018.0
+    engine.update_post_trade_markouts(now_s=t0 + 5.5)
+    assert "5s" in pending_item["markouts"]
+    assert pending_item["markouts"]["5s"] == 3.0
+
+    # 4. Simular que a +16.0s el mid sube a $60,024 (+4.0 bps)
+    ctx.ring_buffer.ob_bid_prices[idx, 0] = 60022.0
+    ctx.ring_buffer.ob_ask_prices[idx, 0] = 60026.0  # mid = 60024.0
+    engine.update_post_trade_markouts(now_s=t0 + 16.0)
+    assert "15s" in pending_item["markouts"]
+    assert pending_item["markouts"]["15s"] == 4.0
+
+    # 5. Simular que a +31.0s el mid sube a $60,030 (+5.0 bps)
+    ctx.ring_buffer.ob_bid_prices[idx, 0] = 60028.0
+    ctx.ring_buffer.ob_ask_prices[idx, 0] = 60032.0  # mid = 60030.0
+    engine.update_post_trade_markouts(now_s=t0 + 31.0)
+    assert "30s" in pending_item["markouts"]
+    assert pending_item["markouts"]["30s"] == 5.0
+    assert engine.markout_curve_bps["30s"] == 5.0
+
+
+def test_btc_gold_correlation_and_safe_haven_allocation() -> None:
+    import backend.telemetry_server as ts
+    ts.GLOBAL_MOCK_TRADFI_STATE = True
+    try:
+        engine = DryRunExecutionEngine()
+
+        # Inyectar retornos descorrelacionados
+        engine.symbol_returns["BTC/USDT:USDT"] = [0.01, -0.015, 0.02, -0.01, 0.005, -0.02, 0.015]
+        engine.symbol_returns["XAU/USDT:USDT"] = [0.002, 0.001, -0.001, 0.003, -0.002, 0.004, -0.001]
+
+        corr = engine.compute_rolling_correlation("BTC/USDT:USDT", "XAU/USDT:USDT")
+        assert isinstance(corr, float)
+        assert -1.0 <= corr <= 1.0
+
+        # Activar alerta de caída sistémica en cripto
+        engine.contagion_shield.bid_shield_active = True
+        weights = engine.compute_multivariate_half_kelly()
+
+        # Si la correlación es baja (<= 0.15), XAU recibe el 20% prioritario de refugio
+        if engine.btc_gold_corr <= 0.15:
+            assert weights["XAU/USDT:USDT"] == 0.20
+            assert engine.contagion_shield.xau_safe_haven_active is True
+    finally:
+        ts.GLOBAL_MOCK_TRADFI_STATE = None
+
+
+def test_stress_event_api_endpoint() -> None:
+    from fastapi.testclient import TestClient
+    from backend.telemetry_server import app, engine
+
+    client = TestClient(app)
+
+    # 1. Inyectar Flash Crash -5%
+    res_crash = client.post("/api/stress-event", json={"event_type": "FLASH_CRASH_5PCT", "symbol": "BTC/USDT:USDT"})
+    assert res_crash.status_code == 200
+    data_crash = res_crash.json()
+    assert data_crash["status"] == "STRESS_EVENT_INJECTED"
+    assert engine.contagion_shield.bid_shield_active is True
+    assert engine.contagion_shield.trigger_reason == "FLASH_CRASH_5PCT_INJECTED"
+
+    # 2. Inyectar Spike de Latencia de 200ms
+    res_lat = client.post("/api/stress-event", json={"event_type": "LATENCY_SPIKE_200MS"})
+    assert res_lat.status_code == 200
+    assert engine.chaos_latency_active is True
+    assert engine.symbol_contexts["BTC/USDT:USDT"].l2_sim.latency_ms == 200.0
+
+    # 3. Inyectar Cierre TradFi Weekend Close
+    res_tradfi = client.post("/api/stress-event", json={"event_type": "TRADFI_WEEKEND_CLOSE"})
+    assert res_tradfi.status_code == 200
+    assert engine.mock_tradfi_closed is True
+
+    # 4. Resetear Caos
+    res_reset = client.post("/api/stress-event", json={"event_type": "RESET_CHAOS"})
+    assert res_reset.status_code == 200
+    assert engine.chaos_latency_active is False
+    assert engine.mock_tradfi_closed is False
+    assert engine.symbol_contexts["BTC/USDT:USDT"].l2_sim.latency_ms == 15.0
+

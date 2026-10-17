@@ -22,12 +22,40 @@ class MandateGatekeeper:
         "_emergency_callback",
         "kill_switch_engaged",
         "emergency_flatten_count",
+        "max_leverage_cap",
+        "max_single_pair_margin_ratio",
     )
 
-    def __init__(self, emergency_callback: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        emergency_callback: Callable[[], None] | None = None,
+        max_leverage_cap: float | None = None,
+        max_single_pair_margin_ratio: float | None = None,
+    ) -> None:
         self._emergency_callback = emergency_callback
         self.kill_switch_engaged: bool = False
         self.emergency_flatten_count: int = 0
+        self.max_leverage_cap: float = (
+            float(max_leverage_cap) if max_leverage_cap is not None else self.MAX_LEVERAGE_CAP
+        )
+        self.max_single_pair_margin_ratio: float = (
+            float(max_single_pair_margin_ratio)
+            if max_single_pair_margin_ratio is not None
+            else self.MAX_SINGLE_PAIR_MARGIN_RATIO
+        )
+
+    def set_leverage_tier(self, leverage: float) -> None:
+        """
+        Ajusta el techo de apalancamiento autorizado (ej. x3, x5, x7, x10)
+        y escala proporcionalmente el cupo nocional por par mantendo máx 20% del margen.
+        """
+        lev = max(1.0, min(float(leverage), 20.0))
+        self.max_leverage_cap = lev
+        # A 3x/4x base, el cupo nocional por par es 0.20 * base_cap (o escalado si lev > 4.0)
+        if lev <= 4.0:
+            self.max_single_pair_margin_ratio = self.MAX_SINGLE_PAIR_MARGIN_RATIO
+        else:
+            self.max_single_pair_margin_ratio = round(self.MAX_SINGLE_PAIR_MARGIN_RATIO * (lev / 3.0), 4)
 
     def trigger_emergency_flatten(self) -> None:
         """
@@ -84,37 +112,42 @@ class MandateGatekeeper:
                 )
 
         # ---------------------------------------------------------------------
-        # GATE 3: Techo Dinámico Half-Kelly (0.0x a 4.0x) y Límite 20% por Par
+        # GATE 3: Techo Dinámico Half-Kelly (0.0x a max_leverage_cap) y Límite por Par
         # ---------------------------------------------------------------------
         variance_safe = max(state.rolling_variance_sigma2, 1e-8)
         l_half_kelly = 0.5 * (state.rolling_edge_mu / variance_safe)
-        allowed_leverage = min(max(l_half_kelly, 0.0), self.MAX_LEVERAGE_CAP)
+        # Si el operador configuró un tier explícito > 4.0 (ej. 5x, 7x, 10x), escalar el techo efectivo
+        scale_mult = max(1.0, self.max_leverage_cap / self.MAX_LEVERAGE_CAP)
+        allowed_leverage = min(max(l_half_kelly * scale_mult, 0.0), self.max_leverage_cap)
 
         base_cap = state.base_capital_usd
         order_notional = order.price * order.qty
 
         # 3a. Concentración máxima por par individual (<= 20% del margen operativo)
         existing_pair_notional = state.active_positions.get(order.symbol, 0.0)
-        if (existing_pair_notional > 0 and order.side == "SELL") or (existing_pair_notional < 0 and order.side == "BUY"):
+        is_reducing = (existing_pair_notional > 0 and order.side == "SELL") or (
+            existing_pair_notional < 0 and order.side == "BUY"
+        )
+        if is_reducing:
             projected_pair_notional = max(0.0, abs(existing_pair_notional) - order_notional)
         else:
             projected_pair_notional = abs(existing_pair_notional) + order_notional
         pair_margin_ratio = projected_pair_notional / base_cap
 
-        if pair_margin_ratio > (self.MAX_SINGLE_PAIR_MARGIN_RATIO + self.FLOAT_EPSILON):
+        if pair_margin_ratio > (self.max_single_pair_margin_ratio + self.FLOAT_EPSILON):
             return (
                 False,
                 f"GATE_3_PAIR_CONCENTRATION: El par '{order.symbol}' alcanzaría "
-                f"{pair_margin_ratio * 100:.2f}% del margen operativo (máximo permitido: 20.00%).",
+                f"{pair_margin_ratio * 100:.2f}% del margen operativo (máximo permitido: {self.max_single_pair_margin_ratio * 100:.2f}%).",
             )
 
-        # 3b. Apalancamiento total del portafolio vs min(L_half_kelly, 4.0)
-        open_notional = 0.0
-        for pos_notional in state.active_positions.values():
-            open_notional += abs(pos_notional)
+        # 3b. Apalancamiento total del portafolio vs min(L_half_kelly, max_leverage_cap)
+        other_pairs_notional = sum(
+            abs(pos_notional) for sym, pos_notional in state.active_positions.items() if sym != order.symbol
+        )
 
-        projected_total_leverage = (open_notional + order_notional) / base_cap
-        if projected_total_leverage > (allowed_leverage + self.FLOAT_EPSILON):
+        projected_total_leverage = (other_pairs_notional + projected_pair_notional) / base_cap
+        if not is_reducing and projected_total_leverage > (allowed_leverage + self.FLOAT_EPSILON):
             return (
                 False,
                 f"GATE_3_HALF_KELLY_CAP: Apalancamiento proyectado ({projected_total_leverage:.4f}x) "

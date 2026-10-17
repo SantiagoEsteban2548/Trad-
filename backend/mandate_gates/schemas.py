@@ -47,11 +47,19 @@ class OrderRequest(BaseModel):
     margin_mode: str = Field(..., description="Modo de margen: ISOLATED o CROSS")
     strategy_id: str = Field(..., min_length=1, description="Identificador del motor de microestructura")
     timestamp_ns: int = Field(..., gt=0, description="Timestamp monotónico o epoch en nanosegundos")
+    client_order_id: str | None = Field(default=None, description="Identificador único del cliente para etiquetar estrategia y lote")
 
     @field_validator("symbol", "order_type", "time_in_force", "margin_mode", "strategy_id")
     @classmethod
     def normalize_upper(cls, v: str) -> str:
         return v.strip().upper()
+
+    @field_validator("client_order_id")
+    @classmethod
+    def normalize_cid(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        return v.strip()
 
     @property
     def notional_usd(self) -> float:
@@ -71,6 +79,7 @@ class OrderRequest(BaseModel):
         strategy_id: str,
         timestamp_ns: int,
         margin_mode: str = "ISOLATED",
+        client_order_id: str | None = None,
     ) -> OrderRequest:
         """
         Constructor auxiliar libre de errores de coma flotante que garantiza
@@ -86,6 +95,7 @@ class OrderRequest(BaseModel):
             margin_mode=margin_mode,
             strategy_id=strategy_id,
             timestamp_ns=timestamp_ns,
+            client_order_id=client_order_id,
         )
 
 

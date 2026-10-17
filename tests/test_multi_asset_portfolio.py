@@ -659,3 +659,144 @@ async def test_bingx_live_ws_gateway_post_only_and_margin() -> None:
     await gateway.emergency_flatten_all(["XAU/USDT:USDT"])
     mock_exchange.cancel_all_orders.assert_awaited_once_with("XAU/USDT:USDT")
 
+
+@pytest.mark.asyncio
+async def test_short_position_sign_in_sync_and_emergency_flatten() -> None:
+    """
+    Verifica que cuando CCXT devuelve una posición SHORT (contracts > 0 pero side == 'short'),
+    sync_portfolio_state registre active_positions con signo negativo (-notional) y
+    emergency_flatten_all envíe una orden BUY con reduceOnly=True (evitando el error -2022).
+    """
+    from backend.telemetry_server import BinanceLiveWsGateway
+
+    mock_exchange = MagicMock()
+    mock_exchange.cancel_all_orders = AsyncMock(return_value=[])
+    mock_exchange.create_order = AsyncMock(return_value={"id": "close_short_1", "status": "closed"})
+    mock_exchange.fetch_balance = AsyncMock(return_value={"total": {"USDT": 5000.0}})
+    mock_exchange.fetch_open_orders = AsyncMock(return_value=[])
+    mock_exchange.fetch_positions = AsyncMock(
+        return_value=[
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": 0.016,
+                "notional": 1305.31,
+                "side": "short",
+                "info": {"positionAmt": "-0.016"},
+            }
+        ]
+    )
+
+    gw = BinanceLiveWsGateway(exchange=mock_exchange)
+    portfolio = PortfolioState(
+        base_capital_usd=5000.0,
+        current_equity_usd=5000.0,
+        daily_high_watermark_usd=5000.0,
+        realized_pnl_today_usd=0.0,
+        active_positions={},
+        rolling_edge_mu=0.045,
+        rolling_variance_sigma2=0.0090,
+    )
+
+    await gw.sync_portfolio_state(portfolio)
+    assert portfolio.active_positions["BTC/USDT:USDT"] == -1305.31
+
+    await gw.emergency_flatten_all(["BTC/USDT:USDT"])
+    mock_exchange.create_order.assert_awaited_once_with(
+        symbol="BTC/USDT:USDT",
+        type="market",
+        side="buy",
+        amount=0.016,
+        params={"reduceOnly": True},
+    )
+
+
+@pytest.mark.asyncio
+async def test_position_brackets_and_tp_sl_closures() -> None:
+    """
+    Verifica que update_position_brackets calcule TP y SL exactos tanto para LONG como para SHORT,
+    y que check_and_execute_tp_sl_closures cierre determinísticamente la posición en TAKE_PROFIT
+    y en STOP_LOSS actualizando el equity y limpiando active_positions.
+    """
+    eng = DryRunExecutionEngine()
+    sym = "BTC/USDT:USDT"
+    ctx = eng.symbol_contexts[sym]
+    now_ns = time.time_ns()
+
+    # 1. Caso LONG: entrada a 65000.0 con +1000 USDT nocional
+    eng.portfolio.base_capital_usd = 5000.0
+    eng.portfolio.current_equity_usd = 5000.0
+    eng.portfolio.active_positions[sym] = 1000.0
+    ctx.inventory_open_ts_ns = now_ns
+    eng.update_position_brackets(sym, entry_price=65000.0, signed_notional=1000.0)
+
+    assert ctx.avg_entry_price == 65000.0
+    assert ctx.take_profit_price is not None and ctx.take_profit_price > 65000.0
+    assert ctx.stop_loss_price is not None and ctx.stop_loss_price < 65000.0
+
+    # Simular que el bid alcanza el Take Profit
+    tp_target = ctx.take_profit_price
+    reason_tp = await eng.check_and_execute_tp_sl_closures(
+        symbol=sym,
+        best_bid=tp_target + 1.0,
+        best_ask=tp_target + 2.0,
+        mid_px=tp_target + 1.5,
+        now_ns=now_ns + 1_000_000_000,
+    )
+    assert reason_tp == "TAKE_PROFIT"
+    assert sym not in eng.portfolio.active_positions
+    assert eng.tp_exits_count == 1
+    assert eng.portfolio.current_equity_usd > 5000.0
+
+    # 2. Caso SHORT: entrada a 65000.0 con -1000 USDT nocional
+    eq_before_sl = eng.portfolio.current_equity_usd
+    eng.portfolio.active_positions[sym] = -1000.0
+    ctx.inventory_open_ts_ns = now_ns
+    eng.update_position_brackets(sym, entry_price=65000.0, signed_notional=-1000.0)
+
+    assert ctx.take_profit_price is not None and ctx.take_profit_price < 65000.0
+    assert ctx.stop_loss_price is not None and ctx.stop_loss_price > 65000.0
+
+    # Simular que el precio sube y toca el Stop Loss del SHORT
+    sl_target = ctx.stop_loss_price
+    reason_sl = await eng.check_and_execute_tp_sl_closures(
+        symbol=sym,
+        best_bid=sl_target,
+        best_ask=sl_target + 1.0,
+        mid_px=sl_target + 0.5,
+        now_ns=now_ns + 2_000_000_000,
+    )
+    assert reason_sl == "STOP_LOSS"
+    assert sym not in eng.portfolio.active_positions
+    assert eng.sl_exits_count == 1
+    assert eng.portfolio.current_equity_usd < eq_before_sl
+
+
+@pytest.mark.asyncio
+async def test_multi_tier_leverage_evaluation_and_switching() -> None:
+    """
+    Verifica que evaluate_leverage_tiers evalúe x3, x5, x7 y x10 con sus métricas de riesgo/retorno,
+    y que set_leverage_tier actualice MandateGatekeeper y los brackets TP/SL.
+    """
+    eng = DryRunExecutionEngine()
+    eng.portfolio.base_capital_usd = 5000.0
+
+    analysis = eng.evaluate_leverage_tiers()
+    assert analysis["selected_leverage"] == 3
+    assert analysis["recommended_leverage"] in (3, 5, 7, 10)
+    tiers = {t["leverage"]: t for t in analysis["tiers"]}
+    assert set(tiers.keys()) == {3, 5, 7, 10}
+    assert tiers[3]["max_portfolio_notional_usd"] == 15000.0
+    assert tiers[5]["max_portfolio_notional_usd"] == 25000.0
+    assert tiers[7]["max_portfolio_notional_usd"] == 35000.0
+    assert tiers[10]["max_portfolio_notional_usd"] == 50000.0
+    # A mayor apalancamiento, el SL en bps es más ajustado para proteger el margen aislado
+    assert tiers[3]["sl_bps"] > tiers[5]["sl_bps"] > tiers[7]["sl_bps"] > tiers[10]["sl_bps"]
+
+    # Cambiar a x7
+    updated = await eng.set_leverage_tier(7)
+    assert updated["selected_leverage"] == 7
+    assert eng.gatekeeper.max_leverage_cap == 7.0
+    assert eng.symbol_contexts["BTC/USDT:USDT"].tp_bps == 14.0
+    assert eng.symbol_contexts["BTC/USDT:USDT"].sl_bps == 18.0
+
+

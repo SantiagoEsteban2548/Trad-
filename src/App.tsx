@@ -28,7 +28,10 @@ import {
   PieChart,
   ArrowDownUp,
   Cpu,
-  BarChart3
+  BarChart3,
+  Volume2,
+  VolumeX,
+  Sparkles
 } from 'lucide-react';
 
 // Exact Normal CDF Phi(x)
@@ -171,7 +174,7 @@ export interface OrderBookDepth {
 
 function getInitialCandles(): Candle[] {
   const list: Candle[] = [];
-  let p = 65000.0;
+  let p = 81300.0;
   for (let i = 0; i < 35; i++) {
     const delta = (Math.sin(i * 0.45) + Math.cos(i * 0.75)) * 16.0 + (i % 2 === 0 ? 9 : -8);
     const open = p;
@@ -288,8 +291,10 @@ function CandlestickChart({
 
   const lows = candles.map((c) => c.low).filter((v) => v > 0);
   const highs = candles.map((c) => c.high).filter((v) => v > 0);
-  const minP = Math.min(...lows, bestBid > 0 ? bestBid * 0.999 : 64000);
-  const maxP = Math.max(...highs, bestAsk > 0 ? bestAsk * 1.001 : 66000);
+  let minP = lows.length > 0 ? Math.min(...lows) : (bestBid > 0 ? bestBid * 0.998 : 100);
+  let maxP = highs.length > 0 ? Math.max(...highs) : (bestAsk > 0 ? bestAsk * 1.002 : 101);
+  if (bestBid > 0) minP = Math.min(minP, bestBid * 0.999);
+  if (bestAsk > 0) maxP = Math.max(maxP, bestAsk * 1.001);
   const rangeP = maxP - minP || 1.0;
 
   const maxV = Math.max(...candles.map((c) => c.volume), 1.0);
@@ -653,6 +658,150 @@ function exportTradesToCsv(trades: RecentTrade[]) {
   document.body.removeChild(link);
 }
 
+// Web Audio API Pure Synthesis (Zero external audio files, 100% in-browser)
+class SoundFX {
+  private ctx: AudioContext | null = null;
+  public isMuted: boolean = false;
+
+  private initCtx() {
+    if (!this.ctx && typeof window !== 'undefined') {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (AudioCtx) {
+        this.ctx = new AudioCtx();
+      }
+    }
+    if (this.ctx && this.ctx.state === 'suspended') {
+      this.ctx.resume().catch(() => {});
+    }
+  }
+
+  public playProfitChime() {
+    if (this.isMuted) return;
+    try {
+      this.initCtx();
+      if (!this.ctx) return;
+      const t0 = this.ctx.currentTime;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(587.33, t0); // D5
+      osc.frequency.exponentialRampToValueAtTime(880.0, t0 + 0.12); // A5 chime
+      gain.gain.setValueAtTime(0.08, t0);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.35);
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.35);
+    } catch {
+      // AudioContext policy: will play after first user interaction
+    }
+  }
+
+  public playAlertSound() {
+    if (this.isMuted) return;
+    try {
+      this.initCtx();
+      if (!this.ctx) return;
+      const t0 = this.ctx.currentTime;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(320.0, t0);
+      osc.frequency.linearRampToValueAtTime(240.0, t0 + 0.25);
+      gain.gain.setValueAtTime(0.12, t0);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + 0.30);
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.30);
+    } catch {
+      // AudioContext policy: will play after first user interaction
+    }
+  }
+}
+const soundFx = new SoundFX();
+
+function MarkoutCurveChart({
+  curve,
+}: {
+  curve: { '1s': number; '5s': number; '15s': number; '30s': number };
+}) {
+  const points = [
+    { label: '+1s', bps: curve?.['1s'] ?? 1.45 },
+    { label: '+5s', bps: curve?.['5s'] ?? 2.10 },
+    { label: '+15s', bps: curve?.['15s'] ?? 2.80 },
+    { label: '+30s', bps: curve?.['30s'] ?? 3.45 },
+  ];
+
+  const svgW = 280;
+  const svgH = 80;
+  const padX = 25;
+  const padY = 16;
+  const plotW = svgW - padX * 2;
+  const plotH = svgH - padY * 2;
+
+  const minBps = Math.min(0, ...points.map((p) => p.bps));
+  const maxBps = Math.max(4.0, ...points.map((p) => p.bps));
+  const range = maxBps - minBps || 1.0;
+
+  const coords = points.map((p, idx) => {
+    const x = padX + (idx / (points.length - 1)) * plotW;
+    const y = svgH - padY - ((p.bps - minBps) / range) * plotH;
+    return { ...p, x, y };
+  });
+
+  const pathD = `M ${coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' L ')}`;
+  const areaD = `M ${coords[0].x.toFixed(1)},${svgH - padY} L ${coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(' L ')} L ${coords[coords.length - 1].x.toFixed(1)},${svgH - padY} Z`;
+
+  const isUp = points[points.length - 1].bps >= points[0].bps;
+  const strokeColor = isUp ? '#00F59B' : '#A855F7';
+
+  return (
+    <div className="w-full space-y-2">
+      <svg viewBox={`0 0 ${svgW} ${svgH}`} className="w-full h-20 overflow-visible">
+        <defs>
+          <linearGradient id="markoutGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={strokeColor} stopOpacity="0.35" />
+            <stop offset="100%" stopColor={strokeColor} stopOpacity="0.0" />
+          </linearGradient>
+        </defs>
+        {/* Zero baseline */}
+        <line
+          x1={padX}
+          y1={svgH - padY - ((0 - minBps) / range) * plotH}
+          x2={svgW - padX}
+          y2={svgH - padY - ((0 - minBps) / range) * plotH}
+          stroke="#1C2230"
+          strokeDasharray="3 3"
+        />
+        <path d={areaD} fill="url(#markoutGrad)" />
+        <path d={pathD} fill="none" stroke={strokeColor} strokeWidth="2.0" strokeLinecap="round" strokeLinejoin="round" />
+        {coords.map((c, idx) => (
+          <g key={idx}>
+            <circle cx={c.x} cy={c.y} r="3" fill={strokeColor} stroke="#080A0F" strokeWidth="1.5" />
+            <text x={c.x} y={c.y - 7} fill={strokeColor} fontSize="8" fontFamily="monospace" textAnchor="middle" fontWeight="bold">
+              {c.bps > 0 ? `+${c.bps.toFixed(1)}` : c.bps.toFixed(1)}
+            </text>
+            <text x={c.x} y={svgH - 2} fill="#64748B" fontSize="8" fontFamily="monospace" textAnchor="middle">
+              {c.label}
+            </text>
+          </g>
+        ))}
+      </svg>
+      <div className="grid grid-cols-4 gap-1 text-[10px] font-mono">
+        {points.map((p) => (
+          <div key={p.label} className="bg-[#080A0F] border border-[#1C2230] rounded p-1 text-center">
+            <div className="text-slate-500">{p.label}</div>
+            <div className={`font-bold ${p.bps >= 0 ? 'text-[#00F59B]' : 'text-rose-400'}`}>
+              {p.bps > 0 ? `+${p.bps.toFixed(1)}` : p.bps.toFixed(1)} bps
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<
     'command' | 'phase1' | 'phase2' | 'phase3' | 'phase4' | 'phase5'
@@ -685,15 +834,15 @@ export default function App() {
   // Live Telemetry Payload State (Direct from backend/telemetry_server.py)
   const [isLiveRunning, setIsLiveRunning] = useState<boolean>(true);
   const [tickCount, setTickCount] = useState<number>(0);
-  const [midPrice, setMidPrice] = useState<number>(65000.5);
-  const [bestBid, setBestBid] = useState<number>(65000.0);
-  const [bestAsk, setBestAsk] = useState<number>(65001.0);
-  const [microprice, setMicroprice] = useState<number>(65000.2);
+  const [midPrice, setMidPrice] = useState<number>(81300.5);
+  const [bestBid, setBestBid] = useState<number>(81300.0);
+  const [bestAsk, setBestAsk] = useState<number>(81301.0);
+  const [microprice, setMicroprice] = useState<number>(81300.2);
   const [liveObi, setLiveObi] = useState<number>(0.0);
   const [liveTfi, setLiveTfi] = useState<number>(0.0);
   const [normInventoryQ, setNormInventoryQ] = useState<number>(0.0);
   const [realizedSigma, setRealizedSigma] = useState<number>(0.00012);
-  const [reservationPrice, setReservationPrice] = useState<number>(65000.5);
+  const [reservationPrice, setReservationPrice] = useState<number>(81300.5);
   const [optimalSpread, setOptimalSpread] = useState<number>(1.85);
   const [hotPathLatencyUs, setHotPathLatencyUs] = useState<number>(2.4);
   const [bidCancelledByShield, setBidCancelledByShield] = useState<boolean>(false);
@@ -718,13 +867,17 @@ export default function App() {
   const [modeSwitchSuccess, setModeSwitchSuccess] = useState<string | null>(null);
   const [isSwitchingMode, setIsSwitchingMode] = useState<boolean>(false);
 
-  // Mandate Gates State
+  // Mandate Gates & Multi-Tier Leverage State (x3, x5, x7, x10)
   const [gate1Mode, setGate1Mode] = useState<string>('LOCKED_ISOLATED');
   const [gate2Mode, setGate2Mode] = useState<string>('ENFORCED_POST_ONLY');
   const [gate3HalfKelly, setGate3HalfKelly] = useState<number>(2.5);
   const [gate3CurrentLev, setGate3CurrentLev] = useState<number>(0.0);
   const [gate4KillSwitch, setGate4KillSwitch] = useState<boolean>(false);
   const [emergencyFlattenCount, setEmergencyFlattenCount] = useState<number>(0);
+  const [activeLeverageTier, setActiveLeverageTier] = useState<number>(3);
+  const [optimalLeverageTier, setOptimalLeverageTier] = useState<number>(3);
+  const [activeTpBps, setActiveTpBps] = useState<number>(28.0);
+  const [activeSlBps, setActiveSlBps] = useState<number>(18.0);
 
   // L2 Queue Simulator State
   const [simOrderId, setSimOrderId] = useState<string>('NONE');
@@ -758,8 +911,18 @@ export default function App() {
     rotations_today: number;
     pnl_today_usd: number;
     half_kelly_weight: number;
+    selected_leverage?: number;
+    optimal_leverage?: number;
+    virtual_lots?: Array<{
+      strategy_id: string;
+      sub_lot_id: string;
+      inventory_q: number;
+      entry_price: number;
+      realized_pnl_usd: number;
+      is_open: boolean;
+    }>;
   }>>({
-    'BTC/USDT:USDT': { symbol: 'BTC/USDT:USDT', base_asset: 'BTC', mid_price: 65000.5, best_bid: 65000.0, best_ask: 65001.0, obi: 0.0, inventory_q: 0.0, position_usd: 0.0, rotations_today: 0, pnl_today_usd: 0.0, half_kelly_weight: 0.20 },
+    'BTC/USDT:USDT': { symbol: 'BTC/USDT:USDT', base_asset: 'BTC', mid_price: 81300.5, best_bid: 81300.0, best_ask: 81301.0, obi: 0.0, inventory_q: 0.0, position_usd: 0.0, rotations_today: 0, pnl_today_usd: 0.0, half_kelly_weight: 0.20 },
     'ETH/USDT:USDT': { symbol: 'ETH/USDT:USDT', base_asset: 'ETH', mid_price: 2500.5, best_bid: 2500.0, best_ask: 2501.0, obi: 0.0, inventory_q: 0.0, position_usd: 0.0, rotations_today: 0, pnl_today_usd: 0.0, half_kelly_weight: 0.20 },
     'SOL/USDT:USDT': { symbol: 'SOL/USDT:USDT', base_asset: 'SOL', mid_price: 150.2, best_bid: 150.1, best_ask: 150.3, obi: 0.0, inventory_q: 0.0, position_usd: 0.0, rotations_today: 0, pnl_today_usd: 0.0, half_kelly_weight: 0.20 },
     'BNB/USDT:USDT': { symbol: 'BNB/USDT:USDT', base_asset: 'BNB', mid_price: 550.4, best_bid: 550.3, best_ask: 550.5, obi: 0.0, inventory_q: 0.0, position_usd: 0.0, rotations_today: 0, pnl_today_usd: 0.0, half_kelly_weight: 0.20 },
@@ -810,10 +973,11 @@ export default function App() {
   const [activeTimeframe, setActiveTimeframe] = useState<'1m' | '5m' | '15m' | '1h'>('1m');
   const [activeBottomTab, setActiveBottomTab] = useState<'transactions' | 'orders' | 'scanner' | 'activity'>('transactions');
 
+
   // Real-Time L2 Microstructure Visual State
   const [orderBookDepth, setOrderBookDepth] = useState<OrderBookDepth>({
-    bids: [[65000.0, 1.5, 1.5], [64995.0, 2.2, 3.7], [64990.0, 3.8, 7.5], [64985.0, 5.0, 12.5], [64980.0, 7.2, 19.7]],
-    asks: [[65001.0, 1.4, 1.4], [65006.0, 2.5, 3.9], [65011.0, 3.6, 7.5], [65016.0, 4.8, 12.3], [65021.0, 6.9, 19.2]],
+    bids: [[81300.0, 1.5, 1.5], [81295.0, 2.2, 3.7], [81290.0, 3.8, 7.5], [81285.0, 5.0, 12.5], [81280.0, 7.2, 19.7]],
+    asks: [[81301.0, 1.4, 1.4], [81306.0, 2.5, 3.9], [81311.0, 3.6, 7.5], [81316.0, 4.8, 12.3], [81321.0, 6.9, 19.2]],
   });
   const [candlesHistory, setCandlesHistory] = useState<Candle[]>(getInitialCandles);
   const [equityComparison, setEquityComparison] = useState<EquityComparisonPoint[]>(getInitialEquity);
@@ -826,12 +990,129 @@ export default function App() {
     { symbol: 'DOGE/USDT:USDT', base_asset: 'DOGE', weight_pct: 10.0, notional_usd: 10.0, color: '#EC4899' },
   ]);
 
+  // Institutional Optimization State: VPIN, Markout Curve, Sound & Chaos Injection
+  const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [vpinScore, setVpinScore] = useState<number>(0.28);
+  const [markoutCurve, setMarkoutCurve] = useState<{ '1s': number; '5s': number; '15s': number; '30s': number }>({
+    '1s': 1.45,
+    '5s': 2.10,
+    '15s': 2.80,
+    '30s': 3.45,
+  });
+  const [btcGoldCorr, setBtcGoldCorr] = useState<number>(0.05);
+  const [chaosState, setChaosState] = useState<{ mock_tradfi_closed: boolean; latency_spike_active: boolean }>({
+    mock_tradfi_closed: false,
+    latency_spike_active: false,
+  });
+  const [chaosNotification, setChaosNotification] = useState<string | null>(null);
+  const [isInjectingChaos, setIsInjectingChaos] = useState<boolean>(false);
+  const prevWinsRef = React.useRef<number>(0);
+  const prevShieldRef = React.useRef<boolean>(false);
+  const prevKillSwitchRef = React.useRef<boolean>(false);
+
+  const toggleMute = () => {
+    setIsMuted((prev) => {
+      const next = !prev;
+      soundFx.isMuted = next;
+      return next;
+    });
+  };
+
+  const handleInjectStressEvent = async (eventType: string) => {
+    setIsInjectingChaos(true);
+    try {
+      const res = await fetch(`${apiBaseUrl}/api/stress-event`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event_type: eventType, symbol: 'BTC/USDT:USDT' }),
+      });
+      const data = await res.json();
+      setChaosNotification(data.message || `Evento ${eventType} inyectado.`);
+      if (data.mock_tradfi_closed !== undefined || data.latency_spike_active !== undefined) {
+        setChaosState({
+          mock_tradfi_closed: Boolean(data.mock_tradfi_closed),
+          latency_spike_active: Boolean(data.latency_spike_active),
+        });
+      }
+      setTimeout(() => setChaosNotification(null), 4500);
+    } catch (err: any) {
+      setChaosNotification(`Error al inyectar estrés: ${err.message}`);
+      setTimeout(() => setChaosNotification(null), 4500);
+    } finally {
+      setIsInjectingChaos(false);
+    }
+  };
+
   // Stress Tester Interactive State
   const [testMarginMode, setTestMarginMode] = useState<'ISOLATED' | 'CROSS'>('ISOLATED');
   const [testOrderType, setTestOrderType] = useState<'LIMIT' | 'MARKET'>('LIMIT');
   const [testTif, setTestTif] = useState<'GTX' | 'GTC' | 'IOC'>('GTX');
   const [testPairPct, setTestPairPct] = useState<number>(15);
   const [testDrawdownPct, setTestDrawdownPct] = useState<number>(-0.8);
+
+  // Real-time Active Pair & Timeframe Spec (Reactivity for BTC, ETH, SOL, BNB, DOGE, XAU, XAG)
+  const activePairSpec = useMemo(() => {
+    const key = Object.keys(symbolsData).find((k) => k.startsWith(activeCoin)) || 'BTC/USDT:USDT';
+    const sData = symbolsData[key];
+    const isBtc = activeCoin === 'BTC';
+    const pairMid = sData?.mid_price ?? (isBtc ? midPrice : 100);
+    const pairBid = sData?.best_bid ?? (isBtc ? bestBid : pairMid * 0.9998);
+    const pairAsk = sData?.best_ask ?? (isBtc ? bestAsk : pairMid * 1.0002);
+    const pairObi = sData?.obi !== undefined ? sData.obi : (isBtc ? liveObi : 0.0);
+    const pairSpread = sData ? Number((pairAsk - pairBid).toFixed(pairMid >= 1 ? 2 : 4)) : optimalSpread;
+    const pairRes = isBtc ? reservationPrice : Number((pairMid - (sData?.inventory_q ?? 0) * 0.25).toFixed(pairMid >= 1 ? 2 : 4));
+
+    // Scale candles for selected coin
+    const baseCandles = (candlesHistory && candlesHistory.length > 0) ? candlesHistory : getInitialCandles();
+    const btcRef = midPrice > 0 ? midPrice : 81300;
+    const scaleFactor = isBtc ? 1.0 : (pairMid / btcRef);
+
+    let displayCandles = baseCandles.map((c) => ({
+      ...c,
+      open: Number((c.open * scaleFactor).toFixed(pairMid >= 1 ? 2 : 4)),
+      high: Number((c.high * scaleFactor).toFixed(pairMid >= 1 ? 2 : 4)),
+      low: Number((c.low * scaleFactor).toFixed(pairMid >= 1 ? 2 : 4)),
+      close: Number((c.close * scaleFactor).toFixed(pairMid >= 1 ? 2 : 4)),
+      reservation_price: Number((c.reservation_price * scaleFactor).toFixed(pairMid >= 1 ? 2 : 4)),
+    }));
+
+    // Timeframe aggregation if not 1m
+    if (activeTimeframe === '5m' || activeTimeframe === '15m' || activeTimeframe === '1h') {
+      const step = activeTimeframe === '5m' ? 3 : (activeTimeframe === '15m' ? 5 : 8);
+      const agg: Candle[] = [];
+      for (let i = 0; i < displayCandles.length; i += step) {
+        const slice = displayCandles.slice(i, i + step);
+        if (slice.length === 0) continue;
+        const open = slice[0].open;
+        const close = slice[slice.length - 1].close;
+        const high = Math.max(...slice.map(s => s.high));
+        const low = Math.min(...slice.map(s => s.low));
+        const volume = Number(slice.reduce((acc, s) => acc + s.volume, 0).toFixed(2));
+        const reservation_price = slice[slice.length - 1].reservation_price;
+        agg.push({
+          open,
+          high,
+          low,
+          close,
+          volume,
+          is_bullish: close >= open,
+          reservation_price,
+        });
+      }
+      displayCandles = agg;
+    }
+
+    return {
+      symbolKey: key,
+      mid: pairMid,
+      bid: pairBid,
+      ask: pairAsk,
+      obi: pairObi,
+      spread: pairSpread,
+      reservationPrice: pairRes,
+      candles: displayCandles,
+    };
+  }, [activeCoin, activeTimeframe, symbolsData, midPrice, bestBid, bestAsk, liveObi, optimalSpread, reservationPrice, candlesHistory]);
 
   const applyTelemetrySnapshot = (data: any) => {
     setTickCount((prev) => prev + 1);
@@ -944,6 +1225,76 @@ export default function App() {
       setDsrScore(data.dsr_audit.deflated_sharpe_ratio);
       setDsrStatus(data.dsr_audit.status);
       setDsrOverfitted(data.dsr_audit.is_overfitted);
+    }
+
+    if (data.leverage_analysis) {
+      if (data.leverage_analysis.active_leverage_tier !== undefined) {
+        setActiveLeverageTier(data.leverage_analysis.active_leverage_tier);
+      }
+      if (data.leverage_analysis.optimal_leverage_tier !== undefined) {
+        setOptimalLeverageTier(data.leverage_analysis.optimal_leverage_tier);
+      }
+      const tiers = data.leverage_analysis.tiers;
+      const activeKey = `${data.leverage_analysis.active_leverage_tier || 3}x`;
+      if (tiers && tiers[activeKey]) {
+        setActiveTpBps(tiers[activeKey].tp_bps);
+        setActiveSlBps(tiers[activeKey].sl_bps);
+      }
+    }
+
+    // VPIN, Markout Curve, Chaos State & Lead-Lag Corr
+    if (data.vpin_score !== undefined) setVpinScore(data.vpin_score);
+    else if (data.market?.vpin !== undefined) setVpinScore(data.market.vpin);
+
+    if (data.markout_curve_bps) setMarkoutCurve(data.markout_curve_bps);
+    else if (data.market?.markout_curve) setMarkoutCurve(data.market.markout_curve);
+
+    if (data.btc_gold_corr !== undefined) setBtcGoldCorr(data.btc_gold_corr);
+    else if (data.market?.btc_gold_corr !== undefined) setBtcGoldCorr(data.market.btc_gold_corr);
+
+    if (data.chaos_state) setChaosState(data.chaos_state);
+
+    // Audio triggers: pulso en profit exit y alerta sonora en OBI Shield / Emergency Flatten
+    if (data.execution_stats?.wins_count !== undefined) {
+      if (data.execution_stats.wins_count > prevWinsRef.current && prevWinsRef.current > 0) {
+        soundFx.playProfitChime();
+      }
+      prevWinsRef.current = data.execution_stats.wins_count;
+    }
+
+    const isBidShield = Boolean(data.contagion_shield?.bid_shield_active);
+    if (isBidShield && !prevShieldRef.current) {
+      soundFx.playAlertSound();
+    }
+    prevShieldRef.current = isBidShield;
+
+    const isKillSwitch = Boolean(data.mandate_gates?.gate_4_kill_switch_engaged);
+    if (isKillSwitch && !prevKillSwitchRef.current) {
+      soundFx.playAlertSound();
+    }
+    prevKillSwitchRef.current = isKillSwitch;
+  };
+
+  const handleSwitchLeverage = async (targetTier: number) => {
+    setActiveLeverageTier(targetTier);
+    const defaultBrackets: Record<number, { tp: number; sl: number }> = {
+      3: { tp: 28.0, sl: 18.0 },
+      5: { tp: 22.0, sl: 14.0 },
+      7: { tp: 18.0, sl: 11.0 },
+      10: { tp: 14.0, sl: 8.5 },
+    };
+    if (defaultBrackets[targetTier]) {
+      setActiveTpBps(defaultBrackets[targetTier].tp);
+      setActiveSlBps(defaultBrackets[targetTier].sl);
+    }
+    try {
+      await fetch(`${apiBaseUrl}/api/leverage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ leverage: targetTier }),
+      });
+    } catch {
+      // Fallback local state if server is stopped
     }
   };
 
@@ -1260,6 +1611,17 @@ export default function App() {
         </div>
       )}
 
+      {/* Chaos Injection Notification Banner */}
+      {chaosNotification && (
+        <div className="bg-[#A855F7]/15 border-b border-[#A855F7]/30 px-6 py-2 text-xs font-mono text-[#A855F7] flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-[#A855F7] shrink-0 animate-pulse" />
+            <span>{chaosNotification}</span>
+          </div>
+          <button onClick={() => setChaosNotification(null)} className="text-[#A855F7] hover:text-white font-bold px-1">✕</button>
+        </div>
+      )}
+
       {/* Main Container: Left Rail + Work Area */}
       <div className="flex-1 flex overflow-hidden">
         {/* Barra Lateral Izquierda (Icon Navigation Rail) */}
@@ -1327,6 +1689,18 @@ export default function App() {
               title={wsConnected ? 'WebSocket Conectado (10 Hz)' : 'WebSocket Desconectado'}
               className={`w-2.5 h-2.5 rounded-full ${wsConnected ? 'bg-[#00F59B] shadow-lg shadow-[#00F59B]/50 animate-pulse' : 'bg-amber-500'}`}
             />
+            {/* Audio Mute Toggle Button */}
+            <button
+              onClick={toggleMute}
+              title={isMuted ? 'Sonido Silenciado (Click para activar)' : 'Efectos Sonoros Web Audio Activos (Click para silenciar)'}
+              className={`w-8 h-8 rounded-lg border flex items-center justify-center transition-all ${
+                isMuted
+                  ? 'bg-[#10141D] border-[#1C2230] text-slate-500 hover:text-slate-300'
+                  : 'bg-[#00F59B]/15 border-[#00F59B]/40 text-[#00F59B] shadow-sm shadow-[#00F59B]/20'
+              }`}
+            >
+              {isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+            </button>
             <div className="w-8 h-8 rounded-lg bg-[#10141D] border border-[#1C2230] flex items-center justify-center text-slate-500">
               <TerminalIcon className="w-3.5 h-3.5" />
             </div>
@@ -1525,9 +1899,9 @@ export default function App() {
                       </span>
                     </div>
                     <div className="flex items-center justify-between text-slate-300">
-                      <span className="text-[11px]">Gate 3: Half-Kelly &le; 3.0x</span>
+                      <span className="text-[11px]">Gate 3: Half-Kelly &le; {activeLeverageTier}.0x</span>
                       <span className="flex items-center gap-1 text-[#00F59B] font-bold text-[10px]">
-                        {gate3CurrentLev.toFixed(1)}x / 3.0x <CheckCircle2 className="w-3.5 h-3.5 text-[#00F59B]" />
+                        {gate3CurrentLev.toFixed(1)}x / {activeLeverageTier}.0x <CheckCircle2 className="w-3.5 h-3.5 text-[#00F59B]" />
                       </span>
                     </div>
                     <div className="flex items-center justify-between text-slate-300">
@@ -1535,6 +1909,33 @@ export default function App() {
                       <span className="flex items-center gap-1 text-[#00F59B] font-bold text-[10px]">
                         ARMED <CheckCircle2 className="w-3.5 h-3.5 text-[#00F59B]" />
                       </span>
+                    </div>
+                  </div>
+
+                  {/* Multi-Tier Leverage Selector (x3 | x5 | x7 | x10) & Deterministic TP/SL */}
+                  <div className="pt-2 border-t border-[#1C2230] space-y-1.5">
+                    <div className="flex items-center justify-between text-[10px] font-mono">
+                      <span className="text-slate-400 uppercase font-bold">Tier Apalancamiento</span>
+                      <span className="text-[#00F59B]">Óptimo: x{optimalLeverageTier}</span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-1 bg-[#080A0F] p-1 rounded-lg border border-[#1C2230] text-[10px] font-mono">
+                      {[3, 5, 7, 10].map((lvl) => (
+                        <button
+                          key={lvl}
+                          onClick={() => handleSwitchLeverage(lvl)}
+                          className={`py-1 rounded font-bold transition-all ${
+                            activeLeverageTier === lvl
+                              ? 'bg-[#00F59B]/20 text-[#00F59B] border border-[#00F59B]/40'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          x{lvl}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-0.5">
+                      <span>TP Auto: <strong className="text-[#00F59B]">+{activeTpBps.toFixed(1)} bps</strong></span>
+                      <span>SL Auto: <strong className="text-[#A855F7]">-{activeSlBps.toFixed(1)} bps</strong></span>
                     </div>
                   </div>
 
@@ -1547,6 +1948,72 @@ export default function App() {
                     {renderEquitySparkline(executionStats.equity_curve || [5000, 5000])}
                   </div>
                 </div>
+
+                {/* 4. Chaos Injection Sub-panel (Only in PAPER_L2 mode) */}
+                {tradingMode === 'PAPER_L2' && (
+                  <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3 space-y-2.5">
+                    <div className="flex items-center justify-between border-b border-[#1C2230] pb-1.5">
+                      <span className="text-[10px] font-mono uppercase text-[#A855F7] font-bold tracking-wider flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-[#A855F7]" />
+                        CHAOS STRESS-TESTING
+                      </span>
+                      <span className="text-[9px] font-mono text-slate-400">PAPER ONLY</span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-1.5 text-[10px] font-mono">
+                      <button
+                        onClick={() => handleInjectStressEvent('FLASH_CRASH_5PCT')}
+                        disabled={isInjectingChaos}
+                        className="py-1.5 px-2 rounded-lg bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 font-bold transition-all flex items-center justify-center gap-1 disabled:opacity-50"
+                        title="Inyecta caída instantánea del -5% en mid-price para disparar OBI Shield"
+                      >
+                        ⚡ -5% Crash
+                      </button>
+                      <button
+                        onClick={() => handleInjectStressEvent('LATENCY_SPIKE_200MS')}
+                        disabled={isInjectingChaos}
+                        className={`py-1.5 px-2 rounded-lg border font-bold transition-all flex items-center justify-center gap-1 disabled:opacity-50 ${
+                          chaosState.latency_spike_active
+                            ? 'bg-amber-500/30 border-amber-500/60 text-amber-300'
+                            : 'bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/30 text-amber-300'
+                        }`}
+                        title="Inyecta 200ms de latencia en simulador L2 Queue"
+                      >
+                        ⏱ +200ms Lag
+                      </button>
+                      <button
+                        onClick={() => handleInjectStressEvent('TRADFI_WEEKEND_CLOSE')}
+                        disabled={isInjectingChaos}
+                        className={`py-1.5 px-2 rounded-lg border font-bold transition-all flex items-center justify-center gap-1 disabled:opacity-50 ${
+                          chaosState.mock_tradfi_closed
+                            ? 'bg-[#A855F7]/30 border-[#A855F7]/60 text-[#A855F7]'
+                            : 'bg-[#A855F7]/15 hover:bg-[#A855F7]/25 border-[#A855F7]/30 text-purple-300'
+                        }`}
+                        title="Simula cierre de mercado de fin de semana en TradFi (XAU/XAG)"
+                      >
+                        🏛 TradFi Close
+                      </button>
+                      <button
+                        onClick={() => handleInjectStressEvent('RESET_CHAOS')}
+                        disabled={isInjectingChaos}
+                        className="py-1.5 px-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-bold transition-all flex items-center justify-center gap-1 disabled:opacity-50"
+                        title="Restaura condiciones normales de mercado"
+                      >
+                        ↺ Reset Chaos
+                      </button>
+                    </div>
+
+                    {(chaosState.mock_tradfi_closed || chaosState.latency_spike_active) && (
+                      <div className="text-[9px] font-mono text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded p-1.5 flex items-center justify-between">
+                        <span>ESTRÉS ACTIVO:</span>
+                        <span>
+                          {chaosState.mock_tradfi_closed ? '🏛 TradFi Cerrado ' : ''}
+                          {chaosState.latency_spike_active ? '⏱ +200ms Latencia' : ''}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Columna Central (flex-1) */}
@@ -1591,21 +2058,21 @@ export default function App() {
                       ))}
                     </div>
 
-                    {/* Métricas técnicas inline */}
+                    {/* Métricas técnicas inline reactivas al par seleccionado */}
                     <div className="flex items-center gap-3 text-xs font-mono">
-                      <span className="text-slate-400">Mid: <strong className="text-white">${midPrice.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 })}</strong></span>
-                      <span className="text-slate-400">Res: <strong className="text-[#00F59B]">${reservationPrice.toFixed(1)}</strong></span>
-                      <span className="text-slate-400">Spread: <strong className="text-[#A855F7]">${optimalSpread.toFixed(2)}</strong></span>
-                      <span className="text-slate-400">OBI: <strong className={liveObi >= 0 ? 'text-[#00F59B]' : 'text-[#A855F7]'}>{liveObi > 0 ? `+${liveObi.toFixed(3)}` : liveObi.toFixed(3)}</strong></span>
+                      <span className="text-slate-400">Mid: <strong className="text-white">${activePairSpec.mid >= 1 ? activePairSpec.mid.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 }) : activePairSpec.mid.toFixed(4)}</strong></span>
+                      <span className="text-slate-400">Res: <strong className="text-[#00F59B]">${activePairSpec.reservationPrice >= 1 ? activePairSpec.reservationPrice.toFixed(1) : activePairSpec.reservationPrice.toFixed(4)}</strong></span>
+                      <span className="text-slate-400">Spread: <strong className="text-[#A855F7]">${activePairSpec.spread.toFixed(activePairSpec.mid >= 1 ? 2 : 4)}</strong></span>
+                      <span className="text-slate-400">OBI: <strong className={activePairSpec.obi >= 0 ? 'text-[#00F59B]' : 'text-[#A855F7]'}>{activePairSpec.obi > 0 ? `+${activePairSpec.obi.toFixed(3)}` : activePairSpec.obi.toFixed(3)}</strong></span>
                     </div>
                   </div>
 
                   <div className="w-full">
                     <CandlestickChart
-                      candles={candlesHistory}
-                      reservationPrice={reservationPrice}
-                      bestBid={bestBid}
-                      bestAsk={bestAsk}
+                      candles={activePairSpec.candles}
+                      reservationPrice={activePairSpec.reservationPrice}
+                      bestBid={activePairSpec.bid}
+                      bestAsk={activePairSpec.ask}
                     />
                   </div>
                 </div>
@@ -1888,10 +2355,15 @@ export default function App() {
                                     ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
                                     : 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/30'
                                 }`}>
-                                  {isTradFi ? 'COMMODITY (BINGX)' : 'CRYPTO 24/7'}
+                                  {isTradFi ? 'COMMODITY' : 'CRYPTO'}
                                 </span>
                               </div>
-                              <span className="text-[10px] text-slate-400">{(s.half_kelly_weight * 100).toFixed(0)}% W</span>
+                              <div className="flex items-center gap-1">
+                                <span className="px-1.5 py-0.2 rounded text-[8px] font-mono font-bold bg-[#A855F7]/20 text-[#A855F7] border border-[#A855F7]/40">
+                                  x{s.selected_leverage || 3}
+                                </span>
+                                <span className="text-[10px] text-slate-400">{(s.half_kelly_weight * 100).toFixed(0)}% W</span>
+                              </div>
                             </div>
                             <div className="text-slate-200 font-bold">${s.mid_price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
                             <div className="flex items-center justify-between text-[10px]">
@@ -1902,6 +2374,16 @@ export default function App() {
                               <span className="text-slate-400">Posición:</span>
                               <span className="text-slate-300">${s.position_usd.toFixed(1)}</span>
                             </div>
+                            {s.virtual_lots && s.virtual_lots.some((l) => l.is_open) && (
+                              <div className="flex items-center gap-1 text-[8px] pt-1 border-t border-[#1C2230]/60">
+                                <span className="text-slate-500">Sub-lots:</span>
+                                {s.virtual_lots.filter((l) => l.is_open).map((l, i) => (
+                                  <span key={i} className="px-1 py-0.2 rounded bg-[#00F59B]/10 text-[#00F59B] border border-[#00F59B]/20 font-bold">
+                                    {l.sub_lot_id}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         );
                       })}
@@ -1982,6 +2464,79 @@ export default function App() {
                           )}
                         </div>
                       </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 1.5. Institutional Microstructure Audit: VPIN & Post-Trade Markout Curve */}
+                <div className="bg-[#10141D] border border-[#1C2230] rounded-xl p-3.5 space-y-3">
+                  <div className="flex items-center justify-between border-b border-[#1C2230] pb-2">
+                    <div className="flex items-center gap-2">
+                      <Activity className="w-4 h-4 text-[#00F59B]" />
+                      <span className="font-bold text-xs font-mono text-white tracking-wide uppercase">
+                        VPIN & POST-TRADE AUDIT
+                      </span>
+                    </div>
+                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold border ${
+                      vpinScore > 0.75
+                        ? 'bg-rose-500/15 text-rose-300 border-rose-500/30 animate-pulse'
+                        : vpinScore > 0.50
+                        ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                        : 'bg-[#00F59B]/15 text-[#00F59B] border-[#00F59B]/30'
+                    }`}>
+                      {vpinScore > 0.75 ? 'ALERTA TOXICIDAD' : vpinScore > 0.50 ? 'FLUJO MODERADO' : 'FLUJO INFORMADO BAJO'}
+                    </span>
+                  </div>
+
+                  {/* VPIN Volume Toxicity Gauge */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-[10px] font-mono">
+                      <span className="text-slate-400">VPIN (Toxicity):</span>
+                      <span className={`font-bold ${
+                        vpinScore > 0.75 ? 'text-rose-400' : vpinScore > 0.50 ? 'text-amber-400' : 'text-[#00F59B]'
+                      }`}>
+                        {(vpinScore * 100).toFixed(1)}% ({vpinScore.toFixed(3)})
+                      </span>
+                    </div>
+                    <div className="w-full h-1.5 bg-[#080A0F] rounded-full overflow-hidden">
+                      <div
+                        className={`h-full transition-all duration-300 ${
+                          vpinScore > 0.75 ? 'bg-rose-500' : vpinScore > 0.50 ? 'bg-amber-400' : 'bg-[#00F59B]'
+                        }`}
+                        style={{ width: `${Math.min(vpinScore * 100, 100)}%` }}
+                      />
+                    </div>
+                    {vpinScore > 0.75 && (
+                      <div className="text-[9px] font-mono text-rose-300 bg-rose-500/10 border border-rose-500/20 rounded p-1 flex items-center justify-between">
+                        <span>🛡 RIESGO DINÁMICO:</span>
+                        <span className="font-bold">γ +40% | OBI SHIELD -25%</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Post-Trade Markout Curve Chart (+1s, +5s, +15s, +30s) */}
+                  <div className="space-y-1.5 pt-1 border-t border-[#1C2230]">
+                    <div className="flex items-center justify-between text-[10px] font-mono">
+                      <span className="text-slate-400 uppercase tracking-tight">Curva Markout Post-Fill</span>
+                      <span className="text-[#00F59B] font-bold">Sin Selección Adversa</span>
+                    </div>
+                    <MarkoutCurveChart curve={markoutCurve} />
+                  </div>
+
+                  {/* Macro Lead-Lag Correlation Indicator (BTC vs XAU) */}
+                  <div className="pt-2 border-t border-[#1C2230] flex items-center justify-between text-[10px] font-mono">
+                    <span className="text-slate-400">Lead-Lag BTC-XAU:</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className={`font-bold ${btcGoldCorr <= 0.15 ? 'text-[#00F59B]' : 'text-amber-400'}`}>
+                        ρ = {btcGoldCorr >= 0 ? `+${btcGoldCorr.toFixed(2)}` : btcGoldCorr.toFixed(2)}
+                      </span>
+                      <span className={`px-1 py-0.2 rounded text-[8px] font-bold ${
+                        btcGoldCorr <= 0.15
+                          ? 'bg-[#00F59B]/15 text-[#00F59B] border border-[#00F59B]/30'
+                          : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                      }`}>
+                        {btcGoldCorr <= 0.15 ? 'REFUGIO ACTIVO' : 'CORRELACIONADO'}
+                      </span>
                     </div>
                   </div>
                 </div>

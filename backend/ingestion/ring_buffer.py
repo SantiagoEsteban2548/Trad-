@@ -265,6 +265,70 @@ class MarketRingBuffer:
 
         return float(np.std(log_returns))
 
+    def compute_vpin(self, bucket_volume: float = 10.0, num_buckets: int = 20) -> float:
+        """
+        Calcula VPIN (Volume-Synchronized Probability of Toxicity) de Easley, López de Prado & O'Hara:
+            VPIN = (sum_{k=1}^N |V_k^B - V_k^S|) / (N * V)
+        Divide el flujo de volumen en buckets de tamaño constante V (bucket_volume).
+        Para cada bucket, calcula el desbalance de volumen de compradores y vendedores.
+        Devuelve un float acotado en [0.0, 1.0].
+        """
+        if self.trade_count < 2:
+            return 0.25
+
+        if self.trade_count < self.capacity:
+            qtys = self.trade_qtys[: self.trade_count]
+            is_bm = self.trade_is_buyer_maker[: self.trade_count]
+        else:
+            qtys = np.concatenate([self.trade_qtys[self.trade_head :], self.trade_qtys[: self.trade_head]])
+            is_bm = np.concatenate([self.trade_is_buyer_maker[self.trade_head :], self.trade_is_buyer_maker[: self.trade_head]])
+
+        tot_vol = float(np.sum(qtys))
+        if tot_vol <= 1e-8:
+            return 0.25
+
+        v = float(bucket_volume)
+        if v <= 0.0:
+            v = max(0.001, tot_vol / max(num_buckets, 1))
+
+        bucket_imbalances: list[float] = []
+        cur_v_buy = 0.0
+        cur_v_sell = 0.0
+        cur_filled = 0.0
+
+        for i in range(len(qtys)):
+            q_rem = float(qtys[i])
+            is_buy = (is_bm[i] == 0)
+
+            while q_rem > 1e-8:
+                space = v - cur_filled
+                if q_rem < space:
+                    if is_buy:
+                        cur_v_buy += q_rem
+                    else:
+                        cur_v_sell += q_rem
+                    cur_filled += q_rem
+                    q_rem = 0.0
+                else:
+                    if is_buy:
+                        cur_v_buy += space
+                    else:
+                        cur_v_sell += space
+                    bucket_imbalances.append(abs(cur_v_buy - cur_v_sell))
+                    q_rem -= space
+                    cur_v_buy = 0.0
+                    cur_v_sell = 0.0
+                    cur_filled = 0.0
+
+        if len(bucket_imbalances) == 0:
+            if cur_filled > 0.0:
+                return float(np.clip(abs(cur_v_buy - cur_v_sell) / cur_filled, 0.0, 1.0))
+            return 0.25
+
+        recent_imb = bucket_imbalances[-num_buckets:]
+        vpin = float(sum(recent_imb) / (len(recent_imb) * v))
+        return float(np.clip(vpin, 0.0, 1.0))
+
     def detect_liquidation_cluster(self, percentile: float = 99.0) -> dict:
         """
         Detecta si el volumen liquidado en los últimos 10 segundos excede el umbral extremo

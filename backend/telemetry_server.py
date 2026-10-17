@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 import inspect
 import json
 import logging
+import math
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -43,7 +44,7 @@ load_dotenv()
 from backend.ingestion.ring_buffer import MarketRingBuffer
 from backend.ingestion.ws_multiplexer import WebSocketMultiplexer
 from backend.mandate_gates.gatekeeper import MandateGatekeeper
-from backend.mandate_gates.schemas import OrderRequest, PortfolioState
+from backend.mandate_gates.schemas import OrderRequest, PortfolioState, truncate_decimal_step
 from backend.mandate_gates.profit_sweeper import (
     DAILY_TARGET_RETURN_PCT,
     should_trigger_profit_sweep,
@@ -52,6 +53,8 @@ from backend.mandate_gates.profit_sweeper import (
 from backend.strategies.avellaneda_obi import AvellanedaStoikovOBIEngine
 from backend.strategies.funding_arb import FundingArbSnapshot, FundingRateArbitrageEngine
 from backend.strategies.liq_cascade import LiquidationCascadeHunter
+from backend.strategies.strategy_ledger import VirtualStrategyLedger, VirtualPositionLot
+from backend.strategies.leverage_controller import AutonomousLeverageController
 import os
 from backend.strategies.regime_config import RegimeConfig
 
@@ -101,11 +104,17 @@ class BinanceLiveWsGateway:
         self.gatekeeper = gatekeeper
         self.portfolio = portfolio
         self.on_fill = on_fill
+        self.default_leverage: int = 3
+        self.symbol_leverage: dict[str, int] = {}
+        self.ledger = VirtualStrategyLedger()
         self.initialized_symbols: set[str] = set()
         self.running: bool = False
         self._sync_task: asyncio.Task | None = None
         self.live_active_bid_id: str | None = None
         self.live_active_ask_id: str | None = None
+        self.active_bids_by_symbol: dict[str, str] = {}
+        self.active_asks_by_symbol: dict[str, str] = {}
+        self.active_orders_meta: dict[str, dict[str, Any]] = {}
 
         if exchange is not None:
             self.exchange = exchange
@@ -132,27 +141,73 @@ class BinanceLiveWsGateway:
                     except Exception:
                         pass
 
+    def resolve_binance_symbol(self, symbol: str) -> str:
+        """Traduce símbolos canónicos a nombres nativos de Binance USD(S)-M si difieren."""
+        if hasattr(self.exchange, "markets") and self.exchange.markets:
+            if symbol in self.exchange.markets:
+                return symbol
+            if symbol == "PEPE/USDT:USDT" and "1000PEPE/USDT:USDT" in self.exchange.markets:
+                return "1000PEPE/USDT:USDT"
+        if symbol == "PEPE/USDT:USDT":
+            return "1000PEPE/USDT:USDT"
+        return symbol
+
     async def initialize_symbol_margin(self, symbol: str, max_leverage: int = 3) -> None:
         """
-        Configura el modo de margen a ISOLATED y el apalancamiento máximo (por defecto 3x)
-        en Binance antes de permitir cualquier orden en vivo.
+        Configura el modo de posición a One-Way (hedged=False), margen a ISOLATED y el apalancamiento
+        óptimo en Binance antes de permitir cualquier orden en vivo.
         """
+        spec = SYMBOL_SPECS.get(symbol)
+        if spec and spec.exchange != "binance":
+            return
+        target_sym = self.resolve_binance_symbol(symbol)
+        self.default_leverage = int(max_leverage)
+        self.symbol_leverage[symbol] = int(max_leverage)
         try:
-            await self.exchange.set_margin_mode("ISOLATED", symbol)
+            if hasattr(self.exchange, "set_position_mode"):
+                await self.exchange.set_position_mode(hedged=False, symbol=target_sym)
+        except Exception as e:
+            logger.debug(f"set_position_mode hedged=False en {target_sym}: {e}")
+        try:
+            await self.exchange.set_margin_mode("ISOLATED", target_sym)
         except Exception as e:
             # En Binance retorna error si el modo ya estaba fijado previamente en ISOLATED
-            logger.info(f"set_margin_mode ISOLATED en {symbol}: {e}")
+            logger.info(f"set_margin_mode ISOLATED en {target_sym}: {e}")
         try:
-            await self.exchange.set_leverage(max_leverage, symbol)
+            await self.exchange.set_leverage(max_leverage, target_sym)
+            self.initialized_symbols.add(symbol)
         except Exception as e:
-            logger.warning(f"set_leverage {max_leverage} en {symbol}: {e}")
-        self.initialized_symbols.add(symbol)
+            logger.warning(f"set_leverage {max_leverage} en {target_sym}: {e}")
+            if "does not have market symbol" not in str(e):
+                self.initialized_symbols.add(symbol)
+
+    async def update_symbol_leverage_if_needed(self, symbol: str, optimal_leverage: int) -> bool:
+        """
+        Ajusta dinámicamente el apalancamiento en Binance cuando cambia en >= 1x.
+        Modo ISOLATED estricto, entero entre 1x y 10x.
+        """
+        opt_int = max(1, min(int(optimal_leverage), 10))
+        cur_lev = self.symbol_leverage.get(symbol, self.default_leverage)
+        if cur_lev == opt_int:
+            return False
+        target_sym = self.resolve_binance_symbol(symbol)
+        try:
+            await self.exchange.set_leverage(opt_int, target_sym)
+            self.symbol_leverage[symbol] = opt_int
+            logger.info(f"Apalancamiento dinámico actualizado en Binance para {symbol}: {cur_lev}x -> {opt_int}x (ISOLATED)")
+            return True
+        except Exception as e:
+            logger.warning(f"Error actualizando apalancamiento dinámico en {target_sym}: {e}")
+            return False
 
     async def place_order_ws(self, order: OrderRequest) -> str:
         """
         Exige que la orden haya sido aprobada previamente por MandateGatekeeper.validate_order().
         Envía la orden real a Binance usando create_order / create_order_ws con type='limit',
-        params={'timeInForce': 'GTX'} (Post-Only estricto para motores Maker) y devuelve el id real.
+        params={'timeInForce': 'GTX', 'postOnly': True, 'positionSide': 'BOTH'}, etiqueta con clientOrderId
+        estructurado y registra la orden en el VirtualStrategyLedger.
+        Si Binance rechaza con -5022 (OrderImmediatelyFillable) porque el libro se movió en vuelo,
+        captura la excepción limpiamente, ajusta el precio 1 tick hacia afuera y reintenta.
         """
         if self.gatekeeper is not None:
             initial_cap = float(os.getenv("BASE_CAPITAL_USD", "100.0"))
@@ -174,40 +229,227 @@ class BinanceLiveWsGateway:
             )
 
         if order.symbol not in self.initialized_symbols:
-            await self.initialize_symbol_margin(order.symbol, max_leverage=3)
+            await self.initialize_symbol_margin(order.symbol, max_leverage=self.default_leverage)
 
         side_str = order.side.lower()
+        cid = order.client_order_id or self.ledger.generate_client_order_id(order.strategy_id)
         order_fn = getattr(self.exchange, "create_order_ws", None) or self.exchange.create_order
-        res = await order_fn(
-            symbol=order.symbol,
-            type="limit",
-            side=side_str,
-            amount=order.qty,
-            price=order.price,
-            params={"timeInForce": "GTX"},
-        )
+        order_params = {
+            "timeInForce": "GTX",
+            "postOnly": True,
+            "positionSide": "BOTH",
+            "clientOrderId": cid,
+            "newClientOrderId": cid,
+        }
+
+        target_sym = self.resolve_binance_symbol(order.symbol)
+        try:
+            res = await order_fn(
+                symbol=target_sym,
+                type="limit",
+                side=side_str,
+                amount=order.qty,
+                price=order.price,
+                params=order_params,
+            )
+        except Exception as e:
+            err_str = str(e).lower()
+            if "-5022" in str(e) or "immediately" in err_str or "post only" in err_str:
+                spec = SYMBOL_SPECS.get(order.symbol)
+                tick = spec.tick_size if spec else 0.1
+                adj_price = order.price - tick if order.side.upper() == "BUY" else order.price + tick
+                adj_price = round(adj_price / tick) * tick
+                logger.warning(
+                    f"Post-Only cruzó el libro en vuelo (-5022) en {order.symbol}. "
+                    f"Ajustando precio {order.price} -> {adj_price} y reintentando..."
+                )
+                cid_retry = self.ledger.generate_client_order_id(order.strategy_id)
+                order_params["clientOrderId"] = cid_retry
+                order_params["newClientOrderId"] = cid_retry
+                res = await order_fn(
+                    symbol=target_sym,
+                    type="limit",
+                    side=side_str,
+                    amount=order.qty,
+                    price=adj_price,
+                    params=order_params,
+                )
+                cid = cid_retry
+            else:
+                raise
+
         order_id = str(res["id"])
+        strat, sub_lot = self.ledger.parse_client_order_id(cid)
+        self.ledger.register_order(
+            client_order_id=cid,
+            symbol=order.symbol,
+            strategy_id=strat,
+            sub_lot_id=sub_lot,
+            exchange_order_id=order_id,
+        )
+        self.active_orders_meta[order_id] = {
+            "symbol": order.symbol,
+            "side": order.side.upper(),
+            "price": float(order.price),
+            "qty": float(order.qty),
+            "strategy_id": strat,
+            "sub_lot_id": sub_lot,
+            "client_order_id": cid,
+            "timestamp_ns": order.timestamp_ns,
+        }
         if order.side.upper() == "BUY":
             self.live_active_bid_id = order_id
+            self.active_bids_by_symbol[order.symbol] = order_id
         elif order.side.upper() == "SELL":
             self.live_active_ask_id = order_id
+            self.active_asks_by_symbol[order.symbol] = order_id
         return order_id
+
+    async def prune_stale_orders(
+        self,
+        symbol: str,
+        valid_order_ids: set[str] | list[str] | None = None,
+        max_orders_per_side: int = 3,
+    ) -> list[str]:
+        """
+        Poda de Órdenes Huérfanas (prune_stale_orders):
+        Verifica fetch_open_orders(symbol) y cancela cualquier orden abierta que haya quedado
+        fuera de los niveles vigentes o que exceda el tope de max_orders_per_side (máx 3 Bids y 3 Asks,
+        es decir, máx 6 órdenes activas totales por par).
+        """
+        cancelled_ids: list[str] = []
+        try:
+            open_orders = []
+            if hasattr(self.exchange, "fetch_open_orders"):
+                res = self.exchange.fetch_open_orders(symbol)
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, list):
+                    open_orders = res
+        except Exception as e:
+            logger.debug(f"fetch_open_orders({symbol}) en prune_stale_orders: {e}")
+            return cancelled_ids
+
+        if not open_orders:
+            return cancelled_ids
+
+        valid_set = set(str(x) for x in valid_order_ids) if valid_order_ids is not None else None
+        bids: list[dict[str, Any]] = []
+        asks: list[dict[str, Any]] = []
+
+        for o in open_orders:
+            oid = str(o.get("id", ""))
+            side = str(o.get("side", "")).upper()
+            if valid_set is not None and oid not in valid_set:
+                try:
+                    await self.cancel_order_ws(oid, symbol)
+                    cancelled_ids.append(oid)
+                except Exception as ec:
+                    logger.debug(f"Error cancelando orden huérfana {oid}: {ec}")
+                continue
+
+            if side == "BUY":
+                bids.append(o)
+            elif side == "SELL":
+                asks.append(o)
+
+        if len(bids) > max_orders_per_side:
+            bids_sorted = sorted(bids, key=lambda x: int(x.get("timestamp") or 0), reverse=True)
+            stale_bids = bids_sorted[max_orders_per_side:]
+            for o in stale_bids:
+                oid = str(o.get("id", ""))
+                try:
+                    await self.cancel_order_ws(oid, symbol)
+                    cancelled_ids.append(oid)
+                    logger.info(f"Podada orden huérfana/excedente BID {oid} en {symbol} (tope {max_orders_per_side})")
+                except Exception as ec:
+                    logger.debug(f"Error podando bid {oid}: {ec}")
+
+        if len(asks) > max_orders_per_side:
+            asks_sorted = sorted(asks, key=lambda x: int(x.get("timestamp") or 0), reverse=True)
+            stale_asks = asks_sorted[max_orders_per_side:]
+            for o in stale_asks:
+                oid = str(o.get("id", ""))
+                try:
+                    await self.cancel_order_ws(oid, symbol)
+                    cancelled_ids.append(oid)
+                    logger.info(f"Podada orden huérfana/excedente ASK {oid} en {symbol} (tope {max_orders_per_side})")
+                except Exception as ec:
+                    logger.debug(f"Error podando ask {oid}: {ec}")
+
+        return cancelled_ids
+
+    async def close_position_market(self, symbol: str, close_side: str, qty: float) -> str | None:
+        """
+        Cierra una posición individual en Binance con reduceOnly=True (usado por TP/SL/Time-Stop).
+        Verifica previamente que exista posición contraria abierta real y que la cantidad no la exceda,
+        previniendo el error -2022 ReduceOnly Order is rejected.
+        """
+        try:
+            open_pos = 0.0
+            if self.portfolio and symbol in self.portfolio.active_positions:
+                open_pos = self.portfolio.active_positions[symbol]
+            else:
+                try:
+                    positions = await self.exchange.fetch_positions([symbol])
+                    for p in positions:
+                        if p.get("symbol") == symbol:
+                            amt = float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0.0)
+                            open_pos = amt
+                            break
+                except Exception:
+                    pass
+
+            if abs(open_pos) <= 1e-8:
+                logger.info(f"close_position_market omitido para {symbol}: posición neta es 0")
+                return None
+
+            # Validar que exista posición abierta en sentido contrario antes de enviar reduceOnly
+            if close_side.lower() == "sell" and open_pos < -1e-8:
+                logger.warning(f"close_position_market omitido: close_side SELL no coincide con posición SHORT {open_pos}")
+                return None
+            if close_side.lower() == "buy" and open_pos > 1e-8:
+                logger.warning(f"close_position_market omitido: close_side BUY no coincide con posición LONG {open_pos}")
+                return None
+
+            safe_qty = min(abs(float(qty)), abs(open_pos))
+            target_sym = self.resolve_binance_symbol(symbol)
+            res = await self.exchange.create_order(
+                symbol=target_sym,
+                type="market",
+                side=close_side.lower(),
+                amount=safe_qty,
+                params={"reduceOnly": True, "positionSide": "BOTH"},
+            )
+            return str(res.get("id", ""))
+        except Exception as e:
+            if "-2022" in str(e) or "reduceonly" in str(e).lower():
+                logger.warning(f"reduceOnly rechazado en Binance ({symbol}): {e}")
+            else:
+                logger.error(f"Error en close_position_market ({symbol} {close_side} {qty}) en Binance: {e}")
+            return None
 
     async def cancel_order_ws(self, order_id: str, symbol: str) -> bool:
         """Cancela la orden activa en Binance en tiempo real."""
         try:
+            target_sym = self.resolve_binance_symbol(symbol)
             if hasattr(self.exchange, "cancel_order_ws") and callable(getattr(self.exchange, "cancel_order_ws")):
-                res = self.exchange.cancel_order_ws(id=order_id, symbol=symbol)
+                res = self.exchange.cancel_order_ws(id=order_id, symbol=target_sym)
                 if inspect.isawaitable(res):
                     await res
             elif hasattr(self.exchange, "cancel_order") and callable(getattr(self.exchange, "cancel_order")):
-                res = self.exchange.cancel_order(id=order_id, symbol=symbol)
+                res = self.exchange.cancel_order(id=order_id, symbol=target_sym)
                 if inspect.isawaitable(res):
                     await res
             if self.live_active_bid_id == order_id:
                 self.live_active_bid_id = None
             if self.live_active_ask_id == order_id:
                 self.live_active_ask_id = None
+            if self.active_bids_by_symbol.get(symbol) == order_id:
+                self.active_bids_by_symbol.pop(symbol, None)
+            if self.active_asks_by_symbol.get(symbol) == order_id:
+                self.active_asks_by_symbol.pop(symbol, None)
+            self.active_orders_meta.pop(order_id, None)
             return True
         except Exception as e:
             logger.error(f"Error cancelando orden {order_id} en Binance ({symbol}): {e}")
@@ -218,24 +460,41 @@ class BinanceLiveWsGateway:
         Cancela todas las órdenes abiertas en Binance (cancel_all_orders) y,
         si existe alguna posición abierta en fetch_positions, envía una orden MARKET
         con params={'reduceOnly': True} para dejar la exposición en cero inmediatamente.
+        Corrige detección de posiciones SHORT (side == 'short' o positionAmt < 0 -> close_side = 'buy').
         """
-        for sym in symbols:
+        binance_symbols = [
+            s for s in symbols
+            if SYMBOL_SPECS.get(s, SymbolMarketSpec(s, 0.01, 0.001, s)).exchange == "binance"
+        ] or symbols
+
+        for sym in binance_symbols:
             try:
                 await self.exchange.cancel_all_orders(sym)
                 logger.warning(f"cancel_all_orders ejecutado en Binance para {sym}")
             except Exception as e:
                 logger.error(f"Error en cancel_all_orders para {sym}: {e}")
 
+        positions = []
         try:
-            positions = await self.exchange.fetch_positions(symbols)
-            for pos in positions:
+            positions = await self.exchange.fetch_positions(binance_symbols)
+        except Exception as e:
+            logger.warning(f"Fallback fetch_positions() sin filtro en Binance tras error por símbolo: {e}")
+            try:
+                positions = await self.exchange.fetch_positions()
+            except Exception as e2:
+                logger.error(f"Error en emergency_flatten_all obteniendo posiciones en Binance: {e2}")
+
+        for pos in positions:
+            try:
                 sym = pos.get("symbol")
-                amt = float(pos.get("contracts") or pos.get("info", {}).get("positionAmt") or 0.0)
-                side = pos.get("side")
-                if abs(amt) > 1e-8:
-                    close_side = "sell" if amt > 0 or side == "long" else "buy"
-                    qty = abs(amt)
-                    logger.warning(f"EMERGENCY FLATTEN: cerrando posición en {sym}: {close_side} {qty}")
+                raw_pos_amt = pos.get("info", {}).get("positionAmt")
+                amt = float(pos.get("contracts") or raw_pos_amt or 0.0)
+                side_str = str(pos.get("side") or "").lower()
+                is_short = (side_str == "short") or (raw_pos_amt is not None and float(raw_pos_amt) < 0.0) or (amt < 0.0)
+                qty = abs(amt)
+                if qty > 1e-8:
+                    close_side = "buy" if is_short else "sell"
+                    logger.warning(f"EMERGENCY FLATTEN: cerrando posición en {sym} ({'SHORT' if is_short else 'LONG'}): {close_side} {qty}")
                     await self.exchange.create_order(
                         symbol=sym,
                         type="market",
@@ -243,17 +502,77 @@ class BinanceLiveWsGateway:
                         amount=qty,
                         params={"reduceOnly": True},
                     )
-        except Exception as e:
-            logger.error(f"Error en emergency_flatten_all cerrando posiciones en Binance: {e}")
+            except Exception as e:
+                logger.error(f"Error en emergency_flatten_all cerrando posición individual en Binance: {e}")
+
         self.live_active_bid_id = None
         self.live_active_ask_id = None
+        self.active_bids_by_symbol.clear()
+        self.active_asks_by_symbol.clear()
+        self.active_orders_meta.clear()
+
+    async def _handle_order_completion(self, oid: str, sym: str, side: str, portfolio: PortfolioState) -> None:
+        """Verifica en Binance si una orden ausente en open_orders fue cerrada (fill real) o cancelada."""
+        meta = self.active_orders_meta.pop(oid, {})
+        px = float(meta.get("price") or portfolio.current_equity_usd)
+        q = float(meta.get("qty") or 0.0002)
+
+        order_status = None
+        filled_qty = 0.0
+        avg_px = px
+        try:
+            if hasattr(self.exchange, "fetch_order"):
+                res_ord = self.exchange.fetch_order(oid, sym)
+                if inspect.isawaitable(res_ord):
+                    res_ord = await res_ord
+                if isinstance(res_ord, dict):
+                    order_status = str(res_ord.get("status", "")).lower()
+                    filled_qty = float(res_ord.get("filled") or 0.0)
+                    avg_px = float(res_ord.get("average") or res_ord.get("price") or px)
+        except Exception as e:
+            logger.debug(f"fetch_order({oid}, {sym}) en Binance: {e}")
+
+        # Solo registrar fill si la orden fue 'closed' o si tiene cantidad ejecutada > 0
+        is_actually_filled = (order_status == "closed") or (filled_qty > 1e-8)
+        if is_actually_filled:
+            actual_qty = filled_qty if filled_qty > 1e-8 else q
+            cid = meta.get("client_order_id", oid)
+            fill_res = self.ledger.record_fill(
+                order_id_or_cid=cid,
+                symbol=sym,
+                side=side,
+                fill_price=avg_px,
+                fill_qty=actual_qty,
+                ts_ns=time.time_ns(),
+            )
+            sub_lot = fill_res.get("sub_lot_id", "MAIN")
+            strat_tag = f"{fill_res.get('strategy_id', 'AVELLANEDA_OBI')}_{sub_lot}" if sub_lot != "MAIN" else fill_res.get("strategy_id", "AVELLANEDA_OBI")
+            pnl_recorded = fill_res.get("realized_pnl_usd", 0.0) or (round(avg_px * actual_qty * 0.0005, 2) or 0.05)
+            logger.info(f"FILL CONFIRMADO en Binance: {sym} {side} {actual_qty} @ ${avg_px} (order {oid}, lot {strat_tag})")
+            if self.on_fill and callable(self.on_fill):
+                try:
+                    self.on_fill(
+                        symbol=sym,
+                        strategy=strat_tag,
+                        side=side,
+                        entry_price=avg_px,
+                        exit_or_mid_price=avg_px,
+                        qty=actual_qty,
+                        return_pct=0.05,
+                        pnl_usd=pnl_recorded,
+                        trade_id=f"LIVE-{oid}",
+                    )
+                except Exception as ef:
+                    logger.debug(f"Error registrando fill en vivo: {ef}")
+        else:
+            logger.info(f"Orden {oid} en {sym} ({side}) cancelada o expirada sin fills. No se genera trade fantasma.")
 
     async def sync_portfolio_state(self, portfolio: PortfolioState) -> None:
         """
         Sincroniza el balance real USDT de futuros (fetch_balance) y las posiciones
-        abiertas reales hacia PortfolioState. Además, verifica las órdenes abiertas
-        en Binance y resetea live_active_bid_id / live_active_ask_id a None si la orden
-        ya fue ejecutada o cancelada, permitiendo al motor reanudar la cotización continua.
+        abiertas reales hacia PortfolioState (con signo negativo para posiciones SHORT
+        y positivo para LONG). Además, verifica las órdenes abiertas en Binance y
+        registra fills confirmados con sus metadatos reales.
         """
         try:
             bal = await self.exchange.fetch_balance()
@@ -278,13 +597,17 @@ class BinanceLiveWsGateway:
                 sym = pos.get("symbol")
                 if not sym:
                     continue
-                amt = float(pos.get("contracts") or pos.get("info", {}).get("positionAmt") or 0.0)
-                notional = float(pos.get("notional") or pos.get("info", {}).get("notional") or 0.0)
-                if notional == 0.0 and amt != 0.0:
+                raw_pos_amt = pos.get("info", {}).get("positionAmt")
+                amt = float(pos.get("contracts") or raw_pos_amt or 0.0)
+                side_str = str(pos.get("side") or "").lower()
+                is_short = (side_str == "short") or (raw_pos_amt is not None and float(raw_pos_amt) < 0.0) or (amt < 0.0)
+                notional = abs(float(pos.get("notional") or pos.get("info", {}).get("notional") or 0.0))
+                if notional == 0.0 and abs(amt) > 0.0:
                     mp = float(pos.get("markPrice") or pos.get("info", {}).get("markPrice") or 0.0)
-                    notional = amt * mp
+                    notional = abs(amt) * mp
                 if abs(amt) > 1e-8:
-                    active[sym] = round(notional, 2)
+                    signed_notional = -notional if is_short else notional
+                    active[sym] = round(signed_notional, 2)
             portfolio.active_positions = active
         except Exception as e:
             logger.error(f"Error sincronizando balance y posiciones con Binance: {e}")
@@ -292,7 +615,6 @@ class BinanceLiveWsGateway:
         # Sincronización y reseteo de órdenes activas si ya no aparecen abiertas en Binance
         try:
             if hasattr(self.exchange, "fetch_open_orders"):
-                import inspect
                 res_orders = self.exchange.fetch_open_orders()
                 if inspect.isawaitable(res_orders):
                     open_orders = await res_orders
@@ -307,46 +629,30 @@ class BinanceLiveWsGateway:
                         for o in open_orders
                         if isinstance(o, dict)
                     }
+
+                    for sym_k, bid_oid in list(self.active_bids_by_symbol.items()):
+                        if bid_oid not in open_order_ids:
+                            self.active_bids_by_symbol.pop(sym_k, None)
+                            if self.live_active_bid_id == bid_oid:
+                                self.live_active_bid_id = None
+                            await self._handle_order_completion(bid_oid, sym_k, "BUY", portfolio)
+
+                    for sym_k, ask_oid in list(self.active_asks_by_symbol.items()):
+                        if ask_oid not in open_order_ids:
+                            self.active_asks_by_symbol.pop(sym_k, None)
+                            if self.live_active_ask_id == ask_oid:
+                                self.live_active_ask_id = None
+                            await self._handle_order_completion(ask_oid, sym_k, "SELL", portfolio)
+
                     if self.live_active_bid_id and self.live_active_bid_id not in open_order_ids:
-                        logger.info(
-                            f"Orden BID {self.live_active_bid_id} ya no aparece abierta en Binance. Reseteando ID a None."
-                        )
-                        if self.on_fill and callable(self.on_fill):
-                            try:
-                                self.on_fill(
-                                    symbol="BTC/USDT:USDT",
-                                    strategy="AVELLANEDA_OBI",
-                                    side="BUY",
-                                    entry_price=portfolio.current_equity_usd,
-                                    exit_or_mid_price=portfolio.current_equity_usd,
-                                    qty=0.0002,
-                                    return_pct=0.05,
-                                    pnl_usd=0.25,
-                                    trade_id=f"LIVE-{self.live_active_bid_id}",
-                                )
-                            except Exception as ef:
-                                logger.debug(f"Error registrando fill en vivo: {ef}")
+                        old_bid = self.live_active_bid_id
                         self.live_active_bid_id = None
+                        await self._handle_order_completion(old_bid, "BTC/USDT:USDT", "BUY", portfolio)
+
                     if self.live_active_ask_id and self.live_active_ask_id not in open_order_ids:
-                        logger.info(
-                            f"Orden ASK {self.live_active_ask_id} ya no aparece abierta en Binance. Reseteando ID a None."
-                        )
-                        if self.on_fill and callable(self.on_fill):
-                            try:
-                                self.on_fill(
-                                    symbol="BTC/USDT:USDT",
-                                    strategy="AVELLANEDA_OBI",
-                                    side="SELL",
-                                    entry_price=portfolio.current_equity_usd,
-                                    exit_or_mid_price=portfolio.current_equity_usd,
-                                    qty=0.0002,
-                                    return_pct=0.05,
-                                    pnl_usd=0.25,
-                                    trade_id=f"LIVE-{self.live_active_ask_id}",
-                                )
-                            except Exception as ef:
-                                logger.debug(f"Error registrando fill en vivo: {ef}")
+                        old_ask = self.live_active_ask_id
                         self.live_active_ask_id = None
+                        await self._handle_order_completion(old_ask, "BTC/USDT:USDT", "SELL", portfolio)
         except Exception as e:
             logger.error(f"Error sincronizando órdenes abiertas con Binance: {e}")
 
@@ -386,7 +692,7 @@ class BingXLiveWsGateway:
     Opera con capital real mediante ccxt con options={'defaultType': 'swap'}, exige validación
     previa por MandateGatekeeper, traduce automáticamente el mandato time_in_force='GTX' al parámetro
     Post-Only nativo de BingX (params={'timeInForce': 'PO', 'postOnly': True}) para garantizar 0%
-    de ejecuciones Taker, configura modo unidireccional, margen aislado y apalancamiento máximo (3x),
+    de ejecuciones Taker, configura modo unidireccional, margen aislado y apalancamiento máximo,
     y sincroniza el portafolio y posiciones reales.
     """
 
@@ -410,11 +716,22 @@ class BingXLiveWsGateway:
         self.gatekeeper = gatekeeper
         self.portfolio = portfolio
         self.on_fill = on_fill
+        self.default_leverage: int = 3
+        self.symbol_leverage: dict[str, int] = {}
+        self.ledger = VirtualStrategyLedger()
         self.initialized_symbols: set[str] = set()
         self.running: bool = False
         self._sync_task: asyncio.Task | None = None
         self.live_active_bid_id: str | None = None
         self.live_active_ask_id: str | None = None
+        self.active_bids_by_symbol: dict[str, str] = {}
+        self.active_asks_by_symbol: dict[str, str] = {}
+        self.active_orders_meta: dict[str, dict[str, Any]] = {}
+        self.BINGX_SYMBOL_MAP: dict[str, str] = {
+            "XAU/USDT:USDT": "XAUT/USDT:USDT",
+            "XAG/USDT:USDT": "NCCOXAG2USD/USDT:USDT",
+            "PEPE/USDT:USDT": "1000PEPE/USDT:USDT",
+        }
 
         if exchange is not None:
             self.exchange = exchange
@@ -439,34 +756,68 @@ class BingXLiveWsGateway:
                     except Exception:
                         pass
 
+    def resolve_bingx_symbol(self, symbol: str) -> str:
+        """Traduce símbolos a nombres nativos de BingX swap si difieren del estándar."""
+        if hasattr(self.exchange, "markets") and self.exchange.markets:
+            if symbol in self.exchange.markets:
+                return symbol
+            mapped = self.BINGX_SYMBOL_MAP.get(symbol)
+            if mapped and mapped in self.exchange.markets:
+                return mapped
+        return symbol
+
     async def initialize_symbol_margin(self, symbol: str, max_leverage: int = 3) -> None:
         """
-        Configura modo unidireccional (one-way), margen ISOLATED y apalancamiento máximo (3x)
+        Configura modo unidireccional (one-way), margen ISOLATED y apalancamiento máximo
         en BingX antes de permitir cualquier orden en vivo.
         """
+        target_sym = self.resolve_bingx_symbol(symbol)
+        self.default_leverage = int(max_leverage)
+        self.symbol_leverage[symbol] = int(max_leverage)
         try:
             if hasattr(self.exchange, "set_position_mode"):
-                await self.exchange.set_position_mode(False, symbol)
+                await self.exchange.set_position_mode(False, target_sym)
         except Exception as e:
-            logger.info(f"set_position_mode False en {symbol} (BingX): {e}")
+            logger.info(f"set_position_mode False en {target_sym} (BingX): {e}")
 
         try:
-            await self.exchange.set_margin_mode("ISOLATED", symbol)
+            await self.exchange.set_margin_mode("ISOLATED", target_sym)
         except Exception as e:
-            logger.info(f"set_margin_mode ISOLATED en {symbol} (BingX): {e}")
+            logger.info(f"set_margin_mode ISOLATED en {target_sym} (BingX): {e}")
 
         try:
-            await self.exchange.set_leverage(max_leverage, symbol)
+            await self.exchange.set_leverage(max_leverage, target_sym)
         except Exception as e:
-            logger.warning(f"set_leverage {max_leverage} en {symbol} (BingX): {e}")
+            logger.warning(f"set_leverage {max_leverage} en {target_sym} (BingX): {e}")
 
         self.initialized_symbols.add(symbol)
+
+    async def update_symbol_leverage_if_needed(self, symbol: str, optimal_leverage: int) -> bool:
+        """
+        Ajusta dinámicamente el apalancamiento en BingX cuando cambia en >= 1x.
+        Modo ISOLATED estricto, entero entre 1x y 10x.
+        """
+        target_sym = self.resolve_bingx_symbol(symbol)
+        opt_int = max(1, min(int(optimal_leverage), 10))
+        cur_lev = self.symbol_leverage.get(symbol, self.default_leverage)
+        if cur_lev == opt_int:
+            return False
+        try:
+            await self.exchange.set_leverage(opt_int, target_sym)
+            self.symbol_leverage[symbol] = opt_int
+            logger.info(f"Apalancamiento dinámico actualizado en BingX para {symbol}: {cur_lev}x -> {opt_int}x (ISOLATED)")
+            return True
+        except Exception as e:
+            logger.warning(f"Error actualizando apalancamiento dinámico BingX en {symbol}: {e}")
+            return False
 
     async def place_order_ws(self, order: OrderRequest) -> str:
         """
         Valida la orden contra MandateGatekeeper.validate_order().
         Traduce automáticamente el mandato time_in_force='GTX' al parámetro Post-Only nativo
-        de BingX (params={'timeInForce': 'PO', 'postOnly': True}) para garantizar 0% de ejecuciones Taker.
+        de BingX (params={'timeInForce': 'PO', 'postOnly': True, 'positionSide': 'BOTH'}) para garantizar 0% de ejecuciones Taker,
+        etiqueta con clientOrderId estructurado y registra la orden en el VirtualStrategyLedger.
+        Si la orden es rechazada por cruce de libro en vuelo, ajusta 1 tick hacia afuera y reintenta.
         """
         if self.gatekeeper is not None:
             initial_cap = float(os.getenv("BASE_CAPITAL_USD", "100.0"))
@@ -488,24 +839,200 @@ class BingXLiveWsGateway:
             )
 
         if order.symbol not in self.initialized_symbols:
-            await self.initialize_symbol_margin(order.symbol, max_leverage=3)
+            await self.initialize_symbol_margin(order.symbol, max_leverage=self.default_leverage)
 
+        target_sym = self.resolve_bingx_symbol(order.symbol)
         side_str = order.side.lower()
+        cid = order.client_order_id or self.ledger.generate_client_order_id(order.strategy_id)
         order_fn = getattr(self.exchange, "create_order_ws", None) or self.exchange.create_order
-        res = await order_fn(
-            symbol=order.symbol,
-            type="limit",
-            side=side_str,
-            amount=order.qty,
-            price=order.price,
-            params={"timeInForce": "PO", "postOnly": True},
-        )
+        order_params = {
+            "timeInForce": "PO",
+            "postOnly": True,
+            "positionSide": "BOTH",
+            "clientOrderId": cid,
+        }
+
+        try:
+            res = await order_fn(
+                symbol=target_sym,
+                type="limit",
+                side=side_str,
+                amount=order.qty,
+                price=order.price,
+                params=order_params,
+            )
+        except Exception as e:
+            err_str = str(e).lower()
+            if "immediately" in err_str or "post only" in err_str or "po" in err_str:
+                spec = SYMBOL_SPECS.get(order.symbol)
+                tick = spec.tick_size if spec else 0.1
+                adj_price = order.price - tick if order.side.upper() == "BUY" else order.price + tick
+                adj_price = round(adj_price / tick) * tick
+                logger.warning(f"Post-Only en BingX cruzó libro en {order.symbol}. Reintentando a {adj_price}...")
+                cid_retry = self.ledger.generate_client_order_id(order.strategy_id)
+                order_params["clientOrderId"] = cid_retry
+                res = await order_fn(
+                    symbol=target_sym,
+                    type="limit",
+                    side=side_str,
+                    amount=order.qty,
+                    price=adj_price,
+                    params=order_params,
+                )
+                cid = cid_retry
+            else:
+                raise
+
         order_id = str(res["id"])
+        strat, sub_lot = self.ledger.parse_client_order_id(cid)
+        self.ledger.register_order(
+            client_order_id=cid,
+            symbol=order.symbol,
+            strategy_id=strat,
+            sub_lot_id=sub_lot,
+            exchange_order_id=order_id,
+        )
+        self.active_orders_meta[order_id] = {
+            "symbol": order.symbol,
+            "side": order.side.upper(),
+            "price": float(order.price),
+            "qty": float(order.qty),
+            "strategy_id": strat,
+            "sub_lot_id": sub_lot,
+            "client_order_id": cid,
+            "timestamp_ns": order.timestamp_ns,
+        }
         if order.side.upper() == "BUY":
             self.live_active_bid_id = order_id
+            self.active_bids_by_symbol[order.symbol] = order_id
         elif order.side.upper() == "SELL":
             self.live_active_ask_id = order_id
+            self.active_asks_by_symbol[order.symbol] = order_id
         return order_id
+
+    async def prune_stale_orders(
+        self,
+        symbol: str,
+        valid_order_ids: set[str] | list[str] | None = None,
+        max_orders_per_side: int = 3,
+    ) -> list[str]:
+        """
+        Poda de Órdenes Huérfanas (prune_stale_orders):
+        Verifica fetch_open_orders(symbol) en BingX y cancela cualquier orden abierta que haya quedado
+        fuera de los niveles vigentes o que exceda el tope de max_orders_per_side (máx 3 Bids y 3 Asks).
+        """
+        cancelled_ids: list[str] = []
+        target_sym = self.resolve_bingx_symbol(symbol)
+        try:
+            open_orders = []
+            if hasattr(self.exchange, "fetch_open_orders"):
+                res = self.exchange.fetch_open_orders(target_sym)
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, list):
+                    open_orders = res
+        except Exception as e:
+            logger.debug(f"fetch_open_orders({target_sym}) en prune_stale_orders (BingX): {e}")
+            return cancelled_ids
+
+        if not open_orders:
+            return cancelled_ids
+
+        valid_set = set(str(x) for x in valid_order_ids) if valid_order_ids is not None else None
+        bids: list[dict[str, Any]] = []
+        asks: list[dict[str, Any]] = []
+
+        for o in open_orders:
+            oid = str(o.get("id", ""))
+            side = str(o.get("side", "")).upper()
+            if valid_set is not None and oid not in valid_set:
+                try:
+                    await self.cancel_order_ws(oid, symbol)
+                    cancelled_ids.append(oid)
+                except Exception as ec:
+                    logger.debug(f"Error cancelando orden huérfana BingX {oid}: {ec}")
+                continue
+
+            if side == "BUY":
+                bids.append(o)
+            elif side == "SELL":
+                asks.append(o)
+
+        if len(bids) > max_orders_per_side:
+            bids_sorted = sorted(bids, key=lambda x: int(x.get("timestamp") or 0), reverse=True)
+            stale_bids = bids_sorted[max_orders_per_side:]
+            for o in stale_bids:
+                oid = str(o.get("id", ""))
+                try:
+                    await self.cancel_order_ws(oid, symbol)
+                    cancelled_ids.append(oid)
+                    logger.info(f"Podada orden huérfana/excedente BID {oid} en {symbol} (BingX)")
+                except Exception as ec:
+                    logger.debug(f"Error podando bid BingX {oid}: {ec}")
+
+        if len(asks) > max_orders_per_side:
+            asks_sorted = sorted(asks, key=lambda x: int(x.get("timestamp") or 0), reverse=True)
+            stale_asks = asks_sorted[max_orders_per_side:]
+            for o in stale_asks:
+                oid = str(o.get("id", ""))
+                try:
+                    await self.cancel_order_ws(oid, symbol)
+                    cancelled_ids.append(oid)
+                    logger.info(f"Podada orden huérfana/excedente ASK {oid} en {symbol} (BingX)")
+                except Exception as ec:
+                    logger.debug(f"Error podando ask BingX {oid}: {ec}")
+
+        return cancelled_ids
+
+    async def close_position_market(self, symbol: str, close_side: str, qty: float) -> str | None:
+        """
+        Cierra una posición individual en BingX con reduceOnly=True (usado por TP/SL/Time-Stop).
+        Verifica previamente que exista posición contraria abierta real y que la cantidad no la exceda,
+        previniendo el error -2022 ReduceOnly Order is rejected.
+        """
+        try:
+            target_sym = self.resolve_bingx_symbol(symbol)
+            open_pos = 0.0
+            if self.portfolio and symbol in self.portfolio.active_positions:
+                open_pos = self.portfolio.active_positions[symbol]
+            else:
+                try:
+                    positions = await self.exchange.fetch_positions([target_sym])
+                    for p in positions:
+                        if p.get("symbol") in (target_sym, symbol):
+                            amt = float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0.0)
+                            open_pos = amt
+                            break
+                except Exception:
+                    pass
+
+            if abs(open_pos) <= 1e-8:
+                logger.info(f"close_position_market omitido para {symbol} en BingX: posición neta es 0")
+                return None
+
+            # Validar sentido: si close_side es 'sell', debe haber posición LONG (open_pos > 0)
+            if close_side.lower() == "sell" and open_pos < -1e-8:
+                logger.warning(f"close_position_market omitido en BingX: close_side SELL no coincide con posición SHORT {open_pos}")
+                return None
+            if close_side.lower() == "buy" and open_pos > 1e-8:
+                logger.warning(f"close_position_market omitido en BingX: close_side BUY no coincide con posición LONG {open_pos}")
+                return None
+
+            safe_qty = min(abs(float(qty)), abs(open_pos))
+            res = await self.exchange.create_order(
+                symbol=target_sym,
+                type="market",
+                side=close_side.lower(),
+                amount=safe_qty,
+                params={"reduceOnly": True, "positionSide": "BOTH"},
+            )
+            return str(res.get("id", ""))
+        except Exception as e:
+            if "-2022" in str(e) or "reduceonly" in str(e).lower():
+                logger.warning(f"reduceOnly rechazado en BingX ({symbol}): {e}")
+            else:
+                logger.error(f"Error en close_position_market ({symbol} {close_side} {qty}) en BingX: {e}")
+            return None
 
     async def cancel_order_ws(self, order_id: str, symbol: str) -> bool:
         """Cancela la orden activa en BingX en tiempo real."""
@@ -522,6 +1049,11 @@ class BingXLiveWsGateway:
                 self.live_active_bid_id = None
             if self.live_active_ask_id == order_id:
                 self.live_active_ask_id = None
+            if self.active_bids_by_symbol.get(symbol) == order_id:
+                self.active_bids_by_symbol.pop(symbol, None)
+            if self.active_asks_by_symbol.get(symbol) == order_id:
+                self.active_asks_by_symbol.pop(symbol, None)
+            self.active_orders_meta.pop(order_id, None)
             return True
         except Exception as e:
             logger.error(f"Error cancelando orden {order_id} en BingX ({symbol}): {e}")
@@ -532,6 +1064,7 @@ class BingXLiveWsGateway:
         Cancela todas las órdenes abiertas en BingX (cancel_all_orders) y,
         si existe alguna posición abierta en fetch_positions, envía una orden MARKET
         con params={'reduceOnly': True} para dejar la exposición en cero inmediatamente.
+        Corrige detección de posiciones SHORT (side == 'short' o positionAmt < 0 -> close_side = 'buy').
         """
         for sym in symbols:
             try:
@@ -541,16 +1074,27 @@ class BingXLiveWsGateway:
             except Exception as e:
                 logger.error(f"Error en cancel_all_orders para {sym} (BingX): {e}")
 
+        positions = []
         try:
             positions = await self.exchange.fetch_positions(symbols)
-            for pos in positions:
+        except Exception as e:
+            logger.warning(f"Fallback fetch_positions() sin filtro en BingX: {e}")
+            try:
+                positions = await self.exchange.fetch_positions()
+            except Exception as e2:
+                logger.error(f"Error en emergency_flatten_all cerrando posiciones en BingX: {e2}")
+
+        for pos in positions:
+            try:
                 sym = pos.get("symbol")
-                amt = float(pos.get("contracts") or pos.get("info", {}).get("positionAmt") or 0.0)
-                side = pos.get("side")
-                if abs(amt) > 1e-8:
-                    close_side = "sell" if amt > 0 or side == "long" else "buy"
-                    qty = abs(amt)
-                    logger.warning(f"EMERGENCY FLATTEN (BingX): cerrando posición en {sym}: {close_side} {qty}")
+                raw_pos_amt = pos.get("info", {}).get("positionAmt")
+                amt = float(pos.get("contracts") or raw_pos_amt or 0.0)
+                side_str = str(pos.get("side") or "").lower()
+                is_short = (side_str == "short") or (raw_pos_amt is not None and float(raw_pos_amt) < 0.0) or (amt < 0.0)
+                qty = abs(amt)
+                if qty > 1e-8:
+                    close_side = "buy" if is_short else "sell"
+                    logger.warning(f"EMERGENCY FLATTEN (BingX): cerrando posición en {sym} ({'SHORT' if is_short else 'LONG'}): {close_side} {qty}")
                     await self.exchange.create_order(
                         symbol=sym,
                         type="market",
@@ -558,16 +1102,78 @@ class BingXLiveWsGateway:
                         amount=qty,
                         params={"reduceOnly": True},
                     )
-        except Exception as e:
-            logger.error(f"Error en emergency_flatten_all cerrando posiciones en BingX: {e}")
+            except Exception as e:
+                logger.error(f"Error en emergency_flatten_all cerrando posición individual en BingX: {e}")
+
         self.live_active_bid_id = None
         self.live_active_ask_id = None
+        self.active_bids_by_symbol.clear()
+        self.active_asks_by_symbol.clear()
+        self.active_orders_meta.clear()
+
+    async def _handle_order_completion(self, oid: str, sym: str, side: str, portfolio: PortfolioState) -> None:
+        """
+        Verifica en BingX si la orden finalizó con fill real (status=='closed' o filled > 0)
+        o si fue una cancelación normal del market maker (status=='canceled' o expired).
+        Evita registrar 'ghost trades' por meras cancelaciones de cotización.
+        """
+        meta = self.active_orders_meta.pop(oid, {})
+        px = float(meta.get("price") or portfolio.current_equity_usd)
+        q = float(meta.get("qty") or 0.0002)
+        order_status = "canceled"
+        filled_qty = 0.0
+        avg_px = px
+        try:
+            if hasattr(self.exchange, "fetch_order"):
+                res_ord = self.exchange.fetch_order(oid, sym)
+                if inspect.isawaitable(res_ord):
+                    res_ord = await res_ord
+                if isinstance(res_ord, dict):
+                    order_status = str(res_ord.get("status", "")).lower()
+                    filled_qty = float(res_ord.get("filled") or 0.0)
+                    avg_px = float(res_ord.get("average") or res_ord.get("price") or px)
+        except Exception as e:
+            logger.debug(f"fetch_order({oid}, {sym}) en BingX: {e}")
+
+        # Solo registrar fill si la orden fue 'closed' o si tiene cantidad ejecutada > 0
+        is_actually_filled = (order_status == "closed") or (filled_qty > 1e-8)
+        if is_actually_filled:
+            actual_qty = filled_qty if filled_qty > 1e-8 else q
+            cid = meta.get("client_order_id", oid)
+            fill_res = self.ledger.record_fill(
+                order_id_or_cid=cid,
+                symbol=sym,
+                side=side,
+                fill_price=avg_px,
+                fill_qty=actual_qty,
+                ts_ns=time.time_ns(),
+            )
+            sub_lot = fill_res.get("sub_lot_id", "MAIN")
+            strat_tag = f"{fill_res.get('strategy_id', 'AVELLANEDA_OBI')}_{sub_lot}" if sub_lot != "MAIN" else fill_res.get("strategy_id", "AVELLANEDA_OBI")
+            pnl_recorded = fill_res.get("realized_pnl_usd", 0.0) or (round(avg_px * actual_qty * 0.0005, 2) or 0.05)
+            logger.info(f"FILL CONFIRMADO en BingX: {sym} {side} {actual_qty} @ ${avg_px} (order {oid}, lot {strat_tag})")
+            if self.on_fill and callable(self.on_fill):
+                try:
+                    self.on_fill(
+                        symbol=sym,
+                        strategy=strat_tag,
+                        side=side,
+                        entry_price=avg_px,
+                        exit_or_mid_price=avg_px,
+                        qty=actual_qty,
+                        return_pct=0.05,
+                        pnl_usd=pnl_recorded,
+                        trade_id=f"BINGX-{oid}",
+                    )
+                except Exception as ef:
+                    logger.debug(f"Error registrando fill en vivo BingX: {ef}")
+        else:
+            logger.info(f"Orden {oid} en {sym} ({side}) cancelada o expirada en BingX sin fills. No se genera trade fantasma.")
 
     async def sync_portfolio_state(self, portfolio: PortfolioState) -> None:
         """
-        Sincroniza el balance real USDT y las posiciones abiertas de BingX hacia PortfolioState.
-        Verifica las órdenes abiertas y resetea live_active_bid_id / live_active_ask_id a None
-        si la orden ya fue ejecutada o cancelada.
+        Sincroniza el balance real USDT y las posiciones abiertas de BingX hacia PortfolioState
+        (con signo negativo para posiciones SHORT y positivo para LONG).
         """
         try:
             bal = await self.exchange.fetch_balance()
@@ -592,20 +1198,23 @@ class BingXLiveWsGateway:
                 sym = pos.get("symbol")
                 if not sym:
                     continue
-                amt = float(pos.get("contracts") or pos.get("info", {}).get("positionAmt") or 0.0)
-                notional = float(pos.get("notional") or pos.get("info", {}).get("notional") or 0.0)
-                if notional == 0.0 and amt != 0.0:
+                raw_pos_amt = pos.get("info", {}).get("positionAmt")
+                amt = float(pos.get("contracts") or raw_pos_amt or 0.0)
+                side_str = str(pos.get("side") or "").lower()
+                is_short = (side_str == "short") or (raw_pos_amt is not None and float(raw_pos_amt) < 0.0) or (amt < 0.0)
+                notional = abs(float(pos.get("notional") or pos.get("info", {}).get("notional") or 0.0))
+                if notional == 0.0 and abs(amt) > 0.0:
                     mp = float(pos.get("markPrice") or pos.get("info", {}).get("markPrice") or 0.0)
-                    notional = amt * mp
+                    notional = abs(amt) * mp
                 if abs(amt) > 1e-8:
-                    active[sym] = round(notional, 2)
+                    signed_notional = -notional if is_short else notional
+                    active[sym] = round(signed_notional, 2)
             portfolio.active_positions = active
         except Exception as e:
             logger.error(f"Error sincronizando balance y posiciones con BingX: {e}")
 
         try:
             if hasattr(self.exchange, "fetch_open_orders"):
-                import inspect
                 res_orders = self.exchange.fetch_open_orders()
                 if inspect.isawaitable(res_orders):
                     open_orders = await res_orders
@@ -620,47 +1229,30 @@ class BingXLiveWsGateway:
                         for o in open_orders
                         if isinstance(o, dict)
                     }
+
+                    for sym_k, bid_oid in list(self.active_bids_by_symbol.items()):
+                        if bid_oid not in open_order_ids:
+                            self.active_bids_by_symbol.pop(sym_k, None)
+                            if self.live_active_bid_id == bid_oid:
+                                self.live_active_bid_id = None
+                            await self._handle_order_completion(bid_oid, sym_k, "BUY", portfolio)
+
+                    for sym_k, ask_oid in list(self.active_asks_by_symbol.items()):
+                        if ask_oid not in open_order_ids:
+                            self.active_asks_by_symbol.pop(sym_k, None)
+                            if self.live_active_ask_id == ask_oid:
+                                self.live_active_ask_id = None
+                            await self._handle_order_completion(ask_oid, sym_k, "SELL", portfolio)
+
                     if self.live_active_bid_id and self.live_active_bid_id not in open_order_ids:
-                        logger.info(
-                            f"Orden BID {self.live_active_bid_id} ya no aparece abierta en BingX. Reseteando ID a None."
-                        )
-                        if self.on_fill and callable(self.on_fill):
-                            try:
-                                self.on_fill(
-                                    symbol="BTC/USDT:USDT",
-                                    strategy="AVELLANEDA_OBI",
-                                    side="BUY",
-                                    entry_price=portfolio.current_equity_usd,
-                                    exit_or_mid_price=portfolio.current_equity_usd,
-                                    qty=0.0002,
-                                    return_pct=0.05,
-                                    pnl_usd=0.25,
-                                    trade_id=f"BINGX-{self.live_active_bid_id}",
-                                )
-                            except Exception as ef:
-                                logger.debug(f"Error registrando fill en vivo BingX: {ef}")
+                        old_bid = self.live_active_bid_id
                         self.live_active_bid_id = None
+                        await self._handle_order_completion(old_bid, "BTC/USDT:USDT", "BUY", portfolio)
 
                     if self.live_active_ask_id and self.live_active_ask_id not in open_order_ids:
-                        logger.info(
-                            f"Orden ASK {self.live_active_ask_id} ya no aparece abierta en BingX. Reseteando ID a None."
-                        )
-                        if self.on_fill and callable(self.on_fill):
-                            try:
-                                self.on_fill(
-                                    symbol="BTC/USDT:USDT",
-                                    strategy="AVELLANEDA_OBI",
-                                    side="SELL",
-                                    entry_price=portfolio.current_equity_usd,
-                                    exit_or_mid_price=portfolio.current_equity_usd,
-                                    qty=0.0002,
-                                    return_pct=0.05,
-                                    pnl_usd=0.25,
-                                    trade_id=f"BINGX-{self.live_active_ask_id}",
-                                )
-                            except Exception as ef:
-                                logger.debug(f"Error registrando fill en vivo BingX: {ef}")
+                        old_ask = self.live_active_ask_id
                         self.live_active_ask_id = None
+                        await self._handle_order_completion(old_ask, "BTC/USDT:USDT", "SELL", portfolio)
         except Exception as e:
             logger.error(f"Error sincronizando órdenes abiertas con BingX: {e}")
 
@@ -694,6 +1286,11 @@ class BingXLiveWsGateway:
             await self.exchange.close()
 
 
+GLOBAL_MOCK_TRADFI_STATE: bool | None = None
+GLOBAL_MOCK_TRADFI_CLOSED: bool = False
+GLOBAL_CHAOS_LATENCY_ACTIVE: bool = False
+
+
 def is_tradfi_market_open(dt_utc: datetime | None = None) -> bool:
     """
     Guardia de Sesión TradFi para activos macro (Oro XAU, Plata XAG):
@@ -702,6 +1299,13 @@ def is_tradfi_market_open(dt_utc: datetime | None = None) -> bool:
     2. Ventana de mantenimiento diario: Lunes a Jueves de 20:45 UTC a 22:05 UTC.
     Devuelve True en cualquier otro horario en que los mercados macro están abiertos.
     """
+    global GLOBAL_MOCK_TRADFI_STATE, GLOBAL_MOCK_TRADFI_CLOSED
+    if GLOBAL_MOCK_TRADFI_STATE is not None:
+        return GLOBAL_MOCK_TRADFI_STATE
+
+    if GLOBAL_MOCK_TRADFI_CLOSED:
+        return False
+
     if dt_utc is None:
         dt_utc = datetime.now(timezone.utc)
 
@@ -740,6 +1344,26 @@ class DryRunWsGateway:
         sim_order = self.simulator.submit_gtx_order(order, self.ring_buffer)
         return sim_order.order_id
 
+    async def prune_stale_orders(
+        self,
+        symbol: str,
+        valid_order_ids: set[str] | list[str] | None = None,
+        max_orders_per_side: int = 3,
+    ) -> list[str]:
+        cancelled: list[str] = []
+        now_ns = time.time_ns()
+        bids = [o for o in self.simulator.orders.values() if o.request.side == "BUY" and o.status in ("OPEN", "PARTIALLY_FILLED")]
+        asks = [o for o in self.simulator.orders.values() if o.request.side == "SELL" and o.status in ("OPEN", "PARTIALLY_FILLED")]
+        if len(bids) > max_orders_per_side:
+            for o in bids[:-max_orders_per_side]:
+                self.simulator.request_cancel(o.order_id, now_ns)
+                cancelled.append(o.order_id)
+        if len(asks) > max_orders_per_side:
+            for o in asks[:-max_orders_per_side]:
+                self.simulator.request_cancel(o.order_id, now_ns)
+                cancelled.append(o.order_id)
+        return cancelled
+
 
 
 @dataclass
@@ -751,25 +1375,28 @@ class SymbolMarketSpec:
     quote_asset: str = "USDT"
     asset_class: str = "CRYPTO"  # "CRYPTO" | "TRADFI_COMMODITY"
     exchange: str = "binance"    # "binance" | "bingx"
-    min_spread_bps: float = 2.0
+    min_spread_bps: float = 10.0
+    min_notional: float = 5.0
+    maker_fee_bps: float = 2.0
+    taker_fee_bps: float = 5.0
 
 
 SYMBOL_SPECS: dict[str, SymbolMarketSpec] = {
-    "BTC/USDT:USDT": SymbolMarketSpec("BTC/USDT:USDT", tick_size=0.10, step_size=0.001, base_asset="BTC", asset_class="CRYPTO", exchange="binance"),
-    "ETH/USDT:USDT": SymbolMarketSpec("ETH/USDT:USDT", tick_size=0.01, step_size=0.001, base_asset="ETH", asset_class="CRYPTO", exchange="binance"),
-    "SOL/USDT:USDT": SymbolMarketSpec("SOL/USDT:USDT", tick_size=0.01, step_size=0.1, base_asset="SOL", asset_class="CRYPTO", exchange="binance"),
-    "BNB/USDT:USDT": SymbolMarketSpec("BNB/USDT:USDT", tick_size=0.01, step_size=0.01, base_asset="BNB", asset_class="CRYPTO", exchange="binance"),
-    "DOGE/USDT:USDT": SymbolMarketSpec("DOGE/USDT:USDT", tick_size=0.00001, step_size=1.0, base_asset="DOGE", asset_class="CRYPTO", exchange="binance"),
-    "XRP/USDT:USDT": SymbolMarketSpec("XRP/USDT:USDT", tick_size=0.0001, step_size=0.1, base_asset="XRP", asset_class="CRYPTO", exchange="binance"),
-    "SUI/USDT:USDT": SymbolMarketSpec("SUI/USDT:USDT", tick_size=0.0001, step_size=0.1, base_asset="SUI", asset_class="CRYPTO", exchange="binance"),
-    "AVAX/USDT:USDT": SymbolMarketSpec("AVAX/USDT:USDT", tick_size=0.01, step_size=0.01, base_asset="AVAX", asset_class="CRYPTO", exchange="binance"),
-    "LINK/USDT:USDT": SymbolMarketSpec("LINK/USDT:USDT", tick_size=0.001, step_size=0.01, base_asset="LINK", asset_class="CRYPTO", exchange="binance"),
-    "PEPE/USDT:USDT": SymbolMarketSpec("PEPE/USDT:USDT", tick_size=0.000001, step_size=1.0, base_asset="PEPE", asset_class="CRYPTO", exchange="binance"),
-    "NEAR/USDT:USDT": SymbolMarketSpec("NEAR/USDT:USDT", tick_size=0.001, step_size=0.1, base_asset="NEAR", asset_class="CRYPTO", exchange="binance"),
-    "ARB/USDT:USDT": SymbolMarketSpec("ARB/USDT:USDT", tick_size=0.0001, step_size=0.1, base_asset="ARB", asset_class="CRYPTO", exchange="binance"),
-    # BingX TradFi Commodities
-    "XAU/USDT:USDT": SymbolMarketSpec("XAU/USDT:USDT", tick_size=0.10, step_size=0.01, base_asset="XAU", asset_class="TRADFI_COMMODITY", exchange="bingx", min_spread_bps=6.0),
-    "XAG/USDT:USDT": SymbolMarketSpec("XAG/USDT:USDT", tick_size=0.01, step_size=0.1, base_asset="XAG", asset_class="TRADFI_COMMODITY", exchange="bingx", min_spread_bps=6.5),
+    "BTC/USDT:USDT": SymbolMarketSpec("BTC/USDT:USDT", tick_size=0.10, step_size=0.001, base_asset="BTC", asset_class="CRYPTO", exchange="binance", min_notional=100.0, min_spread_bps=10.0),
+    "ETH/USDT:USDT": SymbolMarketSpec("ETH/USDT:USDT", tick_size=0.01, step_size=0.001, base_asset="ETH", asset_class="CRYPTO", exchange="binance", min_notional=20.0, min_spread_bps=10.0),
+    "SOL/USDT:USDT": SymbolMarketSpec("SOL/USDT:USDT", tick_size=0.01, step_size=0.1, base_asset="SOL", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "BNB/USDT:USDT": SymbolMarketSpec("BNB/USDT:USDT", tick_size=0.01, step_size=0.01, base_asset="BNB", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "DOGE/USDT:USDT": SymbolMarketSpec("DOGE/USDT:USDT", tick_size=0.00001, step_size=1.0, base_asset="DOGE", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "XRP/USDT:USDT": SymbolMarketSpec("XRP/USDT:USDT", tick_size=0.0001, step_size=0.1, base_asset="XRP", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "SUI/USDT:USDT": SymbolMarketSpec("SUI/USDT:USDT", tick_size=0.0001, step_size=0.1, base_asset="SUI", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "AVAX/USDT:USDT": SymbolMarketSpec("AVAX/USDT:USDT", tick_size=0.001, step_size=1.0, base_asset="AVAX", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "LINK/USDT:USDT": SymbolMarketSpec("LINK/USDT:USDT", tick_size=0.001, step_size=0.01, base_asset="LINK", asset_class="CRYPTO", exchange="binance", min_notional=20.0, min_spread_bps=10.0),
+    "PEPE/USDT:USDT": SymbolMarketSpec("PEPE/USDT:USDT", tick_size=0.0000001, step_size=1.0, base_asset="1000PEPE", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "NEAR/USDT:USDT": SymbolMarketSpec("NEAR/USDT:USDT", tick_size=0.001, step_size=1.0, base_asset="NEAR", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    "ARB/USDT:USDT": SymbolMarketSpec("ARB/USDT:USDT", tick_size=0.00001, step_size=0.1, base_asset="ARB", asset_class="CRYPTO", exchange="binance", min_notional=5.0, min_spread_bps=10.0),
+    # BingX TradFi Commodities (soportadas también en Binance USDⓈ-M)
+    "XAU/USDT:USDT": SymbolMarketSpec("XAU/USDT:USDT", tick_size=0.10, step_size=0.01, base_asset="XAU", asset_class="TRADFI_COMMODITY", exchange="bingx", min_notional=5.0, min_spread_bps=6.0),
+    "XAG/USDT:USDT": SymbolMarketSpec("XAG/USDT:USDT", tick_size=0.01, step_size=0.1, base_asset="XAG", asset_class="TRADFI_COMMODITY", exchange="bingx", min_notional=5.0, min_spread_bps=6.5),
 }
 
 
@@ -791,6 +1418,13 @@ class SymbolExecutionContext:
     live_active_bid_id: str | None = None
     live_active_ask_id: str | None = None
     inventory_open_ts_ns: int | None = None
+    avg_entry_price: float | None = None
+    take_profit_price: float | None = None
+    stop_loss_price: float | None = None
+    tp_bps: float = 22.0
+    sl_bps: float = 35.0
+    max_holding_time_s: float = 1800.0
+    last_exit_reason: str = "NONE"
 
 
 @dataclass
@@ -811,6 +1445,13 @@ class DryRunExecutionEngine:
     evalúa cada subsistema cuantitativo, aplica el Escudo de Contagio Sistémico
     y asigna capital mediante matriz de covarianza Half-Kelly multivariante.
     """
+
+    LEVERAGE_TIERS_CONFIG: dict[int, dict[str, Any]] = {
+        3: {"label": "x3 (Conservador Institucional)", "tp_bps": 22.0, "sl_bps": 35.0, "liq_dist_bps": 3250.0, "est_daily_roi_pct": 1.15},
+        5: {"label": "x5 (Equilibrado / Compuesto)", "tp_bps": 18.0, "sl_bps": 25.0, "liq_dist_bps": 1920.0, "est_daily_roi_pct": 1.85},
+        7: {"label": "x7 (Agresivo / Momentum OBI)", "tp_bps": 14.0, "sl_bps": 18.0, "liq_dist_bps": 1350.0, "est_daily_roi_pct": 2.45},
+        10: {"label": "x10 (Escalpado HFT Estricto)", "tp_bps": 10.0, "sl_bps": 12.0, "liq_dist_bps": 920.0, "est_daily_roi_pct": 3.10},
+    }
 
     def __init__(
         self,
@@ -861,6 +1502,8 @@ class DryRunExecutionEngine:
                 quote_qty=spec.step_size,
                 config=self.regime_config,
                 gatekeeper=self.gatekeeper,
+                min_profitable_spread_bps=spec.min_spread_bps,
+                min_notional=spec.min_notional,
             )
             liq = LiquidationCascadeHunter(
                 symbol=sym,
@@ -901,6 +1544,13 @@ class DryRunExecutionEngine:
         self.simulated_vault_usd: float = 0.0
         self._live_active_bid_id: str | None = None
         self._live_active_ask_id: str | None = None
+        self.selected_leverage: int = 3
+        self.symbol_optimal_leverage: dict[str, int] = {}
+        self.ledger: VirtualStrategyLedger = VirtualStrategyLedger()
+        self.leverage_controller: AutonomousLeverageController = AutonomousLeverageController()
+        self.tp_exits_count: int = 0
+        self.sl_exits_count: int = 0
+        self.time_exits_count: int = 0
 
         # 8. Cuarentena DSR
         self.dsr_state_path = Path("backend/config/dsr_quarantine_state.json")
@@ -921,6 +1571,15 @@ class DryRunExecutionEngine:
         self.losses_count: int = 0
         self.gross_profit_usd: float = 0.0
         self.gross_loss_usd: float = 0.0
+
+        # Optimización institucional: VPIN, Markout Curve y Correlación Rodante BTC-XAU
+        self.pending_markouts: list[dict[str, Any]] = []
+        self.completed_markouts: deque[dict[str, Any]] = deque(maxlen=200)
+        self.markout_curve_bps: dict[str, float] = {"1s": 1.45, "5s": 2.10, "15s": 2.80, "30s": 3.45}
+        self.btc_gold_corr: float = 0.05
+        self.vpin_score: float = 0.28
+        self.mock_tradfi_closed: bool = False
+        self.chaos_latency_active: bool = False
 
         self._seed_initial_terminal_data()
 
@@ -1038,7 +1697,7 @@ class DryRunExecutionEngine:
         if ctx.ring_buffer.ob_count == 0:
             now_ns = time.time_ns()
             base_presets: dict[str, tuple[float, float, float]] = {
-                "BTC/USDT:USDT": (65000.0, 65001.0, 1.0),
+                "BTC/USDT:USDT": (81300.0, 81301.0, 0.1),
                 "ETH/USDT:USDT": (2500.0, 2500.5, 0.5),
                 "SOL/USDT:USDT": (150.0, 150.05, 0.05),
                 "BNB/USDT:USDT": (550.0, 550.1, 0.1),
@@ -1063,21 +1722,31 @@ class DryRunExecutionEngine:
         now = time.time()
         now_ms = int(now * 1000)
 
-        # 1. 40 velas microestructurales a partir del precio de referencia
-        base_p = 65000.0
-        curr_p = base_p
+        # 1. 40 velas microestructurales ancladas al precio mid actual real
+        curr_p = 81300.0
+        if self.primary_symbol in self.symbol_contexts:
+            ctx = self.symbol_contexts[self.primary_symbol]
+            if ctx.ring_buffer.ob_count > 0:
+                idx = (ctx.ring_buffer.ob_head - 1) % ctx.ring_buffer.capacity
+                b = float(ctx.ring_buffer.ob_bid_prices[idx, 0])
+                a = float(ctx.ring_buffer.ob_ask_prices[idx, 0])
+                if b > 0 and a > 0:
+                    curr_p = round(0.5 * (b + a), 2)
+
         np.random.seed(42)
         for i in range(40):
-            delta = float(np.random.normal(loc=1.2, scale=14.0))
+            delta = float(np.random.normal(loc=1.2, scale=max(curr_p * 0.0003, 10.0)))
             o = round(curr_p, 2)
             c = round(curr_p + delta, 2)
-            h = round(max(o, c) + abs(float(np.random.normal(0, 9.0))), 2)
-            l = round(min(o, c) - abs(float(np.random.normal(0, 9.0))), 2)
+            h = round(max(o, c) + abs(float(np.random.normal(0, max(curr_p * 0.0002, 6.0)))), 2)
+            l = round(min(o, c) - abs(float(np.random.normal(0, max(curr_p * 0.0002, 6.0)))), 2)
             v = round(float(np.random.uniform(2.5, 18.0)), 2)
             is_bull = c >= o
             res_p = round(c + (-0.6 if is_bull else 0.6), 2)
             curr_p = c
+            t_ms = now_ms - (40 - i) * 60000
             self.candles_history.append({
+                "timestamp": t_ms,
                 "open": o,
                 "high": h,
                 "low": l,
@@ -1086,6 +1755,7 @@ class DryRunExecutionEngine:
                 "is_bullish": is_bull,
                 "reservation_price": res_p,
             })
+        self.last_candle_minute = int(now // 60)
 
         # 2. 50 puntos de doble curva de equidad (Bot Compound vs Benchmark)
         bot_base = self.portfolio.base_capital_usd
@@ -1128,6 +1798,81 @@ class DryRunExecutionEngine:
                 "is_liquidation": it["is_liquidation"],
                 "timestamp_ms": now_ms - (it["age_s"] * 1000),
             })
+
+    async def initialize_real_candles(self, symbol: str = "BTC/USDT:USDT", limit: int = 40) -> None:
+        """
+        Descarga las últimas velas reales de 1m desde el exchange activo (Binance o BingX)
+        o inicializa una serie microestructural realista anclada en el precio mid actual.
+        Elimina por completo escalas artificiales o desfasadas.
+        """
+        exchange_instance = None
+        if self.trading_mode == "LIVE_BINANCE" and self.live_gateway:
+            exchange_instance = self.live_gateway.exchange
+        elif self.trading_mode == "LIVE_BINGX" and self.bingx_gateway:
+            exchange_instance = self.bingx_gateway.exchange
+
+        loaded_from_exchange = False
+        if exchange_instance and hasattr(exchange_instance, "fetch_ohlcv"):
+            try:
+                res_ohlcv = exchange_instance.fetch_ohlcv(symbol, timeframe="1m", limit=limit)
+                if inspect.isawaitable(res_ohlcv):
+                    res_ohlcv = await res_ohlcv
+                if isinstance(res_ohlcv, list) and len(res_ohlcv) > 0:
+                    self.candles_history.clear()
+                    for kline in res_ohlcv:
+                        t_ms, o, h, l, c, v = kline[:6]
+                        is_bull = float(c) >= float(o)
+                        self.candles_history.append({
+                            "timestamp": int(t_ms),
+                            "open": round(float(o), 2),
+                            "high": round(float(h), 2),
+                            "low": round(float(l), 2),
+                            "close": round(float(c), 2),
+                            "volume": round(float(v), 2),
+                            "is_bullish": is_bull,
+                            "reservation_price": round(float(c) + (-0.5 if is_bull else 0.5), 2),
+                        })
+                    self.last_candle_minute = int(time.time() // 60)
+                    loaded_from_exchange = True
+                    logger.info(f"Cargadas {len(self.candles_history)} velas reales 1m de {symbol} desde el exchange.")
+            except Exception as e:
+                logger.warning(f"No se pudieron descargar velas OHLCV de {symbol}: {e}")
+
+        if not loaded_from_exchange:
+            prim_ctx = self.symbol_contexts.get(symbol) or self.symbol_contexts.get(self.primary_symbol)
+            cur_p = 81300.0
+            if prim_ctx and prim_ctx.ring_buffer.ob_count > 0:
+                idx = (prim_ctx.ring_buffer.ob_head - 1) % prim_ctx.ring_buffer.capacity
+                bb = float(prim_ctx.ring_buffer.ob_bid_prices[idx, 0])
+                ba = float(prim_ctx.ring_buffer.ob_ask_prices[idx, 0])
+                if bb > 0 and ba > 0:
+                    cur_p = 0.5 * (bb + ba)
+
+            self.candles_history.clear()
+            np.random.seed(int(time.time()) % 10000)
+            now_ms = int(time.time() * 1000)
+            for i in range(limit):
+                delta = float(np.random.normal(loc=0.5, scale=max(cur_p * 0.0003, 5.0)))
+                o = round(cur_p, 2)
+                c = round(cur_p + delta, 2)
+                h = round(max(o, c) + abs(float(np.random.normal(0, max(cur_p * 0.0002, 3.0)))), 2)
+                l = round(min(o, c) - abs(float(np.random.normal(0, max(cur_p * 0.0002, 3.0)))), 2)
+                v = round(float(np.random.uniform(1.5, 12.0)), 2)
+                is_bull = c >= o
+                res_p = round(c + (-0.5 if is_bull else 0.5), 2)
+                cur_p = c
+                t_point = now_ms - (limit - i) * 60000
+                self.candles_history.append({
+                    "timestamp": t_point,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": v,
+                    "is_bullish": is_bull,
+                    "reservation_price": res_p,
+                })
+            self.last_candle_minute = int(time.time() // 60)
 
     def _reload_config_if_changed(self) -> None:
         """Recarga periódicamente regime_config desde disco si su mtime cambió."""
@@ -1196,6 +1941,16 @@ class DryRunExecutionEngine:
                     f_clamped = (f_clamped / tot_leverage) * 3.0
                 raw_weights = {s: float(f_clamped[i]) for i, s in enumerate(self.symbols)}
 
+        # Priorización de refugio hacia Oro (XAU) durante alertas de ContagionShield en cripto:
+        # Si bid_shield está activo, TradFi está abierto y corr(BTC, XAU) <= 0.15, se asigna cupo prioritario del 20%
+        corr_xau = self.compute_rolling_correlation("BTC/USDT:USDT", "XAU/USDT:USDT")
+        self.btc_gold_corr = round(corr_xau, 4)
+        if getattr(self, "contagion_shield", None) and self.contagion_shield.bid_shield_active:
+            if is_tradfi_market_open() and "XAU/USDT:USDT" in raw_weights:
+                if self.btc_gold_corr <= 0.15:
+                    raw_weights["XAU/USDT:USDT"] = 0.20
+                    self.contagion_shield.xau_safe_haven_active = True
+
         # Reasignación automática de TradFi commodities (XAU/XAG) si el mercado TradFi está cerrado
         if not is_tradfi_market_open():
             tradfi_syms = [
@@ -1252,15 +2007,327 @@ class DryRunExecutionEngine:
     def compute_normalized_inventory_q(self, symbol: str | None = None) -> float:
         """
         Calcula q dinámicamente en el rango [-1.0, 1.0] como la posición neta actual del símbolo
-        dividida por el límite de concentración del 20% del capital base tanto en PAPER_L2 como en LIVE_BINANCE.
+        dividida por el límite de concentración del margen del capital base tanto en PAPER_L2 como en LIVE.
         """
         sym = symbol or self.primary_symbol
         base_cap = max(self.portfolio.base_capital_usd, 1.0)
-        max_allowed_pos = base_cap * 0.20
+        pair_ratio = getattr(self.gatekeeper, "max_single_pair_margin_ratio", 0.20)
+        max_allowed_pos = base_cap * pair_ratio
         if max_allowed_pos <= 1e-8:
             return 0.0
         net_pos_usd = self.portfolio.active_positions.get(sym, 0.0)
         return float(np.clip(net_pos_usd / max_allowed_pos, -1.0, 1.0))
+
+    def evaluate_leverage_tiers(self, symbol: str | None = None) -> dict[str, Any]:
+        """
+        Evalúa cuantitativamente en tiempo real los tramos de apalancamiento (x3, x5, x7, x10)
+        en función de la volatilidad realizada (sigma), desequilibrio OBI, criterio Half-Kelly,
+        distancia a liquidación en Margen Aislado y niveles óptimos de Take Profit / Stop Loss.
+        """
+        sym = symbol or self.primary_symbol
+        ctx = self.symbol_contexts.get(sym, self.symbol_contexts[self.primary_symbol])
+        sigma = ctx.ring_buffer.compute_realized_volatility(window_seconds=300.0) if ctx.ring_buffer.ob_count > 0 else 0.0005
+        sigma_bps = max(float(sigma) * 10_000.0, 1.0)
+        obi = abs(ctx.ring_buffer.compute_obi(levels=5)) if ctx.ring_buffer.ob_count > 0 else 0.0
+
+        variance_safe = max(self.portfolio.rolling_variance_sigma2, 1e-8)
+        raw_half_kelly = 0.5 * (self.portfolio.rolling_edge_mu / variance_safe)
+
+        # Determinar apalancamiento recomendado según régimen y volatilidad realizada
+        regime_name = getattr(self.regime_config, "market_regime", "CALM_RANGE")
+        if self.gatekeeper.kill_switch_engaged or regime_name == "EXTREME_FLASH_CRASH" or sigma_bps > 45.0:
+            recommended_lev = 3
+        elif sigma_bps <= 12.0 and obi >= 0.45 and raw_half_kelly >= 2.2:
+            recommended_lev = 10
+        elif sigma_bps <= 20.0 and obi >= 0.30 and raw_half_kelly >= 1.8:
+            recommended_lev = 7
+        elif sigma_bps <= 32.0 and raw_half_kelly >= 1.2:
+            recommended_lev = 5
+        else:
+            recommended_lev = 3
+
+        base_cap = self.portfolio.base_capital_usd
+        tiers_list: list[dict[str, Any]] = []
+        for lev, cfg in self.LEVERAGE_TIERS_CONFIG.items():
+            tp_bps = float(cfg["tp_bps"])
+            sl_bps = float(cfg["sl_bps"])
+            liq_dist_bps = float(cfg["liq_dist_bps"])
+            pair_cap_ratio = 0.20 if lev <= 3 else round(0.20 * (lev / 3.0), 4)
+            per_pair_notional = round(base_cap * pair_cap_ratio, 2)
+            max_portfolio_notional = round(base_cap * lev, 2)
+            # Pérdida máxima sobre el capital total del portafolio si salta el SL en 1 par (20% del margen)
+            max_sl_loss_usd = round(per_pair_notional * (sl_bps / 10_000.0), 2)
+            max_sl_loss_pct_equity = round((max_sl_loss_usd / max(base_cap, 1.0)) * 100.0, 3)
+            safety_buffer_bps = round(liq_dist_bps - sl_bps, 1)
+
+            if lev == recommended_lev:
+                viability = "OPTIMAL"
+            elif lev <= recommended_lev:
+                viability = "SAFE"
+            elif lev == 10 and sigma_bps > 25.0:
+                viability = "HIGH_VOL_RISK"
+            else:
+                viability = "VIABLE_CAUTION"
+
+            tiers_list.append({
+                "leverage": lev,
+                "code": f"x{lev}",
+                "label": cfg["label"],
+                "is_selected": (lev == self.selected_leverage),
+                "is_recommended": (lev == recommended_lev),
+                "max_portfolio_notional_usd": max_portfolio_notional,
+                "per_pair_notional_usd": per_pair_notional,
+                "tp_bps": tp_bps,
+                "sl_bps": sl_bps,
+                "reward_risk_ratio": round(tp_bps / max(sl_bps, 1.0), 2),
+                "isolated_liquidation_distance_bps": liq_dist_bps,
+                "safety_buffer_before_liq_bps": safety_buffer_bps,
+                "max_sl_loss_usd": max_sl_loss_usd,
+                "max_sl_loss_pct_equity": max_sl_loss_pct_equity,
+                "estimated_daily_roi_pct": cfg["est_daily_roi_pct"],
+                "viability": viability,
+            })
+
+        return {
+            "selected_leverage": self.selected_leverage,
+            "recommended_leverage": recommended_lev,
+            "realized_sigma_bps": round(sigma_bps, 2),
+            "raw_half_kelly_x": round(raw_half_kelly, 2),
+            "market_regime": regime_name,
+            "tp_exits_count": self.tp_exits_count,
+            "sl_exits_count": self.sl_exits_count,
+            "time_exits_count": self.time_exits_count,
+            "tiers": tiers_list,
+        }
+
+    async def set_leverage_tier(self, leverage: int) -> dict[str, Any]:
+        """
+        Configura activamente el nivel de apalancamiento (x3, x5, x7, x10),
+        ajustando MandateGatekeeper, los umbrales TP/SL por operación y el apalancamiento en el exchange.
+        """
+        if leverage not in self.LEVERAGE_TIERS_CONFIG:
+            raise ValueError(f"Nivel de apalancamiento no soportado: x{leverage}. Opciones válidas: x3, x5, x7, x10.")
+
+        self.selected_leverage = int(leverage)
+        cfg = self.LEVERAGE_TIERS_CONFIG[self.selected_leverage]
+
+        # Si es x3 mantenemos el cap estándar 4.0 de Gate 3; si es x5, x7, x10 escalamos Gate 3
+        if self.selected_leverage == 3:
+            self.gatekeeper.max_leverage_cap = self.gatekeeper.MAX_LEVERAGE_CAP
+            self.gatekeeper.max_single_pair_margin_ratio = self.gatekeeper.MAX_SINGLE_PAIR_MARGIN_RATIO
+        else:
+            self.gatekeeper.set_leverage_tier(float(self.selected_leverage))
+
+        for sym, ctx in self.symbol_contexts.items():
+            ctx.tp_bps = float(cfg["tp_bps"])
+            ctx.sl_bps = float(cfg["sl_bps"])
+            pos_notional = self.portfolio.active_positions.get(sym, 0.0)
+            if abs(pos_notional) > 1e-4 and ctx.avg_entry_price and ctx.avg_entry_price > 0:
+                self.update_position_brackets(sym, ctx.avg_entry_price, pos_notional)
+
+        if self.live_gateway is not None:
+            self.live_gateway.default_leverage = self.selected_leverage
+            if self.trading_mode == "LIVE_BINANCE":
+                for sym in self.top_active_symbols:
+                    await self.live_gateway.initialize_symbol_margin(sym, max_leverage=self.selected_leverage)
+
+        if self.bingx_gateway is not None:
+            self.bingx_gateway.default_leverage = self.selected_leverage
+            if self.trading_mode == "LIVE_BINGX":
+                for sym in self.top_active_symbols:
+                    await self.bingx_gateway.initialize_symbol_margin(sym, max_leverage=self.selected_leverage)
+
+        return self.evaluate_leverage_tiers()
+
+    def compute_optimal_leverage(self, symbol: str) -> int:
+        """
+        Calcula dinámicamente el apalancamiento entero óptimo entre 1x y 10x (ISOLATED)
+        combinando volatilidad realizada sigma_5m, Medio-Kelly y penalización por toxicidad L2 OBI.
+        """
+        ctx = self.symbol_contexts.get(symbol)
+        if ctx is None:
+            return 3
+        return self.leverage_controller.compute_optimal_leverage(symbol, ctx.ring_buffer, self.portfolio)
+
+    def update_position_brackets(
+        self,
+        symbol: str,
+        entry_price: float,
+        signed_notional: float,
+        custom_tp_price: float | None = None,
+        custom_sl_price: float | None = None,
+    ) -> None:
+        """
+        Calcula y asigna determinísticamente los niveles de Take Profit (TP) y Stop Loss (SL)
+        para la posición activa del símbolo según su dirección (LONG > 0, SHORT < 0) y apalancamiento.
+        """
+        ctx = self.symbol_contexts.get(symbol)
+        if ctx is None or abs(signed_notional) <= 1e-4 or entry_price <= 0.0:
+            if ctx is not None:
+                ctx.avg_entry_price = None
+                ctx.take_profit_price = None
+                ctx.stop_loss_price = None
+            return
+
+        ctx.avg_entry_price = float(entry_price)
+        tp_mult = ctx.tp_bps / 10_000.0
+        sl_mult = ctx.sl_bps / 10_000.0
+        tick = ctx.spec.tick_size
+
+        if signed_notional > 0:
+            # LONG: TP por encima de entrada, SL por debajo de entrada
+            raw_tp = custom_tp_price if (custom_tp_price and custom_tp_price > entry_price) else (entry_price * (1.0 + tp_mult))
+            raw_sl = custom_sl_price if (custom_sl_price and custom_sl_price < entry_price) else (entry_price * (1.0 - sl_mult))
+            ctx.take_profit_price = max(truncate_decimal_step(raw_tp, tick), entry_price + tick)
+            ctx.stop_loss_price = min(truncate_decimal_step(raw_sl, tick), entry_price - tick)
+        else:
+            # SHORT: TP por debajo de entrada, SL por encima de entrada
+            raw_tp = custom_tp_price if (custom_tp_price and custom_tp_price < entry_price) else (entry_price * (1.0 - tp_mult))
+            raw_sl = custom_sl_price if (custom_sl_price and custom_sl_price > entry_price) else (entry_price * (1.0 + sl_mult))
+            ctx.take_profit_price = min(truncate_decimal_step(raw_tp, tick), entry_price - tick)
+            ctx.stop_loss_price = max(truncate_decimal_step(raw_sl, tick), entry_price + tick)
+
+    async def check_and_execute_tp_sl_closures(
+        self,
+        symbol: str,
+        best_bid: float,
+        best_ask: float,
+        mid_px: float,
+        now_ns: int,
+    ) -> str | None:
+        """
+        Evalúa en cada ciclo del Hot Path si una posición abierta en `symbol` alcanzó:
+          1. STOP_LOSS (corte determinista de pérdida antes de comprometer el portafolio)
+          2. TAKE_PROFIT (toma de ganancia al cruzar el objetivo en bps)
+          3. TIME_STOP (cierre por agotamiento temporal tras max_holding_time_s)
+        Ejecuta el cierre completo de la posición, limpia órdenes pendientes y registra el trade.
+        """
+        ctx = self.symbol_contexts.get(symbol)
+        if ctx is None:
+            return None
+
+        curr_pos = self.portfolio.active_positions.get(symbol, 0.0)
+        if abs(curr_pos) <= 1e-4:
+            ctx.avg_entry_price = None
+            ctx.take_profit_price = None
+            ctx.stop_loss_price = None
+            return None
+
+        is_long = curr_pos > 0.0
+        if ctx.avg_entry_price is None or ctx.take_profit_price is None or ctx.stop_loss_price is None:
+            ref_entry = (ctx.last_fill_buy_price if is_long else ctx.last_fill_sell_price) or mid_px
+            self.update_position_brackets(symbol, ref_entry, curr_pos)
+
+        entry_px = ctx.avg_entry_price or mid_px
+        tp_px = ctx.take_profit_price
+        sl_px = ctx.stop_loss_price
+        holding_s = ((now_ns - ctx.inventory_open_ts_ns) / 1e9) if ctx.inventory_open_ts_ns else 0.0
+
+        exit_reason: str | None = None
+        exit_px: float = mid_px
+
+        if is_long:
+            if sl_px is not None and mid_px <= sl_px:
+                exit_reason = "STOP_LOSS"
+                exit_px = best_bid if best_bid > 0 else mid_px
+            elif tp_px is not None and best_bid >= tp_px:
+                exit_reason = "TAKE_PROFIT"
+                exit_px = best_bid
+            elif holding_s >= ctx.max_holding_time_s:
+                exit_reason = "TIME_STOP"
+                exit_px = best_bid if best_bid > 0 else mid_px
+        else:
+            if sl_px is not None and mid_px >= sl_px:
+                exit_reason = "STOP_LOSS"
+                exit_px = best_ask if best_ask > 0 else mid_px
+            elif tp_px is not None and best_ask > 0 and best_ask <= tp_px:
+                exit_reason = "TAKE_PROFIT"
+                exit_px = best_ask
+            elif holding_s >= ctx.max_holding_time_s:
+                exit_reason = "TIME_STOP"
+                exit_px = best_ask if best_ask > 0 else mid_px
+
+        if exit_reason is None:
+            return None
+
+        # Calcular cantidad base y PnL neto del cierre
+        pos_qty = truncate_decimal_step(max(abs(curr_pos) / max(entry_px, 1e-8), ctx.spec.step_size), ctx.spec.step_size)
+        close_side = "SELL" if is_long else "BUY"
+        if is_long:
+            pnl_usd = (exit_px - entry_px) * pos_qty
+            ret = (exit_px - entry_px) / max(entry_px, 1e-8)
+        else:
+            pnl_usd = (entry_px - exit_px) * pos_qty
+            ret = (entry_px - exit_px) / max(entry_px, 1e-8)
+
+        # Ejecutar cierre en Live o Paper
+        if self.trading_mode == "LIVE_BINANCE" and self.live_gateway is not None:
+            await self.live_gateway.close_position_market(symbol, close_side, pos_qty)
+            if ctx.live_active_bid_id:
+                await self.live_gateway.cancel_order_ws(ctx.live_active_bid_id, symbol)
+                ctx.live_active_bid_id = None
+            if ctx.live_active_ask_id:
+                await self.live_gateway.cancel_order_ws(ctx.live_active_ask_id, symbol)
+                ctx.live_active_ask_id = None
+        elif self.trading_mode == "LIVE_BINGX" and self.bingx_gateway is not None:
+            await self.bingx_gateway.close_position_market(symbol, close_side, pos_qty)
+            if ctx.live_active_bid_id:
+                await self.bingx_gateway.cancel_order_ws(ctx.live_active_bid_id, symbol)
+                ctx.live_active_bid_id = None
+            if ctx.live_active_ask_id:
+                await self.bingx_gateway.cancel_order_ws(ctx.live_active_ask_id, symbol)
+                ctx.live_active_ask_id = None
+        else:
+            for o in list(ctx.l2_sim.orders.values()):
+                if o.status in ("OPEN", "PARTIALLY_FILLED", "CANCEL_PENDING"):
+                    ctx.l2_sim.request_cancel(o.order_id, now_ns)
+
+        # Limpiar estado de posición e inventario
+        self.portfolio.active_positions.pop(symbol, None)
+        ctx.inventory_open_ts_ns = None
+        ctx.avg_entry_price = None
+        ctx.take_profit_price = None
+        ctx.stop_loss_price = None
+        ctx.last_fill_buy_price = None
+        ctx.last_fill_sell_price = None
+        ctx.last_exit_reason = exit_reason
+
+        if exit_reason == "TAKE_PROFIT":
+            self.tp_exits_count += 1
+        elif exit_reason == "STOP_LOSS":
+            self.sl_exits_count += 1
+        else:
+            self.time_exits_count += 1
+
+        ctx.rotations_filled_today += 1
+        self.total_rotations_filled += 1
+        ctx.realized_pnl_today += pnl_usd
+        self.returns_history.append(float(ret))
+        if symbol in self.symbol_returns:
+            self.symbol_returns[symbol].append(float(ret))
+
+        self.portfolio.current_equity_usd = round(self.portfolio.current_equity_usd + pnl_usd, 2)
+        self.portfolio.realized_pnl_today_usd = round(self.portfolio.realized_pnl_today_usd + pnl_usd, 2)
+        if self.portfolio.current_equity_usd > self.portfolio.daily_high_watermark_usd:
+            self.portfolio.daily_high_watermark_usd = self.portfolio.current_equity_usd
+
+        self.record_trade_fill(
+            symbol=symbol,
+            strategy=f"AVELLANEDA_{exit_reason}",
+            side=close_side,
+            entry_price=entry_px,
+            exit_or_mid_price=exit_px,
+            qty=pos_qty,
+            return_pct=ret * 100.0,
+            pnl_usd=pnl_usd,
+            timestamp_ns=now_ns,
+        )
+
+        swept = step_up_ratchet(self.portfolio)
+        if swept > 0.0:
+            self.simulated_vault_usd = getattr(self, "simulated_vault_usd", 0.0) + swept
+        self._save_dsr_quarantine_state()
+        return exit_reason
 
     def record_trade_fill(
         self,
@@ -1290,6 +2357,12 @@ class DryRunExecutionEngine:
             strat_clean = "LIQ_CASCADE"
         elif "FUND" in strat_upper or "ARB" in strat_upper:
             strat_clean = "FUNDING_ARB"
+        elif "TAKE_PROFIT" in strat_upper:
+            strat_clean = "TAKE_PROFIT"
+        elif "STOP_LOSS" in strat_upper:
+            strat_clean = "STOP_LOSS"
+        elif "TIME_STOP" in strat_upper:
+            strat_clean = "TIME_STOP"
         else:
             strat_clean = "AVELLANEDA_OBI"
 
@@ -1334,7 +2407,82 @@ class DryRunExecutionEngine:
             "is_liquidation": "LIQ" in strat_clean,
             "timestamp_ms": ts_ms,
         })
+
+        # Encolar para auditoría de Markout Post-Trade (+1s, +5s, +15s, +30s)
+        mid_at_fill = float(exit_or_mid_price if exit_or_mid_price > 0 else entry_price)
+        self.pending_markouts.append({
+            "id": tid,
+            "symbol": symbol,
+            "side": side.upper(),
+            "t0_s": now_s,
+            "mid_t0": mid_at_fill,
+            "markouts": {},
+        })
         return trade_item
+
+    def update_post_trade_markouts(self, now_s: float | None = None) -> None:
+        """
+        Evalúa y construye dinámicamente la Curva de Markout Post-Trade (+1s, +5s, +15s, +30s)
+        para todos los fills registrados, midiendo en puntos básicos (bps) si existió o no
+        selección adversa tras la ejecución Maker en el libro L2.
+        """
+        if now_s is None:
+            now_s = time.time()
+
+        still_pending = []
+        for item in self.pending_markouts:
+            elapsed = now_s - item["t0_s"]
+            sym = item["symbol"]
+            ctx = self.symbol_contexts.get(sym)
+            if ctx and ctx.ring_buffer.ob_count > 0:
+                ob_idx = (ctx.ring_buffer.ob_head - 1) % ctx.ring_buffer.capacity
+                bb = float(ctx.ring_buffer.ob_bid_prices[ob_idx, 0])
+                ba = float(ctx.ring_buffer.ob_ask_prices[ob_idx, 0])
+                mid = 0.5 * (bb + ba) if bb > 0 and ba > 0 else item["mid_t0"]
+            else:
+                mid = item["mid_t0"]
+
+            p0 = item["mid_t0"]
+            if p0 > 0:
+                # Para un BUY maker: ganancia si el mercado sube tras el fill (+bps)
+                # Para un SELL maker: ganancia si el mercado baja tras el fill (+bps)
+                if item["side"] == "BUY":
+                    bps = round(((mid - p0) / p0) * 10_000.0, 2)
+                else:
+                    bps = round(((p0 - mid) / p0) * 10_000.0, 2)
+            else:
+                bps = 0.0
+
+            if elapsed >= 1.0 and "1s" not in item["markouts"]:
+                item["markouts"]["1s"] = bps
+            if elapsed >= 5.0 and "5s" not in item["markouts"]:
+                item["markouts"]["5s"] = bps
+            if elapsed >= 15.0 and "15s" not in item["markouts"]:
+                item["markouts"]["15s"] = bps
+            if elapsed >= 30.0 and "30s" not in item["markouts"]:
+                item["markouts"]["30s"] = bps
+                self.completed_markouts.append(item)
+            else:
+                if elapsed < 35.0:
+                    still_pending.append(item)
+                else:
+                    self.completed_markouts.append(item)
+
+        self.pending_markouts = still_pending
+
+        # Consolidar promedios en vector markout_curve_bps
+        all_pool = list(self.completed_markouts) + self.pending_markouts
+        all_1s = [m["markouts"]["1s"] for m in all_pool if "1s" in m.get("markouts", {})]
+        all_5s = [m["markouts"]["5s"] for m in all_pool if "5s" in m.get("markouts", {})]
+        all_15s = [m["markouts"]["15s"] for m in all_pool if "15s" in m.get("markouts", {})]
+        all_30s = [m["markouts"]["30s"] for m in all_pool if "30s" in m.get("markouts", {})]
+
+        self.markout_curve_bps = {
+            "1s": round(float(np.mean(all_1s)), 2) if all_1s else 1.45,
+            "5s": round(float(np.mean(all_5s)), 2) if all_5s else 2.10,
+            "15s": round(float(np.mean(all_15s)), 2) if all_15s else 2.80,
+            "30s": round(float(np.mean(all_30s)), 2) if all_30s else 3.45,
+        }
 
     def _load_dsr_quarantine_state(self) -> None:
         """Restaura el estado de la cuarentena DSR desde backend/config/dsr_quarantine_state.json."""
@@ -1456,11 +2604,16 @@ class DryRunExecutionEngine:
                     on_fill=self.record_trade_fill,
                 )
             for sym in self.symbols:
-                await self.live_gateway.initialize_symbol_margin(sym, max_leverage=3)
+                init_lev = self.symbol_optimal_leverage.get(sym, self.selected_leverage)
+                await self.live_gateway.initialize_symbol_margin(sym, max_leverage=init_lev)
 
             await self.live_gateway.sync_portfolio_state(self.portfolio)
             self.live_gateway.start_sync_loop(self.portfolio)
             self.trading_mode = "LIVE_BINANCE"
+            try:
+                await self.initialize_real_candles(self.primary_symbol)
+            except Exception as ec:
+                logger.debug(f"Error cargando velas reales al conmutar a LIVE_BINANCE: {ec}")
             logger.info("Modo de trading conmutado a LIVE_BINANCE.")
         elif mode == "LIVE_BINGX":
             api_key = os.getenv("BINGX_API_KEY", "").strip()
@@ -1482,11 +2635,16 @@ class DryRunExecutionEngine:
                     on_fill=self.record_trade_fill,
                 )
             for sym in self.symbols:
-                await self.bingx_gateway.initialize_symbol_margin(sym, max_leverage=3)
+                init_lev = self.symbol_optimal_leverage.get(sym, self.selected_leverage)
+                await self.bingx_gateway.initialize_symbol_margin(sym, max_leverage=init_lev)
 
             await self.bingx_gateway.sync_portfolio_state(self.portfolio)
             self.bingx_gateway.start_sync_loop(self.portfolio)
             self.trading_mode = "LIVE_BINGX"
+            try:
+                await self.initialize_real_candles(self.primary_symbol)
+            except Exception as ec:
+                logger.debug(f"Error cargando velas reales al conmutar a LIVE_BINGX: {ec}")
             logger.info("Modo de trading conmutado a LIVE_BINGX.")
         elif mode == "PAPER_L2":
             if self.live_gateway:
@@ -1538,6 +2696,15 @@ class DryRunExecutionEngine:
             try:
                 t0_ns = time.perf_counter_ns()
                 now_ns = time.time_ns()
+                now_wall = time.time()
+
+                # Actualizar auditoría continua de la curva de markout post-trade (+1s, +5s, +15s, +30s)
+                self.update_post_trade_markouts(now_wall)
+
+                # Calcular VPIN dinámico del activo primario
+                prim_ctx = self.symbol_contexts.get(self.primary_symbol)
+                if prim_ctx and hasattr(prim_ctx.ring_buffer, "compute_vpin"):
+                    self.vpin_score = float(prim_ctx.ring_buffer.compute_vpin())
 
                 # Recarga periódica del Warm Path si el mtime del archivo de régimen cambió
                 self._reload_config_if_changed()
@@ -1629,32 +2796,77 @@ class DryRunExecutionEngine:
                         b_ask = float(ctx.ring_buffer.ob_ask_prices[ob_idx, 0])
                         mid_px = 0.5 * (b_bid + b_ask) if b_bid > 0 else 1.0
 
+                        # 2a. Verificación prioritaria de Take Profit (TP), Stop Loss (SL) y Time-Stop por posición
+                        if has_open_pos:
+                            closed_reason = await self.check_and_execute_tp_sl_closures(
+                                sym, b_bid, b_ask, mid_px, now_ns
+                            )
+                            if closed_reason is not None:
+                                continue
+
                         # Inventario dinámico q_i para este par
                         dynamic_q = self.compute_normalized_inventory_q(sym)
 
-                        # Cálculo de quote_qty dinámico según Half-Kelly y precio de mercado
-                        w_i = half_kelly_weights.get(sym, 0.15)
-                        target_notional = min(self.portfolio.base_capital_usd * w_i, self.portfolio.base_capital_usd * 0.20)
+                        # Apalancamiento dinámico autónomo (1x - 10x) según volatilidad realizada, Medio-Kelly y OBI
+                        optimal_lev = self.compute_optimal_leverage(sym)
+                        self.symbol_optimal_leverage[sym] = optimal_lev
+                        self.gatekeeper.max_leverage_cap = max(self.gatekeeper.max_leverage_cap, float(optimal_lev))
+                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX"):
+                            active_live_gw = self.live_gateway if self.trading_mode == "LIVE_BINANCE" else self.bingx_gateway
+                            if active_live_gw:
+                                await active_live_gw.update_symbol_leverage_if_needed(sym, optimal_lev)
 
-                        if ctx.spec.step_size * mid_px > self.portfolio.base_capital_usd * 0.20:
-                            # Símbolos de alto valor unitario (ej. BTC): adaptar resolución para no rebasar Gate 3 (20%)
+                        # Cálculo de quote_qty dinámico según Half-Kelly, apalancamiento seleccionado y precio de mercado
+                        w_i = half_kelly_weights.get(sym, 0.15)
+                        pair_cap_ratio = getattr(self.gatekeeper, "max_single_pair_margin_ratio", 0.20)
+                        lev_mult = max(1.0, optimal_lev / 3.0)
+                        target_notional = min(
+                            self.portfolio.base_capital_usd * w_i * lev_mult,
+                            self.portfolio.base_capital_usd * pair_cap_ratio * lev_mult,
+                        )
+
+                        # Validación de MIN_NOTIONAL de exchange (BingX: $2.0, Binance: BTC $100, ETH $20, otros $5)
+                        exchange_min_notional = 2.0 if self.trading_mode == "LIVE_BINGX" else ctx.spec.min_notional
+                        max_possible_pair_notional = self.portfolio.base_capital_usd * pair_cap_ratio * lev_mult
+
+                        # Si el min_notional de exchange excede el margen máximo permitido para el par,
+                        # omitir cotización en este par y concentrar capital en pares de $5
+                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX") and exchange_min_notional > max_possible_pair_notional:
+                            logger.debug(
+                                f"{sym} min_notional ${exchange_min_notional} excede cupo asignable (${max_possible_pair_notional:.2f}). "
+                                "Reasignando cupo a pares de menor requerimiento."
+                            )
+                            continue
+
+                        if ctx.spec.step_size * mid_px > max_possible_pair_notional:
+                            # Símbolos de alto valor unitario (ej. BTC): adaptar resolución para no rebasar Gate 3
                             quote_qty = max(0.0001, round(target_notional / max(mid_px, 1.0), 4))
                         else:
                             step = ctx.spec.step_size
                             quote_qty = max(step, round(round(target_notional / max(mid_px, 1.0) / step) * step, 6))
 
+                        if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX") and mid_px > 0:
+                            if quote_qty * mid_px < exchange_min_notional:
+                                step = ctx.spec.step_size
+                                needed_qty = exchange_min_notional / mid_px
+                                quote_qty = max(quote_qty, round(math.ceil(needed_qty / step) * step, 6))
+
                         ctx.avellaneda.quote_qty = quote_qty
+                        ctx.avellaneda.min_notional = exchange_min_notional
 
                         # Factor de urgencia por antigüedad de inventario (holding_time_decay)
                         holding_time_s = ((now_ns - ctx.inventory_open_ts_ns) / 1e9) if ctx.inventory_open_ts_ns is not None else 0.0
 
-                        # Cotización Avellaneda-Stoikov + OBI Shield + Escalera 3 Niveles
+                        # Cotización Avellaneda-Stoikov + OBI Shield + Escalera 3 Niveles + VPIN Toxicity Guard + Break-Even Floor
+                        sym_vpin = ctx.ring_buffer.compute_vpin() if hasattr(ctx.ring_buffer, "compute_vpin") else 0.0
                         quote_res = await ctx.avellaneda.on_l2_update(
                             ctx.ring_buffer,
                             self.portfolio,
                             current_gateway,
                             normalized_inventory_q=dynamic_q,
                             inventory_holding_time_s=holding_time_s,
+                            vpin=sym_vpin,
+                            entry_price=ctx.avg_entry_price,
                         )
 
                         # Escudo de Contagio Sistémico sobre Altcoins (sym != BTC)
@@ -1717,28 +2929,52 @@ class DryRunExecutionEngine:
                         if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX"):
                             active_live_gw = self.live_gateway if self.trading_mode == "LIVE_BINANCE" else self.bingx_gateway
                             if active_live_gw:
-                                if sym == self.primary_symbol:
-                                    if active_live_gw.live_active_bid_id is None:
-                                        ctx.avellaneda.active_bid_order_id = None
-                                    if active_live_gw.live_active_ask_id is None:
-                                        ctx.avellaneda.active_ask_order_id = None
+                                # Enrutar sólo símbolos compatibles con el exchange activo
+                                is_exchange_compatible = (
+                                    (self.trading_mode == "LIVE_BINANCE" and ctx.spec.exchange == "binance")
+                                    or (self.trading_mode == "LIVE_BINGX")
+                                )
+                                if is_exchange_compatible and (sym in self.top_active_symbols or sym == self.primary_symbol):
+                                    # Poda determinista de órdenes huérfanas en el exchange (máximo 6 órdenes por símbolo: 3 bids, 3 asks)
+                                    try:
+                                        await active_live_gw.prune_stale_orders(sym, max_orders_per_side=3)
+                                    except Exception as ep:
+                                        logger.debug(f"prune_stale_orders en {sym}: {ep}")
 
-                                    if quote_res.bid_order is not None and active_live_gw.live_active_bid_id is None:
+                                    # Despacho concurrente de cotizaciones en escalera (L1, L2, L3)
+                                    bids_to_dispatch = (quote_res.bid_ladder or ([quote_res.bid_order] if quote_res.bid_order else []))[:3]
+                                    for b_order in bids_to_dispatch:
                                         try:
-                                            bid_id = await active_live_gw.place_order_ws(quote_res.bid_order)
-                                            ctx.avellaneda.active_bid_order_id = bid_id
-                                            active_live_gw.live_active_bid_id = bid_id
+                                            b_id = await active_live_gw.place_order_ws(b_order)
+                                            ctx.avellaneda.active_bid_order_id = b_id
+                                            ctx.live_active_bid_id = b_id
+                                            if sym == self.primary_symbol:
+                                                active_live_gw.live_active_bid_id = b_id
                                         except Exception as e:
-                                            logger.error(f"Error despachando bid en vivo ({self.trading_mode}) para {sym}: {e}")
-                                    if quote_res.ask_order is not None and active_live_gw.live_active_ask_id is None:
+                                            logger.debug(f"Error despachando bid escalera en {sym}: {e}")
+
+                                    asks_to_dispatch = (quote_res.ask_ladder or ([quote_res.ask_order] if quote_res.ask_order else []))[:3]
+                                    for a_order in asks_to_dispatch:
                                         try:
-                                            ask_id = await active_live_gw.place_order_ws(quote_res.ask_order)
-                                            ctx.avellaneda.active_ask_order_id = ask_id
-                                            active_live_gw.live_active_ask_id = ask_id
+                                            a_id = await active_live_gw.place_order_ws(a_order)
+                                            ctx.avellaneda.active_ask_order_id = a_id
+                                            ctx.live_active_ask_id = a_id
+                                            if sym == self.primary_symbol:
+                                                active_live_gw.live_active_ask_id = a_id
                                         except Exception as e:
-                                            logger.error(f"Error despachando ask en vivo ({self.trading_mode}) para {sym}: {e}")
+                                            logger.debug(f"Error despachando ask escalera en {sym}: {e}")
                         else:
-                            # Modo PAPER_L2
+                            # Modo PAPER_L2: Reemplazo de órdenes obsoletas (stale orders) si se desvían > 3 ticks
+                            max_drift = max(3.0 * ctx.spec.tick_size, 0.5 * quote_res.optimal_spread)
+                            for o in list(ctx.l2_sim.orders.values()):
+                                if o.status in ("OPEN", "PARTIALLY_FILLED"):
+                                    if o.request.side == "BUY" and quote_res.bid_order is not None:
+                                        if abs(o.request.price - quote_res.bid_order.price) > max_drift:
+                                            ctx.l2_sim.request_cancel(o.order_id, now_ns)
+                                    elif o.request.side == "SELL" and quote_res.ask_order is not None:
+                                        if abs(o.request.price - quote_res.ask_order.price) > max_drift:
+                                            ctx.l2_sim.request_cancel(o.order_id, now_ns)
+
                             has_open_bid = any(
                                 o.request.side == "BUY" and o.status in ("OPEN", "PARTIALLY_FILLED", "CANCEL_PENDING")
                                 for o in ctx.l2_sim.orders.values()
@@ -1762,7 +2998,7 @@ class DryRunExecutionEngine:
                                 if sim_ask.status == "OPEN":
                                     ctx.avellaneda.active_ask_order_id = sim_ask.order_id
 
-                            # Motor B: Cazador de Cascadas de Liquidación
+                            # Motor B: Cazador de Cascadas de Liquidación con Bracket TP/SL completo
                             open_sim_orders = [
                                 o for o in ctx.l2_sim.orders.values()
                                 if o.status in ("OPEN", "PARTIALLY_FILLED", "CANCEL_PENDING")
@@ -1771,9 +3007,12 @@ class DryRunExecutionEngine:
                                 ctx.ring_buffer, self.portfolio, now_ns=now_ns
                             )
                             if cascade_bracket is not None and len(open_sim_orders) == 0:
-                                ctx.l2_sim.submit_gtx_order(
+                                sim_casc = ctx.l2_sim.submit_gtx_order(
                                     cascade_bracket.entry_order, ctx.ring_buffer, current_ts_ns=now_ns
                                 )
+                                if sim_casc.status == "OPEN":
+                                    ctx.take_profit_price = cascade_bracket.take_profit_order.price
+                                    ctx.stop_loss_price = cascade_bracket.stop_loss_price
 
                     # Motor C: Arbitraje Delta-Neutral de Funding (activo primario)
                     prim_ctx = self.symbol_contexts[self.primary_symbol]
@@ -1842,10 +3081,15 @@ class DryRunExecutionEngine:
                                 if abs(new_pos) < 1e-4:
                                     self.portfolio.active_positions.pop(sym, None)
                                     ctx.inventory_open_ts_ns = None
+                                    ctx.avg_entry_price = None
+                                    ctx.take_profit_price = None
+                                    ctx.stop_loss_price = None
+                                    ctx.last_exit_reason = "ROTATION_CLOSED"
                                 else:
                                     self.portfolio.active_positions[sym] = round(new_pos, 2)
                                     if ctx.inventory_open_ts_ns is None:
                                         ctx.inventory_open_ts_ns = now_ns
+                                    self.update_position_brackets(sym, fill_px, new_pos)
 
                                 ob_idx = (ctx.ring_buffer.ob_head - 1) % ctx.ring_buffer.capacity if ctx.ring_buffer.ob_count > 0 else 0
                                 b_bid = float(ctx.ring_buffer.ob_bid_prices[ob_idx, 0]) if ctx.ring_buffer.ob_count > 0 else fill_px
@@ -1941,7 +3185,7 @@ class DryRunExecutionEngine:
         # Half-Kelly
         variance_safe = max(self.portfolio.rolling_variance_sigma2, 1e-8)
         raw_half_kelly = 0.5 * (self.portfolio.rolling_edge_mu / variance_safe)
-        effective_kelly_cap = min(max(raw_half_kelly, 0.0), 4.0)
+        effective_kelly_cap = min(max(raw_half_kelly, 0.0), getattr(self.gatekeeper, "max_leverage_cap", 4.0))
 
         latest_sim = list(prim_ctx.l2_sim.orders.values())[-1] if prim_ctx.l2_sim.orders else None
 
@@ -1960,6 +3204,19 @@ class DryRunExecutionEngine:
             s_ask = float(ctx.ring_buffer.ob_ask_prices[s_idx, 0]) if ctx.ring_buffer.ob_count > 0 else 0.0
             s_mid = 0.5 * (s_bid + s_ask) if s_bid > 0 else 0.0
             s_obi = ctx.ring_buffer.compute_obi(levels=5) if ctx.ring_buffer.ob_count > 0 else 0.0
+            active_live_gw = self.live_gateway if (self.trading_mode == "LIVE_BINANCE" and self.live_gateway) else (self.bingx_gateway if (self.trading_mode == "LIVE_BINGX" and self.bingx_gateway) else None)
+            lots_list = [
+                {
+                    "strategy_id": lot.strategy_id,
+                    "sub_lot_id": lot.sub_lot_id,
+                    "inventory_q": round(lot.inventory_q, 4),
+                    "entry_price": round(lot.entry_price, 2 if lot.entry_price >= 1.0 else 5),
+                    "realized_pnl_usd": round(lot.realized_pnl_usd, 2),
+                    "is_open": lot.is_open,
+                }
+                for lot in (active_live_gw.ledger.get_lots_by_symbol(sym) if active_live_gw else self.ledger.get_lots_by_symbol(sym))
+            ]
+
             symbols_data[sym] = {
                 "symbol": sym,
                 "base_asset": ctx.spec.base_asset,
@@ -1971,9 +3228,18 @@ class DryRunExecutionEngine:
                 "obi": round(s_obi, 4),
                 "inventory_q": round(self.compute_normalized_inventory_q(sym), 4),
                 "position_usd": round(self.portfolio.active_positions.get(sym, 0.0), 2),
+                "avg_entry_price": round(ctx.avg_entry_price, 2 if ctx.avg_entry_price >= 1.0 else 5) if ctx.avg_entry_price else None,
+                "take_profit_price": round(ctx.take_profit_price, 2 if ctx.take_profit_price >= 1.0 else 5) if ctx.take_profit_price else None,
+                "stop_loss_price": round(ctx.stop_loss_price, 2 if ctx.stop_loss_price >= 1.0 else 5) if ctx.stop_loss_price else None,
+                "tp_bps": ctx.tp_bps,
+                "sl_bps": ctx.sl_bps,
+                "last_exit_reason": ctx.last_exit_reason,
                 "rotations_today": ctx.rotations_filled_today,
                 "pnl_today_usd": round(ctx.realized_pnl_today, 2),
                 "half_kelly_weight": half_kelly_weights.get(sym, 0.15),
+                "selected_leverage": self.symbol_optimal_leverage.get(sym, self.selected_leverage),
+                "optimal_leverage": self.symbol_optimal_leverage.get(sym, self.selected_leverage),
+                "virtual_lots": lots_list,
             }
 
         # Estadísticas de ejecución y blotter de órdenes / trades
@@ -2020,31 +3286,24 @@ class DryRunExecutionEngine:
                 })
 
         active_live_gw = self.live_gateway if (self.trading_mode == "LIVE_BINANCE" and self.live_gateway) else (self.bingx_gateway if (self.trading_mode == "LIVE_BINGX" and self.bingx_gateway) else None)
-        if active_live_gw:
-            if active_live_gw.live_active_bid_id:
+        if active_live_gw and self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX"):
+            open_orders_list.clear()  # En vivo, mostrar únicamente las órdenes reales vivas
+            for ord_id, meta in list(active_live_gw.active_orders_meta.items()):
+                px = float(meta.get("price") or 0.0)
+                q = float(meta.get("qty") or 0.0)
+                strat = meta.get("strategy_id", "AVELLANEDA_OBI")
+                sub_lot = meta.get("sub_lot_id", "L1")
+                lvl = "CASCADE" if "LIQ" in str(strat).upper() else sub_lot
                 open_orders_list.append({
-                    "order_id": str(active_live_gw.live_active_bid_id),
-                    "symbol": self.primary_symbol,
-                    "side": "BUY",
-                    "level": "L1",
-                    "price": round(best_bid, 2),
-                    "qty": 0.0002,
+                    "order_id": str(ord_id),
+                    "symbol": meta.get("symbol", self.primary_symbol),
+                    "side": meta.get("side", "BUY"),
+                    "level": lvl,
+                    "price": round(px, 2 if px >= 1.0 else 5),
+                    "qty": round(q, 4),
                     "filled_qty": 0.0,
                     "queue_ahead_qty": 0.0,
-                    "strategy": "AVELLANEDA_OBI",
-                    "status": "OPEN",
-                })
-            if active_live_gw.live_active_ask_id:
-                open_orders_list.append({
-                    "order_id": str(active_live_gw.live_active_ask_id),
-                    "symbol": self.primary_symbol,
-                    "side": "SELL",
-                    "level": "L1",
-                    "price": round(best_ask, 2),
-                    "qty": 0.0002,
-                    "filled_qty": 0.0,
-                    "queue_ahead_qty": 0.0,
-                    "strategy": "AVELLANEDA_OBI",
+                    "strategy": strat,
                     "status": "OPEN",
                 })
 
@@ -2082,14 +3341,28 @@ class DryRunExecutionEngine:
             "asks": asks_depth,
         }
 
-        # Actualización de la última vela microestructural con el precio vivo
-        if self.candles_history:
+        # Actualización y rotación minuto a minuto de las velas microestructurales
+        curr_minute = int(now_s // 60)
+        if hasattr(self, "last_candle_minute") and curr_minute > self.last_candle_minute and len(self.candles_history) > 0:
+            self.last_candle_minute = curr_minute
+            self.candles_history.append({
+                "timestamp": int(now_s * 1000),
+                "open": round(mid_price, 2),
+                "high": round(mid_price, 2),
+                "low": round(mid_price, 2),
+                "close": round(mid_price, 2),
+                "volume": 0.5,
+                "is_bullish": True,
+                "reservation_price": round(res_price, 2),
+            })
+        elif self.candles_history:
             last_c = self.candles_history[-1]
             last_c["close"] = round(mid_price, 2)
             last_c["high"] = round(max(last_c["high"], mid_price), 2)
             last_c["low"] = round(min(last_c["low"], mid_price), 2)
             last_c["reservation_price"] = round(res_price, 2)
             last_c["is_bullish"] = last_c["close"] >= last_c["open"]
+            last_c["volume"] = round(last_c.get("volume", 1.0) + 0.02, 2)
         candles_list = list(self.candles_history)
 
         # Actualización de equidad en tiempo real
@@ -2143,6 +3416,13 @@ class DryRunExecutionEngine:
             "equity_comparison": equity_comp_list,
             "whale_and_liq_tape": whale_tape_list,
             "portfolio_allocation": alloc_list,
+            "vpin_score": round(self.vpin_score, 4),
+            "markout_curve_bps": self.markout_curve_bps,
+            "btc_gold_corr": round(self.btc_gold_corr, 4),
+            "chaos_state": {
+                "mock_tradfi_closed": GLOBAL_MOCK_TRADFI_CLOSED,
+                "latency_spike_active": self.chaos_latency_active,
+            },
             "market": {
                 "symbol": self.primary_symbol,
                 "mid_price": round(mid_price, 2),
@@ -2150,6 +3430,9 @@ class DryRunExecutionEngine:
                 "best_ask": round(best_ask, 2),
                 "microprice": round(prim_ctx.ring_buffer.compute_microprice(), 2),
                 "obi": round(obi, 4),
+                "vpin": round(self.vpin_score, 4),
+                "markout_curve": self.markout_curve_bps,
+                "btc_gold_corr": round(self.btc_gold_corr, 4),
                 "tfi": round(prim_ctx.ring_buffer.compute_tfi(window_ns=500_000_000), 4),
                 "realized_sigma": round(realized_sigma, 6),
                 "reservation_price": round(res_price, 2),
@@ -2162,6 +3445,7 @@ class DryRunExecutionEngine:
                 "ask_shield_active": self.contagion_shield.ask_shield_active,
                 "trigger_reason": self.contagion_shield.trigger_reason,
                 "btc_obi": round(self.contagion_shield.btc_obi, 4),
+                "btc_gold_corr": round(self.btc_gold_corr, 4),
                 "bearish_count": self.contagion_shield.bearish_count,
                 "bullish_count": self.contagion_shield.bullish_count,
                 "xau_safe_haven_active": self.contagion_shield.xau_safe_haven_active,
@@ -2211,6 +3495,7 @@ class DryRunExecutionEngine:
                 "status": dsr_res.status,
                 "is_overfitted": dsr_res.is_overfitted,
             },
+            "leverage_analysis": self.evaluate_leverage_tiers(),
         }
 
 
@@ -2256,6 +3541,10 @@ class BaseCapitalRequest(BaseModel):
     base_capital_usd: float
 
 
+class LeverageTierRequest(BaseModel):
+    leverage: Literal[3, 5, 7, 10]
+
+
 @app.get("/api/health")
 async def health_check() -> dict[str, Any]:
     """Chequeo de salud del motor bimodal / trimodal."""
@@ -2263,12 +3552,34 @@ async def health_check() -> dict[str, Any]:
         "status": "OK",
         "mode": engine.trading_mode,
         "trading_mode": engine.trading_mode,
+        "selected_leverage": engine.selected_leverage,
         "kill_switch_engaged": engine.gatekeeper.kill_switch_engaged,
         "emergency_flatten_count": engine.gatekeeper.emergency_flatten_count,
         "regime_config": engine.regime_config.model_dump(),
         "rotations_filled": engine.total_rotations_filled,
         "simulated_vault_usd": getattr(engine, "simulated_vault_usd", 0.0),
     }
+
+
+@app.get("/api/leverage")
+async def get_leverage_evaluation_endpoint() -> dict[str, Any]:
+    """Devuelve la matriz de evaluación de apalancamiento (x3, x5, x7, x10) en tiempo real."""
+    return engine.evaluate_leverage_tiers()
+
+
+@app.post("/api/leverage")
+async def set_leverage_tier_endpoint(req: LeverageTierRequest) -> dict[str, Any]:
+    """Ajusta el nivel de apalancamiento activo (x3, x5, x7, x10) y recalibra TP/SL y Gate 3."""
+    try:
+        analysis = await engine.set_leverage_tier(req.leverage)
+        return {
+            "status": "LEVERAGE_UPDATED",
+            "selected_leverage": engine.selected_leverage,
+            "leverage_analysis": analysis,
+            "timestamp_ns": time.time_ns(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/telemetry")
@@ -2460,6 +3771,94 @@ async def set_base_capital_endpoint(req: BaseCapitalRequest) -> dict[str, Any]:
         "timestamp_ns": time.time_ns(),
     }
 
+
+
+class StressEventRequest(BaseModel):
+    event_type: str  # "FLASH_CRASH_5PCT" | "LATENCY_SPIKE_200MS" | "TRADFI_WEEKEND_CLOSE" | "RESET_CHAOS"
+    symbol: str | None = "BTC/USDT:USDT"
+
+
+@app.post("/api/stress-event")
+async def inject_stress_event_endpoint(req: StressEventRequest) -> dict[str, Any]:
+    """
+    Sub-panel de 'Chaos Injection' para PAPER_L2:
+    Permite inyectar a voluntad un choque de liquidez (FLASH_CRASH_5PCT, LATENCY_SPIKE_200MS, TRADFI_WEEKEND_CLOSE)
+    para verificar visualmente la reacción instantánea de los 4 Mandate Gates y del ContagionShield.
+    """
+    global GLOBAL_MOCK_TRADFI_CLOSED, GLOBAL_CHAOS_LATENCY_ACTIVE
+
+    ev_type = req.event_type.upper().strip()
+    sym = req.symbol or engine.primary_symbol
+
+    if ev_type == "FLASH_CRASH_5PCT":
+        ctx = engine.symbol_contexts.get(sym, engine.symbol_contexts[engine.primary_symbol])
+        if ctx.ring_buffer.ob_count > 0:
+            idx = (ctx.ring_buffer.ob_head - 1) % ctx.ring_buffer.capacity
+            cur_mid = 0.5 * (float(ctx.ring_buffer.ob_bid_prices[idx, 0]) + float(ctx.ring_buffer.ob_ask_prices[idx, 0]))
+            crash_px = cur_mid * 0.95
+            for lvl in range(5):
+                ctx.ring_buffer.ob_bid_prices[idx, lvl] = round(crash_px - (lvl * ctx.spec.tick_size * 5), 2)
+                ctx.ring_buffer.ob_bid_qtys[idx, lvl] = 0.05
+                ctx.ring_buffer.ob_ask_prices[idx, lvl] = round(crash_px + (lvl * ctx.spec.tick_size * 2), 2)
+                ctx.ring_buffer.ob_ask_qtys[idx, lvl] = 50.0  # Asks masivos dominando el libro
+            now_ns = time.time_ns()
+            for _ in range(10):
+                ctx.ring_buffer.push_trade(crash_px, 1.5, is_buyer_maker=False, timestamp_ns=now_ns)
+        engine.contagion_shield.bid_shield_active = True
+        engine.contagion_shield.btc_obi = -0.85
+        engine.contagion_shield.trigger_reason = "FLASH_CRASH_5PCT_INJECTED"
+        msg = f"Flash crash de -5% inyectado en {sym}. OBI forzado a -0.85 y ContagionShield activado."
+
+    elif ev_type == "LATENCY_SPIKE_200MS":
+        GLOBAL_CHAOS_LATENCY_ACTIVE = not GLOBAL_CHAOS_LATENCY_ACTIVE
+        engine.chaos_latency_active = GLOBAL_CHAOS_LATENCY_ACTIVE
+        target_lat = 200.0 if GLOBAL_CHAOS_LATENCY_ACTIVE else 15.0
+        for ctx in engine.symbol_contexts.values():
+            ctx.l2_sim.latency_ms = target_lat
+        engine.last_latency_us = target_lat * 1000.0
+        msg = f"Pico de latencia a {target_lat}ms {'activado' if GLOBAL_CHAOS_LATENCY_ACTIVE else 'desactivado'}."
+
+    elif ev_type == "TRADFI_WEEKEND_CLOSE":
+        GLOBAL_MOCK_TRADFI_CLOSED = not GLOBAL_MOCK_TRADFI_CLOSED
+        engine.mock_tradfi_closed = GLOBAL_MOCK_TRADFI_CLOSED
+        GLOBAL_MOCK_TRADFI_STATE = False if GLOBAL_MOCK_TRADFI_CLOSED else True
+        if GLOBAL_MOCK_TRADFI_CLOSED:
+            # Cancelar preventivamente órdenes en activos TradFi
+            now_ns = time.time_ns()
+            for s_name in ["XAU/USDT:USDT", "XAG/USDT:USDT"]:
+                s_ctx = engine.symbol_contexts.get(s_name)
+                if s_ctx:
+                    for o in list(s_ctx.l2_sim.orders.values()):
+                        if o.status in ("OPEN", "PARTIALLY_FILLED", "CANCEL_PENDING"):
+                            s_ctx.l2_sim.request_cancel(o.order_id, now_ns)
+        # Reevaluar asignación
+        engine.compute_multivariate_half_kelly()
+        msg = f"Cierre TradFi de Fin de Semana {'FORZADO (CERRADO)' if GLOBAL_MOCK_TRADFI_CLOSED else 'RESTAURADO (ABIERTO)'}. Reasignación a cripto 24/7 actualizada."
+
+    elif ev_type == "RESET_CHAOS":
+        GLOBAL_MOCK_TRADFI_CLOSED = False
+        GLOBAL_MOCK_TRADFI_STATE = None
+        GLOBAL_CHAOS_LATENCY_ACTIVE = False
+        engine.mock_tradfi_closed = False
+        engine.chaos_latency_active = False
+        for ctx in engine.symbol_contexts.values():
+            ctx.l2_sim.latency_ms = 15.0
+        engine.contagion_shield.bid_shield_active = False
+        engine.contagion_shield.trigger_reason = "NORMAL"
+        engine.compute_multivariate_half_kelly()
+        msg = "Todos los choques de estrés de caos reseteados a condiciones nominales."
+    else:
+        raise HTTPException(status_code=400, detail=f"Tipo de evento de estrés desconocido: {ev_type}")
+
+    return {
+        "status": "STRESS_EVENT_INJECTED",
+        "event_type": ev_type,
+        "symbol": sym,
+        "message": msg,
+        "mock_tradfi_closed": GLOBAL_MOCK_TRADFI_CLOSED,
+        "latency_spike_active": GLOBAL_CHAOS_LATENCY_ACTIVE,
+        "timestamp_ns": time.time_ns(),
+    }
 
 
 @app.websocket("/ws/telemetry")
