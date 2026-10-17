@@ -251,3 +251,145 @@ async def test_api_profit_sweep_live_binance(mock_exchange: MagicMock) -> None:
     # Reset back to PAPER_L2
     engine.trading_mode = "PAPER_L2"
     engine.simulated_vault_usd = 0.0
+
+
+@pytest.mark.asyncio
+async def test_cold_reconciliation_persists_to_ledger_and_db_store(mock_exchange: MagicMock) -> None:
+    """
+    Verifica que la reconciliación en frío de posiciones preexistentes registre
+    correctamente en VirtualStrategyLedger y persista atómicamente en LedgerSqliteStore (SQLite WAL).
+    """
+    from backend.database.ledger_store import LedgerSqliteStore
+
+    db_store = LedgerSqliteStore(":memory:")
+    mock_exchange.fetch_positions = AsyncMock(
+        return_value=[
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": 0.5,
+                "entryPrice": 62000.0,
+                "info": {
+                    "positionAmt": "0.5",
+                    "entryPrice": "62000.0",
+                    "breakEvenPrice": "62015.0",
+                },
+            }
+        ]
+    )
+
+    gateway = BinanceLiveWsGateway(exchange=mock_exchange, db_store=db_store)
+    reconciled = await gateway.reconcile_existing_positions(["BTC/USDT:USDT"])
+
+    assert len(reconciled) == 1
+    assert reconciled[0]["symbol"] == "BTC/USDT:USDT"
+    assert reconciled[0]["qty"] == 0.5
+    assert reconciled[0]["entry_price"] == 62000.0
+    assert reconciled[0]["break_even_price"] == 62015.0
+
+    # 1. Verificación en VirtualStrategyLedger
+    assert gateway.ledger.get_net_inventory("BTC/USDT:USDT") == 0.5
+    lot_key = "BTC/USDT:USDT::AVELLANEDA_OBI::MAIN"
+    lot = gateway.ledger.lots.get(lot_key)
+    assert lot is not None
+    assert lot.inventory_q == 0.5
+    assert lot.break_even_price == 62015.0
+
+    # 2. Verificación en LedgerSqliteStore (disco / memoria WAL)
+    lots_dict = db_store.load_lots()
+    assert lot_key in lots_dict
+    saved = lots_dict[lot_key]
+    assert saved["symbol"] == "BTC/USDT:USDT"
+    assert saved["inventory_q"] == 0.5
+    assert saved["entry_price"] == 62000.0
+    assert saved["break_even_price"] == 62015.0
+
+
+@pytest.mark.asyncio
+async def test_update_symbol_leverage_blocks_reduction_with_open_position_avoids_4161(mock_exchange: MagicMock) -> None:
+    """
+    Verifica que las solicitudes de reducción de apalancamiento sean bloqueadas
+    proactivamente cuando existen posiciones abiertas, previniendo el error -4161 de Binance.
+    """
+    mock_exchange.set_leverage.reset_mock()
+    gateway = BinanceLiveWsGateway(exchange=mock_exchange)
+    gateway.symbol_leverage["BTC/USDT:USDT"] = 5
+    gateway.default_leverage = 5
+
+    # Simular posición abierta de 0.5 BTC ($30.000 notional)
+    portfolio = PortfolioState(
+        base_capital_usd=10_000.0,
+        current_equity_usd=10_000.0,
+        daily_high_watermark_usd=10_000.0,
+        realized_pnl_today_usd=0.0,
+        active_positions={"BTC/USDT:USDT": 30000.0},
+        rolling_edge_mu=0.045,
+        rolling_variance_sigma2=0.0090,
+    )
+    gateway.portfolio = portfolio
+
+    # 1. Intentar reducir de 5x a 3x con posición abierta -> DEBE BLOQUEARSE
+    changed = await gateway.update_symbol_leverage_if_needed("BTC/USDT:USDT", optimal_leverage=3)
+    assert changed is False
+    mock_exchange.set_leverage.assert_not_called()
+    assert gateway.symbol_leverage["BTC/USDT:USDT"] == 5
+
+    # 2. initialize_symbol_margin con apalancamiento inferior también debe bloquear set_leverage
+    await gateway.initialize_symbol_margin("BTC/USDT:USDT", max_leverage=3)
+    mock_exchange.set_leverage.assert_not_called()
+
+    # 3. Limpiar posición abierta -> AHORA SÍ debe permitir reducir apalancamiento
+    portfolio.active_positions.clear()
+    changed_after = await gateway.update_symbol_leverage_if_needed("BTC/USDT:USDT", optimal_leverage=3)
+    assert changed_after is True
+    mock_exchange.set_leverage.assert_awaited_once_with(3, "BTC/USDT:USDT")
+    assert gateway.symbol_leverage["BTC/USDT:USDT"] == 3
+
+
+@pytest.mark.asyncio
+async def test_place_order_ws_handles_5022_order_immediately_fillable_cleanly(mock_exchange: MagicMock) -> None:
+    """
+    Verifica que el error -5022 (OrderImmediatelyFillable / post-only cross)
+    se capture limpiamente, ajustando el precio 1 tick hacia afuera para reintentar,
+    o descartando sin excepción no controlada si el libro sigue cruzando.
+    """
+    order = OrderRequest(
+        symbol="BTC/USDT:USDT",
+        side="BUY",
+        order_type="LIMIT",
+        price=65000.0,
+        qty=0.01,
+        time_in_force="GTX",
+        margin_mode="ISOLATED",
+        strategy_id="AVELLANEDA_OBI",
+        timestamp_ns=1_000_000_000,
+    )
+
+    # Caso 1: Primer envío lanza -5022, el reintento ajustado en tick tiene éxito
+    mock_exchange.create_order = AsyncMock(
+        side_effect=[
+            Exception("binance -5022 OrderImmediatelyFillable: Post-only order would immediately match and take."),
+            {"id": "binance_retry_success_888", "status": "open"},
+        ]
+    )
+    mock_exchange.create_order_ws = None
+
+    gateway1 = BinanceLiveWsGateway(exchange=mock_exchange)
+    order_id1 = await gateway1.place_order_ws(order)
+
+    assert order_id1 == "binance_retry_success_888"
+    assert mock_exchange.create_order.await_count == 2
+    # El segundo llamado debe haber ajustado el precio 1 tick hacia abajo para BUY (65000.0 - 0.1 = 64999.9)
+    second_call_price = mock_exchange.create_order.await_args_list[1].kwargs["price"]
+    assert second_call_price < 65000.0
+
+    # Caso 2: El reintento también falla con -5022 -> se descarta limpiamente retornando ""
+    mock_exchange.create_order.reset_mock()
+    mock_exchange.create_order = AsyncMock(
+        side_effect=Exception("binance -5022 OrderImmediatelyFillable: still crossing")
+    )
+
+    gateway2 = BinanceLiveWsGateway(exchange=mock_exchange)
+    order_id2 = await gateway2.place_order_ws(order)
+
+    assert order_id2 == ""
+

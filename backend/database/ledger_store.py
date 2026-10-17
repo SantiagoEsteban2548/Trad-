@@ -1,6 +1,7 @@
 # backend/database/ledger_store.py
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -23,13 +24,26 @@ class LedgerSqliteStore:
 
     def __init__(self, db_path: str = "backend/data/trades_ledger.db") -> None:
         self.db_path = db_path
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self._lock = threading.Lock()
+        self._memory_conn: sqlite3.Connection | None = None
+        if self.db_path == ":memory:":
+            self._memory_conn = sqlite3.connect(":memory:", check_same_thread=False, timeout=10.0)
+            self._memory_conn.row_factory = sqlite3.Row
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
+        if self._memory_conn is not None:
+            return self._memory_conn
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10.0)
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception as e:
+            logger.debug(f"SQLite PRAGMA setup warning: {e}")
         return conn
 
     def _init_db(self) -> None:
@@ -376,3 +390,68 @@ class LedgerSqliteStore:
                         "timestamp_ms": r["timestamp_ms"],
                     })
                 return results
+
+    async def save_trade_async(self, trade: dict[str, Any], exchange: str = "BINANCE") -> None:
+        """Versión asíncrona no bloqueante de save_trade para el Event Loop."""
+        await asyncio.to_thread(self.save_trade, trade, exchange)
+
+    async def save_metrics_async(
+        self,
+        wins_count: int,
+        losses_count: int,
+        gross_profit_usd: float,
+        gross_loss_usd: float,
+        current_equity_usd: float,
+    ) -> None:
+        """Versión asíncrona no bloqueante de save_metrics para el Event Loop."""
+        await asyncio.to_thread(
+            self.save_metrics,
+            wins_count,
+            losses_count,
+            gross_profit_usd,
+            gross_loss_usd,
+            current_equity_usd,
+        )
+
+    async def save_lot_async(
+        self,
+        lot_key: str,
+        symbol: str,
+        strategy_id: str,
+        sub_lot_id: str,
+        inventory_q: float,
+        entry_price: float,
+        break_even_price: float,
+        entry_ts_ns: int,
+        realized_pnl_usd: float,
+        take_profit_price: float | None = None,
+        stop_loss_price: float | None = None,
+    ) -> None:
+        """Versión asíncrona no bloqueante de save_lot para el Event Loop."""
+        await asyncio.to_thread(
+            self.save_lot,
+            lot_key,
+            symbol,
+            strategy_id,
+            sub_lot_id,
+            inventory_q,
+            entry_price,
+            break_even_price,
+            entry_ts_ns,
+            realized_pnl_usd,
+            take_profit_price,
+            stop_loss_price,
+        )
+
+    async def save_markout_async(self, markout: dict[str, Any]) -> None:
+        """Versión asíncrona no bloqueante de save_markout para el Event Loop."""
+        await asyncio.to_thread(self.save_markout, markout)
+
+    async def load_recent_trades_async(self, limit: int | None = 1000) -> list[dict[str, Any]]:
+        """Versión asíncrona no bloqueante de load_recent_trades para el Event Loop."""
+        return await asyncio.to_thread(self.load_recent_trades, limit)
+
+    async def load_metrics_async(self) -> dict[str, Any] | None:
+        """Versión asíncrona no bloqueante de load_metrics para el Event Loop."""
+        return await asyncio.to_thread(self.load_metrics)
+

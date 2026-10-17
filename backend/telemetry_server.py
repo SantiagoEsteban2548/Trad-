@@ -109,6 +109,7 @@ class BinanceLiveWsGateway:
         portfolio: PortfolioState | None = None,
         exchange: Any | None = None,
         on_fill: Any | None = None,
+        db_store: Any | None = None,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.getenv("BINANCE_API_KEY", "").strip()
         self.api_secret = api_secret if api_secret is not None else os.getenv("BINANCE_API_SECRET", "").strip()
@@ -120,6 +121,7 @@ class BinanceLiveWsGateway:
         self.gatekeeper = gatekeeper
         self.portfolio = portfolio
         self.on_fill = on_fill
+        self.db_store = db_store
         self.default_leverage: int = 3
         self.symbol_leverage: dict[str, int] = {}
         self.ledger = VirtualStrategyLedger()
@@ -136,9 +138,13 @@ class BinanceLiveWsGateway:
         self._last_trade_ts_ms: dict[str, int] = {}
         self._processed_trade_ids: set[str] = set()
         self._init_ts_ms: int = int(time.time() * 1000)
+        self._time_synced: bool = False
 
         if exchange is not None:
             self.exchange = exchange
+            if hasattr(self.exchange, "options") and isinstance(self.exchange.options, dict):
+                self.exchange.options.setdefault("adjustForTimeDifference", True)
+                self.exchange.options.setdefault("recvWindow", 10000)
         else:
             config: dict[str, Any] = {
                 "apiKey": self.api_key,
@@ -147,7 +153,7 @@ class BinanceLiveWsGateway:
                 "options": {
                     "defaultType": "swap",
                     "adjustForTimeDifference": True,
-                    "recvWindow": 60000,
+                    "recvWindow": 10000,
                     "fetchOpenOrders": {
                         "warnWithoutSymbol": False,
                     },
@@ -163,6 +169,18 @@ class BinanceLiveWsGateway:
                         self.exchange.set_sandbox_mode(True)
                     except Exception:
                         pass
+
+    async def sync_time_difference(self) -> None:
+        """Sincroniza la diferencia de reloj con Binance para evitar rechazos -1021 en Windows."""
+        if hasattr(self.exchange, "load_time_difference") and callable(self.exchange.load_time_difference):
+            try:
+                diff = await self.exchange.load_time_difference()
+                logger.info(f"[BinanceLiveWsGateway] Sincronización de reloj con Binance completada (offset: {diff} ms).")
+                self._time_synced = True
+            except Exception as e:
+                logger.warning(f"[BinanceLiveWsGateway] Advertencia al sincronizar reloj con Binance: {e}")
+        else:
+            self._time_synced = True
 
     def resolve_binance_symbol(self, symbol: str) -> str:
         """Traduce símbolos canónicos a nombres nativos de Binance USD(S)-M si difieren."""
@@ -184,8 +202,6 @@ class BinanceLiveWsGateway:
         if spec and spec.exchange != "binance":
             return
         target_sym = self.resolve_binance_symbol(symbol)
-        self.default_leverage = int(max_leverage)
-        self.symbol_leverage[symbol] = int(max_leverage)
         try:
             if hasattr(self.exchange, "set_position_mode"):
                 await self.exchange.set_position_mode(hedged=False, symbol=target_sym)
@@ -196,8 +212,30 @@ class BinanceLiveWsGateway:
         except Exception as e:
             # En Binance retorna error si el modo ya estaba fijado previamente en ISOLATED
             logger.info(f"set_margin_mode ISOLATED en {target_sym}: {e}")
+        cur_lev = self.symbol_leverage.get(symbol, self.default_leverage)
+        has_pos = False
+        if self.portfolio and self.portfolio.active_positions:
+            pos_val = float(self.portfolio.active_positions.get(symbol, 0.0) or self.portfolio.active_positions.get(target_sym, 0.0) or 0.0)
+            has_pos = abs(pos_val) > 1e-6
+        if not has_pos and hasattr(self, "ledger") and self.ledger is not None:
+            has_pos = abs(self.ledger.get_net_inventory(symbol)) > 1e-6
+        has_orders = (
+            symbol in self.active_bids_by_symbol
+            or symbol in self.active_asks_by_symbol
+            or any(m.get("symbol") in (symbol, target_sym) for m in self.active_orders_meta.values())
+        )
+        if int(max_leverage) < cur_lev and (has_pos or has_orders):
+            logger.info(
+                f"set_leverage {max_leverage} omitido/bloqueado en {target_sym} "
+                "para evitar -4161 (posición u órdenes abiertas)."
+            )
+            self.initialized_symbols.add(symbol)
+            return
+
         try:
             await self.exchange.set_leverage(max_leverage, target_sym)
+            self.default_leverage = int(max_leverage)
+            self.symbol_leverage[symbol] = int(max_leverage)
             self.initialized_symbols.add(symbol)
         except Exception as e:
             if "-4161" in str(e) or "leverage reduction" in str(e).lower():
@@ -228,6 +266,8 @@ class BinanceLiveWsGateway:
             if self.portfolio and self.portfolio.active_positions:
                 pos_val = float(self.portfolio.active_positions.get(symbol, 0.0) or self.portfolio.active_positions.get(target_sym, 0.0) or 0.0)
                 has_pos = abs(pos_val) > 1e-6
+            if not has_pos and hasattr(self, "ledger") and self.ledger is not None:
+                has_pos = abs(self.ledger.get_net_inventory(symbol)) > 1e-6
             has_orders = (
                 symbol in self.active_bids_by_symbol
                 or symbol in self.active_asks_by_symbol
@@ -318,17 +358,30 @@ class BinanceLiveWsGateway:
                 cid_retry = self.ledger.generate_client_order_id(order.strategy_id)
                 order_params["clientOrderId"] = cid_retry
                 order_params["newClientOrderId"] = cid_retry
-                res = await order_fn(
-                    symbol=target_sym,
-                    type="limit",
-                    side=side_str,
-                    amount=order.qty,
-                    price=adj_price,
-                    params=order_params,
-                )
-                cid = cid_retry
+                try:
+                    res = await order_fn(
+                        symbol=target_sym,
+                        type="limit",
+                        side=side_str,
+                        amount=order.qty,
+                        price=adj_price,
+                        params=order_params,
+                    )
+                    cid = cid_retry
+                except Exception as e_retry:
+                    err_retry = str(e_retry).lower()
+                    if "-5022" in str(e_retry) or "immediately" in err_retry or "post only" in err_retry:
+                        logger.warning(
+                            f"Post-Only reintento descartado limpiamente tras -5022 en {order.symbol}: {e_retry}"
+                        )
+                        return ""
+                    raise
             else:
                 raise
+
+        if not res or not isinstance(res, dict) or "id" not in res:
+            logger.warning(f"Respuesta inválida o nula de orden en Binance ({order.symbol}): {res}")
+            return ""
 
         order_id = str(res["id"])
         strat, sub_lot = self.ledger.parse_client_order_id(cid)
@@ -831,6 +884,9 @@ class BinanceLiveWsGateway:
         y positivo para LONG). Además, verifica las órdenes abiertas en Binance y
         registra fills confirmados con sus metadatos reales.
         """
+        if not getattr(self, "_time_synced", False):
+            await self.sync_time_difference()
+
         try:
             bal = await self.exchange.fetch_balance()
             total_usdt = 0.0
@@ -1066,7 +1122,7 @@ class BinanceLiveWsGateway:
                 entry_px = float(pos.get("entryPrice") or pos.get("info", {}).get("entryPrice") or 0.0)
                 be_px = float(pos.get("info", {}).get("breakEvenPrice") or entry_px)
                 side = "SELL" if is_short else "BUY"
-                self.ledger.reconcile_position(
+                lot = self.ledger.reconcile_position(
                     symbol=sym,
                     side=side,
                     quantity=qty,
@@ -1075,6 +1131,23 @@ class BinanceLiveWsGateway:
                     strategy_id="AVELLANEDA_OBI",
                     sub_lot_id="MAIN",
                 )
+                if hasattr(self, "db_store") and self.db_store is not None:
+                    try:
+                        lot_k = lot.key
+                        signed_q = qty if side == "BUY" else -qty
+                        self.db_store.save_lot(
+                            lot_key=lot_k,
+                            symbol=sym,
+                            strategy_id="AVELLANEDA_OBI",
+                            sub_lot_id="MAIN",
+                            inventory_q=signed_q,
+                            entry_price=entry_px,
+                            break_even_price=be_px,
+                            entry_ts_ns=time.time_ns(),
+                            realized_pnl_usd=0.0,
+                        )
+                    except Exception as e_lot:
+                        logger.error(f"Error persistiendo lote reconciliado en db_store: {e_lot}")
                 reconciled.append({
                     "symbol": sym,
                     "side": side,
@@ -1226,6 +1299,7 @@ class BingXLiveWsGateway:
         portfolio: PortfolioState | None = None,
         exchange: Any | None = None,
         on_fill: Any | None = None,
+        db_store: Any | None = None,
     ) -> None:
         self.api_key = api_key if api_key is not None else os.getenv("BINGX_API_KEY", "").strip()
         self.api_secret = api_secret if api_secret is not None else os.getenv("BINGX_API_SECRET", "").strip()
@@ -1237,6 +1311,7 @@ class BingXLiveWsGateway:
         self.gatekeeper = gatekeeper
         self.portfolio = portfolio
         self.on_fill = on_fill
+        self.db_store = db_store
         self.default_leverage: int = 3
         self.symbol_leverage: dict[str, int] = {}
         self.ledger = VirtualStrategyLedger()
@@ -1258,9 +1333,13 @@ class BingXLiveWsGateway:
         self._last_trade_ts_ms: dict[str, int] = {}
         self._processed_trade_ids: set[str] = set()
         self._init_ts_ms: int = int(time.time() * 1000)
+        self._time_synced: bool = False
 
         if exchange is not None:
             self.exchange = exchange
+            if hasattr(self.exchange, "options") and isinstance(self.exchange.options, dict):
+                self.exchange.options.setdefault("adjustForTimeDifference", True)
+                self.exchange.options.setdefault("recvWindow", 10000)
         else:
             config: dict[str, Any] = {
                 "apiKey": self.api_key,
@@ -1268,6 +1347,8 @@ class BingXLiveWsGateway:
                 "enableRateLimit": True,
                 "options": {
                     "defaultType": "swap",
+                    "adjustForTimeDifference": True,
+                    "recvWindow": 10000,
                     "fetchOpenOrders": {
                         "warnWithoutSymbol": False,
                     },
@@ -1281,6 +1362,18 @@ class BingXLiveWsGateway:
                         self.exchange.set_sandbox_mode(True)
                     except Exception:
                         pass
+
+    async def sync_time_difference(self) -> None:
+        """Sincroniza la diferencia de reloj con BingX para evitar rechazos -1021 en Windows."""
+        if hasattr(self.exchange, "load_time_difference") and callable(self.exchange.load_time_difference):
+            try:
+                diff = await self.exchange.load_time_difference()
+                logger.info(f"[BingXLiveWsGateway] Sincronización de reloj con BingX completada (offset: {diff} ms).")
+                self._time_synced = True
+            except Exception as e:
+                logger.warning(f"[BingXLiveWsGateway] Advertencia al sincronizar reloj con BingX: {e}")
+        else:
+            self._time_synced = True
 
     def resolve_bingx_symbol(self, symbol: str) -> str:
         """Traduce símbolos a nombres nativos de BingX swap si difieren del estándar."""
@@ -1305,8 +1398,6 @@ class BingXLiveWsGateway:
                 logger.debug(f"load_markets en BingX: {em}")
 
         target_sym = self.resolve_bingx_symbol(symbol)
-        self.default_leverage = int(max_leverage)
-        self.symbol_leverage[symbol] = int(max_leverage)
         try:
             if hasattr(self.exchange, "set_position_mode"):
                 await self.exchange.set_position_mode(False, target_sym)
@@ -1318,11 +1409,35 @@ class BingXLiveWsGateway:
         except Exception as e:
             logger.info(f"set_margin_mode ISOLATED en {target_sym} (BingX): {e}")
 
+        cur_lev = self.symbol_leverage.get(symbol, self.default_leverage)
+        has_pos = False
+        if self.portfolio and self.portfolio.active_positions:
+            pos_val = float(self.portfolio.active_positions.get(symbol, 0.0) or self.portfolio.active_positions.get(target_sym, 0.0) or 0.0)
+            has_pos = abs(pos_val) > 1e-6
+        if not has_pos and hasattr(self, "ledger") and self.ledger is not None:
+            has_pos = abs(self.ledger.get_net_inventory(symbol)) > 1e-6
+        has_orders = (
+            symbol in self.active_bids_by_symbol
+            or symbol in self.active_asks_by_symbol
+            or any(m.get("symbol") in (symbol, target_sym) for m in self.active_orders_meta.values())
+        )
+        if int(max_leverage) < cur_lev and (has_pos or has_orders):
+            logger.info(
+                f"set_leverage {max_leverage} omitido/bloqueado en BingX {target_sym} "
+                "para evitar error por posición u órdenes abiertas."
+            )
+            self.initialized_symbols.add(symbol)
+            return
+
         try:
             await self.exchange.set_leverage(max_leverage, target_sym)
+            self.default_leverage = int(max_leverage)
+            self.symbol_leverage[symbol] = int(max_leverage)
         except Exception:
             try:
                 await self.exchange.set_leverage(max_leverage, target_sym, params={"side": "BOTH"})
+                self.default_leverage = int(max_leverage)
+                self.symbol_leverage[symbol] = int(max_leverage)
             except Exception as e:
                 logger.warning(f"set_leverage {max_leverage} en {target_sym} (BingX): {e}")
 
@@ -1338,6 +1453,27 @@ class BingXLiveWsGateway:
         cur_lev = self.symbol_leverage.get(symbol, self.default_leverage)
         if cur_lev == opt_int:
             return False
+
+        # Si se requiere menor apalancamiento, verificar si hay posición u órdenes abiertas
+        if opt_int < cur_lev:
+            has_pos = False
+            if self.portfolio and self.portfolio.active_positions:
+                pos_val = float(self.portfolio.active_positions.get(symbol, 0.0) or self.portfolio.active_positions.get(target_sym, 0.0) or 0.0)
+                has_pos = abs(pos_val) > 1e-6
+            if not has_pos and hasattr(self, "ledger") and self.ledger is not None:
+                has_pos = abs(self.ledger.get_net_inventory(symbol)) > 1e-6
+            has_orders = (
+                symbol in self.active_bids_by_symbol
+                or symbol in self.active_asks_by_symbol
+                or any(m.get("symbol") in (symbol, target_sym) for m in self.active_orders_meta.values())
+            )
+            if has_pos or has_orders:
+                logger.info(
+                    f"Reducción de apalancamiento omitida en BingX {target_sym} ({cur_lev}x -> {opt_int}x) "
+                    "para evitar error por posición u órdenes abiertas. Se escala quote_qty."
+                )
+                return False
+
         try:
             try:
                 await self.exchange.set_leverage(opt_int, target_sym, params={"side": "BOTH"})
@@ -1456,21 +1592,32 @@ class BingXLiveWsGateway:
                     logger.warning(f"Post-Only en BingX cruzó libro en {order.symbol}. Reintentando a {adj_price}...")
                     cid_retry = self.ledger.generate_client_order_id(order.strategy_id)
                     order_params["clientOrderId"] = cid_retry
-                    res_raw = order_fn(
-                        symbol=target_sym,
-                        type="limit",
-                        side=side_str,
-                        amount=order_qty,
-                        price=adj_price,
-                        params=order_params,
-                    )
-                    if inspect.isawaitable(res_raw):
-                        res = await res_raw
-                    else:
-                        res = res_raw
-                    cid = cid_retry
+                    try:
+                        res_raw = order_fn(
+                            symbol=target_sym,
+                            type="limit",
+                            side=side_str,
+                            amount=order_qty,
+                            price=adj_price,
+                            params=order_params,
+                        )
+                        if inspect.isawaitable(res_raw):
+                            res = await res_raw
+                        else:
+                            res = res_raw
+                        cid = cid_retry
+                    except Exception as e_retry:
+                        err_retry = str(e_retry).lower()
+                        if "immediately" in err_retry or "post" in err_retry or "-5022" in str(e_retry):
+                            logger.warning(f"Post-Only reintento descartado limpiamente tras cruce en BingX ({order.symbol}): {e_retry}")
+                            return ""
+                        raise
                 else:
                     raise e
+
+        if not res or not isinstance(res, dict) or "id" not in res:
+            logger.warning(f"Respuesta inválida o nula de orden en BingX ({order.symbol}): {res}")
+            return ""
 
         order_id = str(res["id"])
         strat, sub_lot = self.ledger.parse_client_order_id(cid)
@@ -2008,6 +2155,9 @@ class BingXLiveWsGateway:
         Sincroniza el balance real USDT y las posiciones abiertas de BingX hacia PortfolioState
         (con signo negativo para posiciones SHORT y positivo para LONG).
         """
+        if not getattr(self, "_time_synced", False):
+            await self.sync_time_difference()
+
         try:
             bal = await self.exchange.fetch_balance()
             total_usdt = 0.0
@@ -2249,7 +2399,7 @@ class BingXLiveWsGateway:
                 entry_px = float(pos.get("entryPrice") or pos.get("info", {}).get("entryPrice") or 0.0)
                 be_px = float(pos.get("info", {}).get("breakEvenPrice") or entry_px)
                 side = "SELL" if is_short else "BUY"
-                self.ledger.reconcile_position(
+                lot = self.ledger.reconcile_position(
                     symbol=sym,
                     side=side,
                     quantity=qty,
@@ -2258,6 +2408,23 @@ class BingXLiveWsGateway:
                     strategy_id="AVELLANEDA_OBI",
                     sub_lot_id="MAIN",
                 )
+                if hasattr(self, "db_store") and self.db_store is not None:
+                    try:
+                        lot_k = lot.key
+                        signed_q = qty if side == "BUY" else -qty
+                        self.db_store.save_lot(
+                            lot_key=lot_k,
+                            symbol=sym,
+                            strategy_id="AVELLANEDA_OBI",
+                            sub_lot_id="MAIN",
+                            inventory_q=signed_q,
+                            entry_price=entry_px,
+                            break_even_price=be_px,
+                            entry_ts_ns=time.time_ns(),
+                            realized_pnl_usd=0.0,
+                        )
+                    except Exception as e_lot:
+                        logger.error(f"Error persistiendo lote reconciliado en db_store (BingX): {e_lot}")
                 reconciled.append({
                     "symbol": sym,
                     "side": side,
@@ -3648,17 +3815,35 @@ class DryRunExecutionEngine:
         })
 
         if hasattr(self, "db_store") and self.db_store is not None:
+            trade_copy = dict(trade_item)
+            wins_c = self.wins_count
+            losses_c = self.losses_count
+            gp_usd = self.gross_profit_usd
+            gl_usd = self.gross_loss_usd
+            eq_usd = self.portfolio.current_equity_usd
+
+            def _persist_fill_sync():
+                try:
+                    self.db_store.save_trade(trade_copy)
+                    self.db_store.save_metrics(
+                        wins_count=wins_c,
+                        losses_count=losses_c,
+                        gross_profit_usd=gp_usd,
+                        gross_loss_usd=gl_usd,
+                        current_equity_usd=eq_usd,
+                    )
+                except Exception as e_db:
+                    logger.error(f"Error persistiendo trade en SQLite WAL: {e_db}")
+
             try:
-                self.db_store.save_trade(trade_item)
-                self.db_store.save_metrics(
-                    wins_count=self.wins_count,
-                    losses_count=self.losses_count,
-                    gross_profit_usd=self.gross_profit_usd,
-                    gross_loss_usd=self.gross_loss_usd,
-                    current_equity_usd=self.portfolio.current_equity_usd,
-                )
-            except Exception as e_db:
-                logger.error(f"Error persistiendo trade en SQLite WAL: {e_db}")
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                loop.create_task(asyncio.to_thread(_persist_fill_sync))
+            else:
+                _persist_fill_sync()
 
         return trade_item
 
@@ -3749,24 +3934,36 @@ class DryRunExecutionEngine:
             logger.warning(f"No se pudo cargar dsr_quarantine_state.json: {e}")
 
     def _save_dsr_quarantine_state(self) -> None:
-        """Persiste atómicamente cada trade y el array returns_history en backend/config/dsr_quarantine_state.json."""
+        """Persiste atómicamente cada trade y el array returns_history en backend/config/dsr_quarantine_state.json de forma no bloqueante."""
+        state_data = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "total_rotations_filled": self.total_rotations_filled,
+            "returns_count": len(self.returns_history),
+            "last_fill_buy_price": self._last_fill_buy_price,
+            "last_fill_sell_price": self._last_fill_sell_price,
+            "current_equity_usd": self.portfolio.current_equity_usd,
+            "returns_history": list(self.returns_history[-2000:]),
+        }
+
+        def _do_write() -> None:
+            try:
+                self.dsr_state_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = self.dsr_state_path.with_suffix(".tmp")
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(state_data, f, indent=2)
+                tmp_path.replace(self.dsr_state_path)
+            except Exception as e:
+                logger.error(f"Error persistiendo estado de cuarentena DSR: {e}")
+
         try:
-            self.dsr_state_path.parent.mkdir(parents=True, exist_ok=True)
-            state_data = {
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "total_rotations_filled": self.total_rotations_filled,
-                "returns_count": len(self.returns_history),
-                "last_fill_buy_price": self._last_fill_buy_price,
-                "last_fill_sell_price": self._last_fill_sell_price,
-                "current_equity_usd": self.portfolio.current_equity_usd,
-                "returns_history": self.returns_history[-2000:],
-            }
-            tmp_path = self.dsr_state_path.with_suffix(".tmp")
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(state_data, f, indent=2)
-            tmp_path.replace(self.dsr_state_path)
-        except Exception as e:
-            logger.error(f"Error persistiendo estado de cuarentena DSR: {e}")
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            loop.create_task(asyncio.to_thread(_do_write))
+        else:
+            _do_write()
 
     def reset_state_from_zero(self, base_capital_usd: float | None = None) -> None:
         """
@@ -3923,7 +4120,12 @@ class DryRunExecutionEngine:
                     gatekeeper=self.gatekeeper,
                     portfolio=self.portfolio,
                     on_fill=self.record_trade_fill,
+                    db_store=getattr(self, "db_store", None),
                 )
+            elif hasattr(self, "db_store"):
+                self.live_gateway.db_store = self.db_store
+
+            await self.live_gateway.sync_time_difference()
             for sym in self.symbols:
                 init_lev = self.symbol_optimal_leverage.get(sym, self.selected_leverage)
                 await self.live_gateway.initialize_symbol_margin(sym, max_leverage=init_lev)
@@ -3966,7 +4168,12 @@ class DryRunExecutionEngine:
                     gatekeeper=self.gatekeeper,
                     portfolio=self.portfolio,
                     on_fill=self.record_trade_fill,
+                    db_store=getattr(self, "db_store", None),
                 )
+            elif hasattr(self, "db_store"):
+                self.bingx_gateway.db_store = self.db_store
+
+            await self.bingx_gateway.sync_time_difference()
             for sym in self.symbols:
                 init_lev = self.symbol_optimal_leverage.get(sym, self.selected_leverage)
                 await self.bingx_gateway.initialize_symbol_margin(sym, max_leverage=init_lev)
@@ -4010,7 +4217,11 @@ class DryRunExecutionEngine:
                     gatekeeper=self.gatekeeper,
                     portfolio=self.portfolio,
                     on_fill=self.record_trade_fill,
+                    db_store=getattr(self, "db_store", None),
                 )
+            elif hasattr(self, "db_store"):
+                self.live_gateway.db_store = self.db_store
+
             if self.bingx_gateway is None:
                 self.bingx_gateway = BingXLiveWsGateway(
                     api_key=bx_key,
@@ -4018,7 +4229,13 @@ class DryRunExecutionEngine:
                     gatekeeper=self.gatekeeper,
                     portfolio=self.portfolio,
                     on_fill=self.record_trade_fill,
+                    db_store=getattr(self, "db_store", None),
                 )
+            elif hasattr(self, "db_store"):
+                self.bingx_gateway.db_store = self.db_store
+
+            await self.live_gateway.sync_time_difference()
+            await self.bingx_gateway.sync_time_difference()
 
             for sym in self.symbols:
                 init_lev = self.symbol_optimal_leverage.get(sym, self.selected_leverage)
