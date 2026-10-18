@@ -145,7 +145,7 @@ class WebSocketMultiplexer:
         logger.info("Multiplexer WS detenido correctamente.")
 
     async def _secondary_order_book_stream(self, symbol: str) -> None:
-        watch_symbol = self._resolve_watch_symbol(symbol)
+        watch_symbol = self._resolve_secondary_watch_symbol(symbol)
         while self.running and self.secondary_exchange:
             try:
                 ob = await self.secondary_exchange.watch_order_book(watch_symbol, limit=5)
@@ -188,6 +188,23 @@ class WebSocketMultiplexer:
     def _resolve_watch_symbol(self, symbol: str) -> str:
         if symbol == "PEPE/USDT:USDT":
             return "1000PEPE/USDT:USDT"
+        ex_id = getattr(self, "exchange_id", "") or (getattr(self.exchange, "id", "") if hasattr(self, "exchange") and self.exchange else "")
+        if "bingx" in str(ex_id).lower():
+            if symbol == "XAU/USDT:USDT":
+                return "XAUT/USDT:USDT"
+            if symbol == "XAG/USDT:USDT":
+                return "NCCOXAG2USD/USDT:USDT"
+        return symbol
+
+    def _resolve_secondary_watch_symbol(self, symbol: str) -> str:
+        if symbol == "PEPE/USDT:USDT":
+            return "1000PEPE/USDT:USDT"
+        sec_id = getattr(self, "secondary_exchange_id", "") or (getattr(self.secondary_exchange, "id", "") if getattr(self, "secondary_exchange", None) else "")
+        if "bingx" in str(sec_id).lower():
+            if symbol == "XAU/USDT:USDT":
+                return "XAUT/USDT:USDT"
+            if symbol == "XAG/USDT:USDT":
+                return "NCCOXAG2USD/USDT:USDT"
         return symbol
 
     async def _order_book_stream(self, symbol: str) -> None:

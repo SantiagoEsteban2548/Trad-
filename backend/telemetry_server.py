@@ -27,6 +27,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import sys
 import time
 from typing import Any, Literal
 from pydantic import BaseModel
@@ -198,9 +199,6 @@ class BinanceLiveWsGateway:
         Configura el modo de posición a One-Way (hedged=False), margen a ISOLATED y el apalancamiento
         óptimo en Binance antes de permitir cualquier orden en vivo.
         """
-        spec = SYMBOL_SPECS.get(symbol)
-        if spec and spec.exchange != "binance":
-            return
         target_sym = self.resolve_binance_symbol(symbol)
         try:
             if hasattr(self.exchange, "set_position_mode"):
@@ -2735,19 +2733,41 @@ class DryRunExecutionEngine:
         self,
         symbols: list[str] | None = None,
         config_path: Path = CONFIG_PATH,
+        primary_exchange: str | None = None,
     ) -> None:
         self.symbols = symbols or list(SYMBOL_SPECS.keys())
         self.primary_symbol = self.symbols[0]
         self.config_path = config_path
 
         # 1. Ingesta WebSocket multiplexada concurrente vía CCXT Pro (Binance Primario + BingX Secundario para Lead-Lag)
-        bingx_symbols = [s for s in self.symbols if SYMBOL_SPECS.get(s) and SYMBOL_SPECS[s].exchange == "bingx"]
+        target_ex = (primary_exchange or os.getenv("TARGET_EXCHANGE") or "").strip().lower()
+        if not target_ex:
+            port_env = os.getenv("PORT", "").strip()
+            if not port_env:
+                for idx, arg in enumerate(sys.argv):
+                    if arg == "--port" and idx + 1 < len(sys.argv):
+                        port_env = sys.argv[idx + 1].strip()
+                        break
+            if port_env == "8001":
+                target_ex = "bingx"
+            elif port_env == "8000":
+                target_ex = "binance"
+            else:
+                target_ex = os.getenv("PRIMARY_EXCHANGE", "binance").strip().lower()
+
+        if target_ex == "bingx" or os.getenv("TRADING_MODE", "").strip().upper() == "LIVE_BINGX":
+            primary_ex_id = "bingx"
+            secondary_ex_id = "binance"
+        else:
+            primary_ex_id = "binance"
+            secondary_ex_id = "bingx"
+
         self.multiplexer = WebSocketMultiplexer(
             symbols=self.symbols,
-            exchange_id="binance",
+            exchange_id=primary_ex_id,
             buffer_capacity=10_000,
-            secondary_exchange_id="bingx",
-            secondary_symbols=bingx_symbols,
+            secondary_exchange_id=secondary_ex_id,
+            secondary_symbols=self.symbols,
         )
 
         # 2. Cortafuegos determinista unificado MandateGatekeeper
@@ -3300,16 +3320,28 @@ class DryRunExecutionEngine:
         liq_intensity = min(ctx.ring_buffer.liq_count / 10.0, 5.0)
         return float(sigma_safe * spread_safe * (1.0 + liq_intensity))
 
-    def select_top_active_symbols(self, k: int = 5) -> list[str]:
+    def select_top_active_symbols(self, k: int | None = None) -> list[str]:
         """
-        Selecciona dinámicamente las Top-k monedas más activas según su ActivityScore,
-        garantizando que BTC permanezca como ancla sistémica.
-        En LIVE_MULTI, garantiza una asignación balanceada seleccionando los pares más activos
-        tanto de Binance como de BingX, para que ambos exchanges coticen y operen en paralelo continuo.
+        Selecciona dinámicamente las monedas más activas según su ActivityScore.
+        Si k no se especifica o QUOTE_ALL_SYMBOLS está activo (default: True), retorna
+        todos los símbolos soportados para cotización integral multimoneda.
         """
+        quote_all = os.getenv("QUOTE_ALL_SYMBOLS", "true").strip().lower() in ("true", "1", "yes")
+        eff_k = len(self.symbols) if (quote_all and k is None) else (k if k is not None else 5)
+
         scores = {sym: self.compute_activity_score(sym) for sym in self.symbols}
         if "BTC/USDT:USDT" in scores:
             scores["BTC/USDT:USDT"] = max(scores["BTC/USDT:USDT"], 0.001)
+
+        if quote_all and (k is None or k >= len(self.symbols)):
+            tradfi_open = is_tradfi_market_open()
+            active_list = []
+            for s in self.symbols:
+                spec = SYMBOL_SPECS.get(s)
+                if spec and spec.asset_class == "TRADFI_COMMODITY" and not tradfi_open:
+                    continue
+                active_list.append(s)
+            return active_list
 
         if getattr(self, "trading_mode", "") == "LIVE_MULTI":
             tradfi_open = is_tradfi_market_open()
@@ -3319,14 +3351,14 @@ class DryRunExecutionEngine:
                 bx_syms = [s for s in bx_syms if SYMBOL_SPECS[s].asset_class != "TRADFI_COMMODITY"]
                 bin_syms = [s for s in bin_syms if SYMBOL_SPECS[s].asset_class != "TRADFI_COMMODITY"]
 
-            top_bin = sorted(bin_syms, key=lambda s: scores.get(s, 0.0), reverse=True)[:3]
-            top_bx = sorted(bx_syms, key=lambda s: scores.get(s, 0.0), reverse=True)[:3]
+            top_bin = sorted(bin_syms, key=lambda s: scores.get(s, 0.0), reverse=True)[:max(eff_k // 2, 3)]
+            top_bx = sorted(bx_syms, key=lambda s: scores.get(s, 0.0), reverse=True)[:max(eff_k // 2, 3)]
             if "BTC/USDT:USDT" not in top_bin and "BTC/USDT:USDT" in bin_syms:
                 top_bin = ["BTC/USDT:USDT"] + [s for s in top_bin if s != "BTC/USDT:USDT"][:2]
             return list(dict.fromkeys(top_bin + top_bx))
 
         sorted_syms = sorted(self.symbols, key=lambda s: scores.get(s, 0.0), reverse=True)
-        return sorted_syms[:k]
+        return sorted_syms[:eff_k]
 
     def compute_normalized_inventory_q(self, symbol: str | None = None) -> float:
         """
@@ -4307,8 +4339,28 @@ class DryRunExecutionEngine:
         await self.multiplexer.start()
         if self.warm_path_scheduler:
             self.warm_path_scheduler.start()
+        target_ex = os.getenv("TARGET_EXCHANGE", "").strip().lower()
+        port_env = os.getenv("PORT", "").strip()
+        if not target_ex or not port_env:
+            for idx, arg in enumerate(sys.argv):
+                if arg == "--port" and idx + 1 < len(sys.argv):
+                    port_env = sys.argv[idx + 1].strip()
+                    break
+        if not target_ex:
+            if port_env == "8001":
+                target_ex = "bingx"
+            elif port_env == "8000":
+                target_ex = "binance"
+            else:
+                target_ex = os.getenv("PRIMARY_EXCHANGE", "binance").strip().lower()
 
-        env_mode = os.getenv("TRADING_MODE", "PAPER_L2").strip().upper()
+        if target_ex == "binance":
+            env_mode = "LIVE_BINANCE"
+        elif target_ex == "bingx":
+            env_mode = "LIVE_BINGX"
+        else:
+            env_mode = os.getenv("TRADING_MODE", "PAPER_L2").strip().upper()
+
         if env_mode in ("LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI", "MULTI_EXCHANGE", "LIVE_PARALLEL"):
             try:
                 await self.set_trading_mode(env_mode)
@@ -4711,7 +4763,7 @@ class DryRunExecutionEngine:
                             if active_live_gw:
                                 # Enrutar sólo símbolos compatibles con el exchange activo
                                 is_exchange_compatible = (
-                                    (self.trading_mode == "LIVE_BINANCE" and ctx.spec.exchange == "binance")
+                                    (self.trading_mode == "LIVE_BINANCE")
                                     or (self.trading_mode == "LIVE_BINGX")
                                     or (self.trading_mode == "LIVE_MULTI")
                                 )
@@ -5153,7 +5205,7 @@ class DryRunExecutionEngine:
                 "symbol": sym,
                 "base_asset": ctx.spec.base_asset,
                 "asset_class": ctx.spec.asset_class,
-                "exchange": ctx.spec.exchange,
+                "exchange": "binance" if self.trading_mode == "LIVE_BINANCE" else ("bingx" if self.trading_mode == "LIVE_BINGX" else ctx.spec.exchange),
                 "mid_price": round(s_mid, 2 if s_mid >= 1.0 else 5),
                 "best_bid": round(s_bid, 2 if s_bid >= 1.0 else 5),
                 "best_ask": round(s_ask, 2 if s_ask >= 1.0 else 5),

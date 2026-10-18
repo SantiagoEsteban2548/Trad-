@@ -855,6 +855,14 @@ export default function App() {
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [httpConnected, setHttpConnected] = useState<boolean>(false);
   const [wsLastError, setWsLastError] = useState<string | null>(null);
+  const [activeServerInstance, setActiveServerInstance] = useState<'binance_8000' | 'bingx_8001'>('binance_8000');
+
+  const handleSelectInstance = (instance: 'binance_8000' | 'bingx_8001') => {
+    setActiveServerInstance(instance);
+    const port = instance === 'binance_8000' ? 8000 : 8001;
+    setApiBaseUrl(`http://127.0.0.1:${port}`);
+    setWsUrl(`ws://127.0.0.1:${port}/ws/telemetry`);
+  };
 
   // Live Telemetry Payload State (Direct from backend/telemetry_server.py)
   const [isLiveRunning, setIsLiveRunning] = useState<boolean>(true);
@@ -1795,6 +1803,32 @@ export default function App() {
                         {wsConnected ? 'LIVE CCXT WS (10 Hz)' : 'OFFLINE / RECONNECT'}
                       </p>
                     </div>
+                  </div>
+
+                  {/* Selector de Instancia de Ejecución (Binance :8000 vs BingX :8001) */}
+                  <div className="flex items-center gap-1 p-1 bg-[#080A0F] rounded-lg border border-[#1C2230] text-[10px] font-mono">
+                    <button
+                      onClick={() => handleSelectInstance('binance_8000')}
+                      className={`flex-1 py-1 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
+                        activeServerInstance === 'binance_8000'
+                          ? 'bg-[#A855F7]/25 text-[#A855F7] border border-[#A855F7]/40 shadow-sm'
+                          : 'text-slate-400 hover:text-[#A855F7]'
+                      }`}
+                      title="Instancia Servidor Binance Futures (Puerto 8000 - Todas las monedas)"
+                    >
+                      <span>BINANCE :8000</span>
+                    </button>
+                    <button
+                      onClick={() => handleSelectInstance('bingx_8001')}
+                      className={`flex-1 py-1 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
+                        activeServerInstance === 'bingx_8001'
+                          ? 'bg-amber-500/25 text-amber-400 border border-amber-500/40 shadow-sm'
+                          : 'text-slate-400 hover:text-amber-400'
+                      }`}
+                      title="Instancia Servidor BingX Swap (Puerto 8001 - Todas las monedas)"
+                    >
+                      <span>BINGX :8001</span>
+                    </button>
                   </div>
 
                   {/* Selector cuadri-modal protegido */}
