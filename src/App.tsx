@@ -1339,17 +1339,24 @@ export default function App() {
   useEffect(() => {
     let ws: WebSocket | null = null;
     let reconnectTimeout: any = null;
+    let isDestroyed = false;
 
     const connectWs = () => {
+      if (isDestroyed) return;
       try {
         ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
+          if (isDestroyed) {
+            try { ws?.close(); } catch {}
+            return;
+          }
           setWsConnected(true);
           setWsLastError(null);
         };
 
         ws.onmessage = (event) => {
+          if (isDestroyed) return;
           try {
             const data = JSON.parse(event.data);
             applyTelemetrySnapshot(data);
@@ -1359,15 +1366,18 @@ export default function App() {
         };
 
         ws.onerror = () => {
+          if (isDestroyed) return;
           setWsConnected(false);
           setWsLastError('Reintentando conexión con /ws/telemetry...');
         };
 
         ws.onclose = () => {
+          if (isDestroyed) return;
           setWsConnected(false);
           reconnectTimeout = setTimeout(connectWs, 3000);
         };
       } catch (err: any) {
+        if (isDestroyed) return;
         setWsConnected(false);
         setWsLastError(err.message || 'Error inicializando WebSocket');
         reconnectTimeout = setTimeout(connectWs, 3000);
@@ -1377,8 +1387,17 @@ export default function App() {
     connectWs();
 
     return () => {
-      if (ws) ws.close();
+      isDestroyed = true;
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (ws) {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        try { ws.close(); } catch {}
+        ws = null;
+      }
+      setWsConnected(false);
     };
   }, [wsUrl]);
 
@@ -1389,28 +1408,15 @@ export default function App() {
     let active = true;
     const fetchTelemetry = async () => {
       try {
-        // Try local relative origin first, fallback to direct port 8000
-        const endpoints = [
-          `${apiBaseUrl}/api/telemetry`,
-          'http://127.0.0.1:8000/api/telemetry',
-        ];
-        for (const ep of endpoints) {
-          try {
-            const res = await fetch(ep, { cache: 'no-store' });
-            if (res.ok) {
-              const data = await res.json();
-              if (active) {
-                applyTelemetrySnapshot(data);
-                setHttpConnected(true);
-                setWsLastError(null);
-              }
-              return;
-            }
-          } catch {
-            // try next endpoint
+        const res = await fetch(`${apiBaseUrl}/api/telemetry`, { cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          if (active) {
+            applyTelemetrySnapshot(data);
+            setHttpConnected(true);
+            setWsLastError(null);
           }
-        }
-        if (active) {
+        } else if (active) {
           setHttpConnected(false);
         }
       } catch {
@@ -1463,6 +1469,12 @@ export default function App() {
 
   const handleSwitchMode = async (targetMode: 'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI') => {
     if (targetMode === tradingMode) return;
+    if (targetMode === 'LIVE_BINGX' && activeServerInstance !== 'bingx_8001') {
+      handleSelectInstance('bingx_8001');
+    } else if (targetMode === 'LIVE_BINANCE' && activeServerInstance !== 'binance_8000') {
+      handleSelectInstance('binance_8000');
+    }
+
     if (targetMode === 'LIVE_BINANCE' || targetMode === 'LIVE_BINGX' || targetMode === 'LIVE_MULTI') {
       setPendingLiveMode(targetMode);
       setModeSwitchError(null);
@@ -1497,8 +1509,14 @@ export default function App() {
   const confirmSwitchToLive = async () => {
     setIsSwitchingMode(true);
     setModeSwitchError(null);
+    if (pendingLiveMode === 'LIVE_BINGX' && activeServerInstance !== 'bingx_8001') {
+      handleSelectInstance('bingx_8001');
+    } else if (pendingLiveMode === 'LIVE_BINANCE' && activeServerInstance !== 'binance_8000') {
+      handleSelectInstance('binance_8000');
+    }
+    const targetUrl = pendingLiveMode === 'LIVE_BINGX' ? 'http://127.0.0.1:8001' : (pendingLiveMode === 'LIVE_BINANCE' ? 'http://127.0.0.1:8000' : apiBaseUrl);
     try {
-      const res = await fetch(`${apiBaseUrl}/api/trading-mode`, {
+      const res = await fetch(`${targetUrl}/api/trading-mode`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: pendingLiveMode }),

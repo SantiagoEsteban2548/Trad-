@@ -908,18 +908,21 @@ class BinanceLiveWsGateway:
                     portfolio.initial_exchange_equities["binance"] = round(total_usdt, 2)
 
                 portfolio.exchange_equities["binance"] = total_usdt
-                if getattr(portfolio, "trading_mode", "") == "LIVE_MULTI":
+                t_mode = getattr(portfolio, "trading_mode", "") or os.getenv("TRADING_MODE", "") or ("LIVE_BINANCE" if os.getenv("TARGET_EXCHANGE", "").lower() == "binance" else "")
+                if t_mode == "LIVE_MULTI":
                     portfolio.current_equity_usd = round(sum(portfolio.exchange_equities.values()), 2)
                     if portfolio.initial_exchange_equities:
                         combined_initial = round(sum(portfolio.initial_exchange_equities.values()), 2)
-                        if combined_initial > 0 and (portfolio.base_capital_usd in (100.0, 5000.0) or len(portfolio.initial_exchange_equities) >= 2):
+                        if combined_initial > 0 and (portfolio.base_capital_usd in (100.0, 5000.0) or len(portfolio.initial_exchange_equities) >= 2 or is_first_sync):
                             portfolio.base_capital_usd = combined_initial
                             portfolio.daily_high_watermark_usd = max(portfolio.base_capital_usd, portfolio.current_equity_usd)
-                elif getattr(portfolio, "trading_mode", "") == "LIVE_BINANCE":
+                            portfolio.realized_pnl_today_usd = 0.0
+                elif t_mode in ("LIVE_BINANCE", "BINANCE"):
                     portfolio.current_equity_usd = round(total_usdt, 2)
-                    if is_first_sync or portfolio.base_capital_usd in (100.0, 5000.0):
+                    if is_first_sync or portfolio.base_capital_usd in (100.0, 5000.0) or portfolio.base_capital_usd <= 0.0:
                         portfolio.base_capital_usd = round(total_usdt, 2)
                         portfolio.daily_high_watermark_usd = max(portfolio.base_capital_usd, portfolio.current_equity_usd)
+                        portfolio.realized_pnl_today_usd = 0.0
                 else:
                     portfolio.current_equity_usd = round(total_usdt, 2)
 
@@ -2194,18 +2197,21 @@ class BingXLiveWsGateway:
                     portfolio.initial_exchange_equities["bingx"] = round(total_usdt, 2)
 
                 portfolio.exchange_equities["bingx"] = total_usdt
-                if getattr(portfolio, "trading_mode", "") == "LIVE_MULTI":
+                t_mode = getattr(portfolio, "trading_mode", "") or os.getenv("TRADING_MODE", "") or ("LIVE_BINGX" if os.getenv("TARGET_EXCHANGE", "").lower() == "bingx" else "")
+                if t_mode == "LIVE_MULTI":
                     portfolio.current_equity_usd = round(sum(portfolio.exchange_equities.values()), 2)
                     if portfolio.initial_exchange_equities:
                         combined_initial = round(sum(portfolio.initial_exchange_equities.values()), 2)
-                        if combined_initial > 0 and (portfolio.base_capital_usd in (100.0, 5000.0) or len(portfolio.initial_exchange_equities) >= 2):
+                        if combined_initial > 0 and (portfolio.base_capital_usd in (100.0, 5000.0) or len(portfolio.initial_exchange_equities) >= 2 or is_first_sync):
                             portfolio.base_capital_usd = combined_initial
                             portfolio.daily_high_watermark_usd = max(portfolio.base_capital_usd, portfolio.current_equity_usd)
-                elif getattr(portfolio, "trading_mode", "") == "LIVE_BINGX":
+                            portfolio.realized_pnl_today_usd = 0.0
+                elif t_mode in ("LIVE_BINGX", "BINGX"):
                     portfolio.current_equity_usd = round(total_usdt, 2)
-                    if is_first_sync or portfolio.base_capital_usd in (100.0, 5000.0):
+                    if is_first_sync or portfolio.base_capital_usd in (100.0, 5000.0) or portfolio.base_capital_usd <= 0.0:
                         portfolio.base_capital_usd = round(total_usdt, 2)
                         portfolio.daily_high_watermark_usd = max(portfolio.base_capital_usd, portfolio.current_equity_usd)
+                        portfolio.realized_pnl_today_usd = 0.0
                 else:
                     portfolio.current_equity_usd = round(total_usdt, 2)
 
@@ -4174,9 +4180,20 @@ class DryRunExecutionEngine:
                 except Exception as er:
                     logger.warning(f"Error en reconcile_existing_positions Binance: {er}")
 
-            await self.live_gateway.sync_portfolio_state(self.portfolio)
-            self.live_gateway.start_sync_loop(self.portfolio)
             self.trading_mode = "LIVE_BINANCE"
+            self.portfolio.trading_mode = "LIVE_BINANCE"
+            await self.live_gateway.sync_portfolio_state(self.portfolio)
+            if self.portfolio.current_equity_usd > 0:
+                live_cap = round(self.portfolio.current_equity_usd, 2)
+                self.portfolio.base_capital_usd = live_cap
+                self.portfolio.daily_high_watermark_usd = live_cap
+                self.portfolio.realized_pnl_today_usd = 0.0
+                if not hasattr(self.portfolio, "initial_exchange_equities"):
+                    self.portfolio.initial_exchange_equities = {}
+                self.portfolio.initial_exchange_equities["binance"] = live_cap
+                self.equity_history = deque([live_cap], maxlen=1000)
+                logger.info(f"Capital inicial calibrado para LIVE_BINANCE: ${live_cap:.2f}")
+            self.live_gateway.start_sync_loop(self.portfolio)
             try:
                 await self.initialize_real_candles(self.primary_symbol)
             except Exception as ec:
@@ -4222,9 +4239,20 @@ class DryRunExecutionEngine:
                 except Exception as er:
                     logger.warning(f"Error en reconcile_existing_positions BingX: {er}")
 
-            await self.bingx_gateway.sync_portfolio_state(self.portfolio)
-            self.bingx_gateway.start_sync_loop(self.portfolio)
             self.trading_mode = "LIVE_BINGX"
+            self.portfolio.trading_mode = "LIVE_BINGX"
+            await self.bingx_gateway.sync_portfolio_state(self.portfolio)
+            if self.portfolio.current_equity_usd > 0:
+                live_cap = round(self.portfolio.current_equity_usd, 2)
+                self.portfolio.base_capital_usd = live_cap
+                self.portfolio.daily_high_watermark_usd = live_cap
+                self.portfolio.realized_pnl_today_usd = 0.0
+                if not hasattr(self.portfolio, "initial_exchange_equities"):
+                    self.portfolio.initial_exchange_equities = {}
+                self.portfolio.initial_exchange_equities["bingx"] = live_cap
+                self.equity_history = deque([live_cap], maxlen=1000)
+                logger.info(f"Capital inicial calibrado para LIVE_BINGX: ${live_cap:.2f}")
+            self.bingx_gateway.start_sync_loop(self.portfolio)
             try:
                 await self.initialize_real_candles(self.primary_symbol)
             except Exception as ec:
@@ -4328,6 +4356,7 @@ class DryRunExecutionEngine:
             if self.bingx_gateway:
                 self.bingx_gateway.stop_sync_loop()
             self.trading_mode = "PAPER_L2"
+            self.portfolio.trading_mode = "PAPER_L2"
             logger.info("Modo de trading conmutado a PAPER_L2.")
         else:
             raise ValueError(f"Modo de trading desconocido: {mode}")
