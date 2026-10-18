@@ -2860,7 +2860,11 @@ class DryRunExecutionEngine:
         self.time_exits_count: int = 0
 
         # 8. Cuarentena DSR
-        self.dsr_state_path = Path("backend/config/dsr_quarantine_state.json")
+        self.target_exchange = target_ex
+        dsr_file = f"backend/config/dsr_quarantine_state_{target_ex}.json" if target_ex else "backend/config/dsr_quarantine_state.json"
+        if not Path(dsr_file).exists() and Path("backend/config/dsr_quarantine_state.json").exists() and target_ex != "bingx":
+            dsr_file = "backend/config/dsr_quarantine_state.json"
+        self.dsr_state_path = Path(dsr_file)
         self.returns_history: list[float] = [0.00095, 0.00110, 0.00085, 0.00105, 0.00090]
         self.running: bool = False
         self._eval_task: asyncio.Task | None = None
@@ -2880,12 +2884,19 @@ class DryRunExecutionEngine:
         self.gross_profit_usd: float = 0.0
         self.gross_loss_usd: float = 0.0
 
-        # Persistencia Ligera en Disco (SQLite WAL Store)
+        # Persistencia Ligera en Disco (SQLite WAL Store aislada por exchange)
         self.db_store: LedgerSqliteStore | None = None
         try:
             db_file = os.getenv("LEDGER_DB_PATH")
             if not db_file:
-                db_file = ":memory:" if os.getenv("PYTEST_CURRENT_TEST") else "backend/data/trades_ledger.db"
+                if os.getenv("PYTEST_CURRENT_TEST"):
+                    db_file = ":memory:"
+                elif target_ex == "bingx" or os.getenv("PORT") == "8001":
+                    db_file = "backend/data/trades_ledger_bingx.db"
+                else:
+                    db_file = "backend/data/trades_ledger_binance.db"
+                    if not Path(db_file).exists() and Path("backend/data/trades_ledger.db").exists():
+                        db_file = "backend/data/trades_ledger.db"
             self.db_store = LedgerSqliteStore(db_file)
             saved_metrics = self.db_store.load_metrics()
             if saved_metrics:
@@ -6117,5 +6128,12 @@ if _dist_path.exists():
             return FileResponse(str(candidate))
         index_file = _dist_path / "index.html"
         if index_file.exists():
-            return FileResponse(str(index_file))
+            return FileResponse(
+                str(index_file),
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
         raise HTTPException(status_code=404, detail="Frontend dist index.html no encontrado.")

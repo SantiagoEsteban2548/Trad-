@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   ShieldAlert,
   Activity,
@@ -833,6 +833,16 @@ export default function App() {
   >('command');
 
   // Telemetry Server Endpoints (Direct integration with backend/telemetry_server.py)
+  const initialPort = typeof window !== 'undefined' && window.location.port === '8001' ? 8001 : 8000;
+  const initialHost = typeof window !== 'undefined' && window.location.hostname ? window.location.hostname : '127.0.0.1';
+
+  const [activeServerInstance, setActiveServerInstance] = useState<'binance_8000' | 'bingx_8001'>(
+    initialPort === 8001 ? 'bingx_8001' : 'binance_8000'
+  );
+  const activeInstanceRef = useRef<'binance_8000' | 'bingx_8001'>(
+    initialPort === 8001 ? 'bingx_8001' : 'binance_8000'
+  );
+
   const [wsUrl, setWsUrl] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       if (window.location.port === '5173') {
@@ -841,7 +851,7 @@ export default function App() {
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       return `${proto}//${window.location.host}/ws/telemetry`;
     }
-    return 'ws://127.0.0.1:8000/ws/telemetry';
+    return `ws://${initialHost}:${initialPort}/ws/telemetry`;
   });
   const [apiBaseUrl, setApiBaseUrl] = useState<string>(() => {
     if (typeof window !== 'undefined') {
@@ -850,18 +860,37 @@ export default function App() {
       }
       return window.location.origin;
     }
-    return 'http://127.0.0.1:8000';
+    return `http://${initialHost}:${initialPort}`;
   });
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [httpConnected, setHttpConnected] = useState<boolean>(false);
   const [wsLastError, setWsLastError] = useState<string | null>(null);
-  const [activeServerInstance, setActiveServerInstance] = useState<'binance_8000' | 'bingx_8001'>('binance_8000');
+
+  const activeWsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<any>(null);
 
   const handleSelectInstance = (instance: 'binance_8000' | 'bingx_8001') => {
+    activeInstanceRef.current = instance;
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    if (activeWsRef.current) {
+      activeWsRef.current.onopen = null;
+      activeWsRef.current.onmessage = null;
+      activeWsRef.current.onerror = null;
+      activeWsRef.current.onclose = null;
+      try { activeWsRef.current.close(); } catch {}
+      activeWsRef.current = null;
+    }
+    setWsConnected(false);
+
     setActiveServerInstance(instance);
+    const host = (typeof window !== 'undefined' && window.location.hostname) ? window.location.hostname : '127.0.0.1';
     const port = instance === 'binance_8000' ? 8000 : 8001;
-    setApiBaseUrl(`http://127.0.0.1:${port}`);
-    setWsUrl(`ws://127.0.0.1:${port}/ws/telemetry`);
+    setApiBaseUrl(`http://${host}:${port}`);
+    setWsUrl(`ws://${host}:${port}/ws/telemetry`);
+    setTradingMode(instance === 'binance_8000' ? 'LIVE_BINANCE' : 'LIVE_BINGX');
   };
 
   // Live Telemetry Payload State (Direct from backend/telemetry_server.py)
@@ -883,9 +912,9 @@ export default function App() {
   const [rotationsFilled, setRotationsFilled] = useState<number>(0);
 
   // Portfolio State
-  const [baseCapital, setBaseCapital] = useState<number>(100.0);
-  const [currentEquity, setCurrentEquity] = useState<number>(100.0);
-  const [dailyHwm, setDailyHwm] = useState<number>(100.0);
+  const [baseCapital, setBaseCapital] = useState<number>(initialPort === 8001 ? 99460.0 : 4950.0);
+  const [currentEquity, setCurrentEquity] = useState<number>(initialPort === 8001 ? 99460.0 : 4950.0);
+  const [dailyHwm, setDailyHwm] = useState<number>(initialPort === 8001 ? 99460.0 : 4950.0);
   const [realizedPnlToday, setRealizedPnlToday] = useState<number>(0.0);
   const [dailyReturnPct, setDailyReturnPct] = useState<number>(0.0);
   const [dailyDrawdownPct, setDailyDrawdownPct] = useState<number>(0.0);
@@ -894,7 +923,9 @@ export default function App() {
   const [exchangeEquities, setExchangeEquities] = useState<Record<string, number>>({});
 
   // Operational Mode State: PAPER_L2 vs LIVE_BINANCE vs LIVE_BINGX vs LIVE_MULTI
-  const [tradingMode, setTradingMode] = useState<'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI'>('PAPER_L2');
+  const [tradingMode, setTradingMode] = useState<'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI'>(
+    initialPort === 8001 ? 'LIVE_BINGX' : 'LIVE_BINANCE'
+  );
   const [pendingLiveMode, setPendingLiveMode] = useState<'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI'>('LIVE_BINANCE');
   const [isLiveConfirmOpen, setIsLiveConfirmOpen] = useState<boolean>(false);
   const [modeSwitchError, setModeSwitchError] = useState<string | null>(null);
@@ -1148,7 +1179,21 @@ export default function App() {
     };
   }, [activeCoin, activeTimeframe, symbolsData, midPrice, bestBid, bestAsk, liveObi, optimalSpread, reservationPrice, candlesHistory]);
 
-  const applyTelemetrySnapshot = (data: any) => {
+  const applyTelemetrySnapshot = (data: any, sourceInstance?: 'binance_8000' | 'bingx_8001') => {
+    const currentActive = activeInstanceRef.current;
+    if (sourceInstance && sourceInstance !== currentActive) {
+      return;
+    }
+    const incomingMode = data.trading_mode || data.mode;
+
+    // Strict Anti-Alternation Guard: Never apply frames from the wrong instance
+    if (currentActive === 'bingx_8001' && incomingMode !== 'LIVE_BINGX') {
+      return;
+    }
+    if (currentActive === 'binance_8000' && incomingMode !== 'LIVE_BINANCE') {
+      return;
+    }
+
     setTickCount((prev) => prev + 1);
 
     if (data.mode) {
@@ -1337,18 +1382,28 @@ export default function App() {
 
   // WebSocket Connection to backend/telemetry_server.py
   useEffect(() => {
-    let ws: WebSocket | null = null;
-    let reconnectTimeout: any = null;
     let isDestroyed = false;
 
     const connectWs = () => {
       if (isDestroyed) return;
       try {
-        ws = new WebSocket(wsUrl);
+        if (activeWsRef.current) {
+          activeWsRef.current.onopen = null;
+          activeWsRef.current.onmessage = null;
+          activeWsRef.current.onerror = null;
+          activeWsRef.current.onclose = null;
+          try { activeWsRef.current.close(); } catch {}
+          activeWsRef.current = null;
+        }
+
+        const currentTargetWs = wsUrl;
+        const currentTargetInstance = activeServerInstance;
+        const ws = new WebSocket(currentTargetWs);
+        activeWsRef.current = ws;
 
         ws.onopen = () => {
-          if (isDestroyed) {
-            try { ws?.close(); } catch {}
+          if (isDestroyed || activeWsRef.current !== ws) {
+            try { ws.close(); } catch {}
             return;
           }
           setWsConnected(true);
@@ -1356,31 +1411,37 @@ export default function App() {
         };
 
         ws.onmessage = (event) => {
-          if (isDestroyed) return;
+          if (isDestroyed || activeWsRef.current !== ws) return;
+          if (activeInstanceRef.current !== currentTargetInstance) {
+            try { ws.close(); } catch {}
+            return;
+          }
           try {
             const data = JSON.parse(event.data);
-            applyTelemetrySnapshot(data);
+            applyTelemetrySnapshot(data, currentTargetInstance);
           } catch {
             // ignore non-json frame
           }
         };
 
         ws.onerror = () => {
-          if (isDestroyed) return;
+          if (isDestroyed || activeWsRef.current !== ws) return;
           setWsConnected(false);
-          setWsLastError('Reintentando conexión con /ws/telemetry...');
+          setWsLastError(`Reintentando conexión con ${currentTargetWs}...`);
         };
 
         ws.onclose = () => {
-          if (isDestroyed) return;
+          if (isDestroyed || activeWsRef.current !== ws) return;
           setWsConnected(false);
-          reconnectTimeout = setTimeout(connectWs, 3000);
+          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = setTimeout(connectWs, 3000);
         };
       } catch (err: any) {
         if (isDestroyed) return;
         setWsConnected(false);
         setWsLastError(err.message || 'Error inicializando WebSocket');
-        reconnectTimeout = setTimeout(connectWs, 3000);
+        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = setTimeout(connectWs, 3000);
       }
     };
 
@@ -1388,31 +1449,36 @@ export default function App() {
 
     return () => {
       isDestroyed = true;
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      if (ws) {
-        ws.onopen = null;
-        ws.onmessage = null;
-        ws.onerror = null;
-        ws.onclose = null;
-        try { ws.close(); } catch {}
-        ws = null;
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      if (activeWsRef.current) {
+        activeWsRef.current.onopen = null;
+        activeWsRef.current.onmessage = null;
+        activeWsRef.current.onerror = null;
+        activeWsRef.current.onclose = null;
+        try { activeWsRef.current.close(); } catch {}
+        activeWsRef.current = null;
       }
       setWsConnected(false);
     };
-  }, [wsUrl]);
+  }, [wsUrl, activeServerInstance]);
 
   // REST Telemetry sync polling (Zero mocks: fetches real data from GET /api/telemetry when WS is idle or connecting)
   useEffect(() => {
     if (wsConnected || !isLiveRunning) return;
 
     let active = true;
+    const currentInstance = activeServerInstance;
     const fetchTelemetry = async () => {
+      if (!active || activeInstanceRef.current !== currentInstance) return;
       try {
         const res = await fetch(`${apiBaseUrl}/api/telemetry`, { cache: 'no-store' });
         if (res.ok) {
           const data = await res.json();
-          if (active) {
-            applyTelemetrySnapshot(data);
+          if (active && activeInstanceRef.current === currentInstance) {
+            applyTelemetrySnapshot(data, currentInstance);
             setHttpConnected(true);
             setWsLastError(null);
           }
@@ -1431,7 +1497,7 @@ export default function App() {
       active = false;
       clearInterval(interval);
     };
-  }, [wsConnected, isLiveRunning, apiBaseUrl]);
+  }, [wsConnected, isLiveRunning, apiBaseUrl, activeServerInstance]);
 
 
   // Kill Switch HTTP Trigger (POST /api/emergency-flatten)
