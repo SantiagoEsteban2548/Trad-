@@ -968,7 +968,7 @@ class BinanceLiveWsGateway:
                 sub_lot = fill_res.get("sub_lot_id", "MAIN")
                 strat_tag = f"{fill_res.get('strategy_id', 'AVELLANEDA_OBI')}_{sub_lot}" if sub_lot != "MAIN" else fill_res.get("strategy_id", "AVELLANEDA_OBI")
                 fee_est = round(avg_px * actual_qty * 0.0002, 4)
-                pnl_recorded = fill_res.get("realized_pnl_usd", 0.0) or (round(avg_px * actual_qty * 0.0005, 2) or 0.05)
+                pnl_recorded = float(fill_res.get("realized_pnl_usd", 0.0) or 0.0)
                 logger.info(f"FILL CONFIRMADO en Binance: {order_sym} {side} {actual_qty} @ ${avg_px} (order {oid}, lot {strat_tag})")
                 if self.on_fill and callable(self.on_fill):
                     try:
@@ -979,10 +979,11 @@ class BinanceLiveWsGateway:
                             entry_price=avg_px,
                             exit_or_mid_price=avg_px,
                             qty=actual_qty,
-                            return_pct=0.05,
+                            return_pct=0.0,
                             pnl_usd=pnl_recorded,
                             trade_id=f"LIVE-{oid}",
                             fee_cost=fee_est,
+                            is_close=False,
                         )
                     except Exception as ef:
                         logger.debug(f"Error registrando fill en vivo: {ef}")
@@ -1392,7 +1393,7 @@ class BinanceLiveWsGateway:
                     cid = tr.get("order") or tr.get("clientOrderId") or ""
                     if self.on_fill:
                         try:
-                            pnl_val = round(price * amount * 0.0005, 2) or 0.05
+                            pnl_val = float(tr.get("pnl") or 0.0)
                             self.on_fill(
                                 symbol=sym,
                                 strategy="AVELLANEDA_OBI",
@@ -1400,9 +1401,10 @@ class BinanceLiveWsGateway:
                                 entry_price=price,
                                 exit_or_mid_price=price,
                                 qty=amount,
-                                return_pct=0.05,
+                                return_pct=0.0,
                                 pnl_usd=pnl_val,
                                 trade_id=f"WS-{tid}" if tid else None,
+                                is_close=False,
                             )
                         except Exception as fe:
                             logger.error(f"Error en on_fill desde watch_my_trades Binance: {fe}")
@@ -3021,10 +3023,10 @@ class DryRunExecutionEngine:
     """
 
     LEVERAGE_TIERS_CONFIG: dict[int, dict[str, Any]] = {
-        3: {"label": "x3 (Conservador Institucional)", "tp_bps": 22.0, "sl_bps": 35.0, "liq_dist_bps": 3250.0, "est_daily_roi_pct": 1.15},
-        5: {"label": "x5 (Equilibrado / Compuesto)", "tp_bps": 18.0, "sl_bps": 25.0, "liq_dist_bps": 1920.0, "est_daily_roi_pct": 1.85},
-        7: {"label": "x7 (Agresivo / Momentum OBI)", "tp_bps": 14.0, "sl_bps": 18.0, "liq_dist_bps": 1350.0, "est_daily_roi_pct": 2.45},
-        10: {"label": "x10 (Escalpado HFT Estricto)", "tp_bps": 10.0, "sl_bps": 12.0, "liq_dist_bps": 920.0, "est_daily_roi_pct": 3.10},
+        3: {"label": "x3 (Conservador Institucional)", "tp_bps": 22.0, "sl_bps": 35.0, "liq_dist_bps": 3250.0},
+        5: {"label": "x5 (Equilibrado / Compuesto)", "tp_bps": 18.0, "sl_bps": 25.0, "liq_dist_bps": 1920.0},
+        7: {"label": "x7 (Agresivo / Momentum OBI)", "tp_bps": 14.0, "sl_bps": 18.0, "liq_dist_bps": 1350.0},
+        10: {"label": "x10 (Escalpado HFT Estricto)", "tp_bps": 10.0, "sl_bps": 12.0, "liq_dist_bps": 920.0},
     }
 
     def __init__(
@@ -3057,8 +3059,8 @@ class DryRunExecutionEngine:
             daily_high_watermark_usd=initial_capital,
             realized_pnl_today_usd=0.0,
             active_positions={},
-            rolling_edge_mu=0.045,
-            rolling_variance_sigma2=0.0090,
+            rolling_edge_mu=0.0,
+            rolling_variance_sigma2=0.0001,
         )
 
         # 4. Configuración de Régimen unificada
@@ -3131,7 +3133,7 @@ class DryRunExecutionEngine:
 
         # 8. Cuarentena DSR
         self.dsr_state_path = Path("backend/config/dsr_quarantine_state.json")
-        self.returns_history: list[float] = [0.00095, 0.00110, 0.00085, 0.00105, 0.00090]
+        self.returns_history: list[float] = []
         self.running: bool = False
         self._eval_task: asyncio.Task | None = None
         self._funding_arb_task: asyncio.Task | None = None
@@ -3642,6 +3644,21 @@ class DryRunExecutionEngine:
         net_pos_usd = self.portfolio.active_positions.get(sym, 0.0)
         return float(np.clip(net_pos_usd / max_allowed_pos, -1.0, 1.0))
 
+    def update_rolling_moments(self) -> None:
+        """
+        Calcula la media mu y varianza sigma2 de los retornos empíricos en una ventana rodante
+        de hasta 100 operaciones cerradas. Si N < 10, mantiene valores conservadores neutros.
+        """
+        if len(self.returns_history) >= 10:
+            recent = np.asarray(self.returns_history[-100:], dtype=np.float64)
+            mu = float(np.mean(recent))
+            var = float(np.var(recent, ddof=1)) if len(recent) > 1 else 1e-4
+            self.portfolio.rolling_edge_mu = round(mu, 6)
+            self.portfolio.rolling_variance_sigma2 = round(max(var, 1e-8), 6)
+        else:
+            self.portfolio.rolling_edge_mu = 0.0
+            self.portfolio.rolling_variance_sigma2 = 1e-4
+
     def evaluate_leverage_tiers(self, symbol: str | None = None) -> dict[str, Any]:
         """
         Evalúa cuantitativamente en tiempo real los tramos de apalancamiento (x3, x5, x7, x10)
@@ -3654,8 +3671,13 @@ class DryRunExecutionEngine:
         sigma_bps = max(float(sigma) * 10_000.0, 1.0)
         obi = abs(ctx.ring_buffer.compute_obi(levels=5)) if ctx.ring_buffer.ob_count > 0 else 0.0
 
+        self.update_rolling_moments()
         variance_safe = max(self.portfolio.rolling_variance_sigma2, 1e-8)
         raw_half_kelly = 0.5 * (self.portfolio.rolling_edge_mu / variance_safe)
+        if len(self.returns_history) < 100:
+            raw_half_kelly = min(max(raw_half_kelly, 0.0), 1.0)
+        else:
+            raw_half_kelly = max(raw_half_kelly, 0.0)
 
         # Determinar apalancamiento recomendado según régimen y volatilidad realizada
         regime_name = getattr(self.regime_config, "market_regime", "CALM_RANGE")
@@ -3693,6 +3715,8 @@ class DryRunExecutionEngine:
             else:
                 viability = "VIABLE_CAUTION"
 
+            daily_roi_est = round(self.portfolio.rolling_edge_mu * lev * 100.0, 3) if len(self.returns_history) >= 30 else None
+
             tiers_list.append({
                 "leverage": lev,
                 "code": f"x{lev}",
@@ -3708,7 +3732,7 @@ class DryRunExecutionEngine:
                 "safety_buffer_before_liq_bps": safety_buffer_bps,
                 "max_sl_loss_usd": max_sl_loss_usd,
                 "max_sl_loss_pct_equity": max_sl_loss_pct_equity,
-                "estimated_daily_roi_pct": cfg["est_daily_roi_pct"],
+                "estimated_daily_roi_pct": daily_roi_est,
                 "viability": viability,
             })
 
@@ -3880,15 +3904,36 @@ class DryRunExecutionEngine:
         if exit_reason is None:
             return None
 
-        # Calcular cantidad base y PnL neto del cierre
+        # Calcular cantidad base y PnL neto del cierre con comisiones, slippage y funding
         pos_qty = truncate_decimal_step(max(abs(curr_pos) / max(entry_px, 1e-8), ctx.spec.step_size), ctx.spec.step_size)
         close_side = "SELL" if is_long else "BUY"
-        if is_long:
-            pnl_usd = (exit_px - entry_px) * pos_qty
-            ret = (exit_px - entry_px) / max(entry_px, 1e-8)
+
+        now_ns = time.time_ns()
+        if exit_reason == "TAKE_PROFIT":
+            effective_exit_px = exit_px
+            maker_fee_entry = entry_px * pos_qty * 0.0002
+            maker_fee_exit = effective_exit_px * pos_qty * 0.0002
+            commissions = maker_fee_entry + maker_fee_exit
         else:
-            pnl_usd = (entry_px - exit_px) * pos_qty
-            ret = (entry_px - exit_px) / max(entry_px, 1e-8)
+            # Slippage adverso de 2 bps (0.0002) en órdenes de mercado (SL / TIME_STOP)
+            slippage_factor = (1.0 - 0.0002) if is_long else (1.0 + 0.0002)
+            effective_exit_px = exit_px * slippage_factor
+            maker_fee_entry = entry_px * pos_qty * 0.0002
+            taker_fee_exit = effective_exit_px * pos_qty * 0.0005
+            commissions = maker_fee_entry + taker_fee_exit
+
+        holding_time_s = max(0.0, (now_ns - (ctx.inventory_open_ts_ns or now_ns)) / 1e9)
+        funding_rate_8h = getattr(self, "latest_funding_rate", 0.0001) or 0.0001
+        funding_cost = abs(pos_qty * entry_px) * funding_rate_8h * (holding_time_s / (8.0 * 3600.0))
+        total_costs = round(commissions + funding_cost, 4)
+
+        if is_long:
+            gross_pnl = (effective_exit_px - entry_px) * pos_qty
+        else:
+            gross_pnl = (entry_px - effective_exit_px) * pos_qty
+
+        pnl_usd = round(gross_pnl - total_costs, 4)
+        ret = pnl_usd / max(entry_px * pos_qty, 1e-8)
 
         # Ejecutar cierre en Live o Paper
         if self.trading_mode in ("LIVE_MULTI", "LIVE_BINANCE", "LIVE_BINGX"):
@@ -4032,11 +4077,14 @@ class DryRunExecutionEngine:
             strategy=f"AVELLANEDA_{exit_reason}",
             side=close_side,
             entry_price=entry_px,
-            exit_or_mid_price=exit_px,
+            exit_or_mid_price=effective_exit_px,
             qty=pos_qty,
             return_pct=ret * 100.0,
             pnl_usd=pnl_usd,
             timestamp_ns=now_ns,
+            fee_cost=total_costs,
+            is_close=True,
+            fee_already_deducted=True,
         )
 
         swept = step_up_ratchet(self.portfolio)
@@ -4103,6 +4151,7 @@ class DryRunExecutionEngine:
                 return {}
 
         fee_cost = float(kwargs.get("fee_cost") or 0.0)
+        fee_already_deducted = kwargs.get("fee_already_deducted", False)
 
         strat_upper = str(strategy).upper()
         if "LIQ" in strat_upper or "CASCADE" in strat_upper:
@@ -4118,6 +4167,15 @@ class DryRunExecutionEngine:
         else:
             strat_clean = "AVELLANEDA_OBI"
 
+        # Determinar si es un cierre de posición (round-trip) o una orden de apertura
+        is_close_param = kwargs.get("is_close")
+        if is_close_param is not None:
+            is_close = bool(is_close_param)
+        else:
+            is_close = any(tag in strat_clean for tag in ("TAKE_PROFIT", "STOP_LOSS", "TIME_STOP", "CLOSE")) or (pnl_usd != 0.0 or return_pct != 0.0)
+
+        net_pnl = float(pnl_usd) if fee_already_deducted else (float(pnl_usd) - fee_cost)
+
         trade_item = {
             "id": tid,
             "timestamp_ms": ts_ms,
@@ -4128,17 +4186,20 @@ class DryRunExecutionEngine:
             "entry_price": round(float(entry_price), 2 if float(entry_price) >= 1.0 else 5),
             "exit_or_mid_price": round(float(exit_or_mid_price), 2 if float(exit_or_mid_price) >= 1.0 else 5),
             "qty": round(float(qty), 4),
-            "return_pct": round(float(return_pct), 3),
-            "pnl_usd": round(float(pnl_usd), 2),
+            "return_pct": round(float(return_pct), 3) if is_close else 0.0,
+            "pnl_usd": round(float(pnl_usd), 2) if is_close else 0.0,
             "fee_cost": round(float(fee_cost), 4),
+            "is_close": is_close,
         }
         self.recent_trades.append(trade_item)
-        if pnl_usd >= 0.0:
-            self.wins_count += 1
-            self.gross_profit_usd = round(self.gross_profit_usd + pnl_usd, 2)
-        else:
-            self.losses_count += 1
-            self.gross_loss_usd = round(self.gross_loss_usd + abs(pnl_usd), 2)
+
+        if is_close:
+            if net_pnl > 0.0:
+                self.wins_count += 1
+                self.gross_profit_usd = round(self.gross_profit_usd + net_pnl, 2)
+            elif net_pnl < 0.0:
+                self.losses_count += 1
+                self.gross_loss_usd = round(self.gross_loss_usd + abs(net_pnl), 2)
 
         self.equity_history.append(round(self.portfolio.current_equity_usd, 2))
 
@@ -4147,7 +4208,7 @@ class DryRunExecutionEngine:
             "timestamp_ms": ts_ms,
             "bot_equity_usd": round(self.portfolio.current_equity_usd, 2),
             "benchmark_equity_usd": round(self.portfolio.base_capital_usd, 2),
-            "trade_pnl_bar": round(pnl_usd, 2),
+            "trade_pnl_bar": round(pnl_usd if is_close else 0.0, 2),
         })
 
         notional = round(float(qty) * float(exit_or_mid_price), 2)
@@ -4277,8 +4338,11 @@ class DryRunExecutionEngine:
                     data = json.load(f)
                 if isinstance(data, dict):
                     saved_returns = data.get("returns_history")
-                    if isinstance(saved_returns, list) and len(saved_returns) > 0:
-                        self.returns_history = [float(r) for r in saved_returns]
+                    if isinstance(saved_returns, list):
+                        loaded = [float(r) for r in saved_returns]
+                        if len(loaded) >= 5 and loaded[:5] == [0.00095, 0.0011, 0.00085, 0.00105, 0.0009]:
+                            loaded = loaded[5:]
+                        self.returns_history = loaded
                     self.total_rotations_filled = int(data.get("total_rotations_filled", self.total_rotations_filled))
                     if data.get("last_fill_buy_price") is not None:
                         self._last_fill_buy_price = float(data["last_fill_buy_price"])
@@ -5393,44 +5457,65 @@ class DryRunExecutionEngine:
                                 b_ask = float(ctx.ring_buffer.ob_ask_prices[ob_idx, 0]) if ctx.ring_buffer.ob_count > 0 else fill_px
                                 cur_mid = 0.5 * (b_bid + b_ask) if b_bid > 0 else fill_px
 
+                                maker_fee = round(fill_px * fill_qty * 0.0002, 4)
+                                is_close_fill = False
                                 if fill.request.side == "BUY":
-                                    ctx.last_fill_buy_price = fill_px
                                     if ctx.last_fill_sell_price is not None:
-                                        cycle_pnl = (ctx.last_fill_sell_price - fill_px) * fill_qty
-                                        ret = (ctx.last_fill_sell_price - fill_px) / fill_px
-                                        exit_or_mid = ctx.last_fill_sell_price
+                                        is_close_fill = True
+                                        gross_pnl = (ctx.last_fill_sell_price - fill_px) * fill_qty
+                                        cycle_pnl = round(gross_pnl - maker_fee, 4)
+                                        ret = cycle_pnl / max(ctx.last_fill_sell_price * fill_qty, 1e-8)
+                                        exit_or_mid = fill_px
+                                        entry_px_fill = ctx.last_fill_sell_price
                                         ctx.last_fill_sell_price = None
-                                    else:
-                                        cycle_pnl = (cur_mid - fill_px) * fill_qty
-                                        ret = (cur_mid - fill_px) / fill_px if fill_px > 0 else 0.0010
-                                        exit_or_mid = cur_mid
-                                else:
-                                    ctx.last_fill_sell_price = fill_px
-                                    if ctx.last_fill_buy_price is not None:
-                                        cycle_pnl = (fill_px - ctx.last_fill_buy_price) * fill_qty
-                                        ret = (fill_px - ctx.last_fill_buy_price) / ctx.last_fill_buy_price
-                                        exit_or_mid = ctx.last_fill_buy_price
                                         ctx.last_fill_buy_price = None
                                     else:
-                                        cycle_pnl = (fill_px - cur_mid) * fill_qty
-                                        ret = (fill_px - cur_mid) / fill_px if fill_px > 0 else 0.0010
-                                        exit_or_mid = cur_mid
+                                        # Apertura de posición larga (sin PnL realizado falso)
+                                        ctx.last_fill_buy_price = fill_px
+                                        cycle_pnl = 0.0
+                                        ret = 0.0
+                                        exit_or_mid = fill_px
+                                        entry_px_fill = fill_px
+                                        self.portfolio.current_equity_usd = round(
+                                            self.portfolio.current_equity_usd - maker_fee, 2
+                                        )
+                                else:
+                                    if ctx.last_fill_buy_price is not None:
+                                        is_close_fill = True
+                                        gross_pnl = (fill_px - ctx.last_fill_buy_price) * fill_qty
+                                        cycle_pnl = round(gross_pnl - maker_fee, 4)
+                                        ret = cycle_pnl / max(ctx.last_fill_buy_price * fill_qty, 1e-8)
+                                        exit_or_mid = fill_px
+                                        entry_px_fill = ctx.last_fill_buy_price
+                                        ctx.last_fill_buy_price = None
+                                        ctx.last_fill_sell_price = None
+                                    else:
+                                        # Apertura de posición corta (sin PnL realizado falso)
+                                        ctx.last_fill_sell_price = fill_px
+                                        cycle_pnl = 0.0
+                                        ret = 0.0
+                                        exit_or_mid = fill_px
+                                        entry_px_fill = fill_px
+                                        self.portfolio.current_equity_usd = round(
+                                            self.portfolio.current_equity_usd - maker_fee, 2
+                                        )
 
-                                captured_return = float(ret)
-                                self.returns_history.append(captured_return)
-                                if sym in self.symbol_returns:
-                                    self.symbol_returns[sym].append(captured_return)
-                                pnl_delta = float(cycle_pnl)
-                                ctx.realized_pnl_today += pnl_delta
+                                if is_close_fill:
+                                    captured_return = float(ret)
+                                    self.returns_history.append(captured_return)
+                                    if sym in self.symbol_returns:
+                                        self.symbol_returns[sym].append(captured_return)
+                                    pnl_delta = float(cycle_pnl)
+                                    ctx.realized_pnl_today += pnl_delta
 
-                                self.portfolio.current_equity_usd = round(
-                                    self.portfolio.current_equity_usd + pnl_delta, 2
-                                )
-                                self.portfolio.realized_pnl_today_usd = round(
-                                    self.portfolio.realized_pnl_today_usd + pnl_delta, 2
-                                )
-                                if self.portfolio.current_equity_usd > self.portfolio.daily_high_watermark_usd:
-                                    self.portfolio.daily_high_watermark_usd = self.portfolio.current_equity_usd
+                                    self.portfolio.current_equity_usd = round(
+                                        self.portfolio.current_equity_usd + pnl_delta, 2
+                                    )
+                                    self.portfolio.realized_pnl_today_usd = round(
+                                        self.portfolio.realized_pnl_today_usd + pnl_delta, 2
+                                    )
+                                    if self.portfolio.current_equity_usd > self.portfolio.daily_high_watermark_usd:
+                                        self.portfolio.daily_high_watermark_usd = self.portfolio.current_equity_usd
 
                                 # Registrar trade fill institucional
                                 strat = getattr(fill.request, "strategy_id", "AVELLANEDA_OBI")
@@ -5438,12 +5523,15 @@ class DryRunExecutionEngine:
                                     symbol=sym,
                                     strategy=strat,
                                     side=fill.request.side,
-                                    entry_price=fill_px,
+                                    entry_price=entry_px_fill,
                                     exit_or_mid_price=exit_or_mid,
                                     qty=fill_qty,
                                     return_pct=ret * 100.0,
                                     pnl_usd=cycle_pnl,
                                     timestamp_ns=trade_ts if trade_ts > 0 else now_ns,
+                                    fee_cost=maker_fee,
+                                    is_close=is_close_fill,
+                                    fee_already_deducted=True,
                                 )
 
                                 # Trinquete 85/15: Escalado dinámico de base_capital_usd y barrido a Bóveda Spot
@@ -5477,38 +5565,45 @@ class DryRunExecutionEngine:
         realized_sigma = prim_ctx.ring_buffer.compute_realized_volatility(window_seconds=300.0)
 
         # Auditoría DSR
-        if len(self.returns_history) >= 3:
+        if len(self.returns_history) >= 30:
             try:
                 dsr_res = DeflatedSharpeAuditor.audit_returns(self.returns_history[-250:], num_trials_n=25)
             except Exception:
                 dsr_res = DSRAuditResult(
-                    deflated_sharpe_ratio=1.0,
-                    observed_sharpe_sr=2.5,
-                    benchmark_null_sr0=0.0,
-                    skewness_gamma3=0.0,
-                    kurtosis_gamma4=3.0,
+                    deflated_sharpe_ratio=None,
+                    observed_sharpe_sr=None,
+                    benchmark_null_sr0=None,
+                    skewness_gamma3=None,
+                    kurtosis_gamma4=None,
                     sample_length_t=len(self.returns_history),
                     num_trials_n=25,
-                    status="INSUFFICIENT_DATA",
+                    status=f"INSUFICIENTE ({len(self.returns_history)} trades)",
                     is_overfitted=False,
+                    annualized_sharpe=None,
                 )
         else:
             dsr_res = DSRAuditResult(
-                deflated_sharpe_ratio=1.0,
-                observed_sharpe_sr=2.5,
-                benchmark_null_sr0=0.0,
-                skewness_gamma3=0.0,
-                kurtosis_gamma4=3.0,
+                deflated_sharpe_ratio=None,
+                observed_sharpe_sr=None,
+                benchmark_null_sr0=None,
+                skewness_gamma3=None,
+                kurtosis_gamma4=None,
                 sample_length_t=len(self.returns_history),
                 num_trials_n=25,
-                status="INITIALIZING",
+                status=f"INSUFICIENTE ({len(self.returns_history)} trades)",
                 is_overfitted=False,
+                annualized_sharpe=None,
             )
 
-        # Half-Kelly
+        # Half-Kelly dinámico empírico
+        self.update_rolling_moments()
         variance_safe = max(self.portfolio.rolling_variance_sigma2, 1e-8)
         raw_half_kelly = 0.5 * (self.portfolio.rolling_edge_mu / variance_safe)
-        effective_kelly_cap = min(max(raw_half_kelly, 0.0), getattr(self.gatekeeper, "max_leverage_cap", 4.0))
+        if len(self.returns_history) < 100:
+            raw_half_kelly = min(max(raw_half_kelly, 0.0), 1.0)
+        else:
+            raw_half_kelly = max(raw_half_kelly, 0.0)
+        effective_kelly_cap = min(raw_half_kelly, getattr(self.gatekeeper, "max_leverage_cap", 4.0))
 
         latest_sim = list(prim_ctx.l2_sim.orders.values())[-1] if prim_ctx.l2_sim.orders else None
 
@@ -5832,14 +5927,15 @@ class DryRunExecutionEngine:
                 "latency_ms": 15.0,
             },
             "dsr_audit": {
-                "deflated_sharpe_ratio": round(dsr_res.deflated_sharpe_ratio, 4),
-                "observed_sharpe_sr": round(dsr_res.observed_sharpe_sr, 3),
-                "benchmark_null_sr0": round(dsr_res.benchmark_null_sr0, 3),
-                "skewness_gamma3": round(dsr_res.skewness_gamma3, 3),
-                "kurtosis_gamma4": round(dsr_res.kurtosis_gamma4, 3),
+                "deflated_sharpe_ratio": round(dsr_res.deflated_sharpe_ratio, 4) if dsr_res.deflated_sharpe_ratio is not None else None,
+                "observed_sharpe_sr": round(dsr_res.observed_sharpe_sr, 3) if dsr_res.observed_sharpe_sr is not None else None,
+                "benchmark_null_sr0": round(dsr_res.benchmark_null_sr0, 3) if dsr_res.benchmark_null_sr0 is not None else None,
+                "skewness_gamma3": round(dsr_res.skewness_gamma3, 3) if dsr_res.skewness_gamma3 is not None else None,
+                "kurtosis_gamma4": round(dsr_res.kurtosis_gamma4, 3) if dsr_res.kurtosis_gamma4 is not None else None,
                 "sample_length_t": dsr_res.sample_length_t,
                 "status": dsr_res.status,
                 "is_overfitted": dsr_res.is_overfitted,
+                "annualized_sharpe": round(dsr_res.annualized_sharpe, 3) if dsr_res.annualized_sharpe is not None else None,
             },
             "leverage_analysis": self.evaluate_leverage_tiers(),
         }

@@ -259,16 +259,16 @@ class L2QueueSimulator:
 
 @dataclass(slots=True, frozen=True)
 class DSRAuditResult:
-    deflated_sharpe_ratio: float
-    observed_sharpe_sr: float
-    benchmark_null_sr0: float
-    skewness_gamma3: float
-    kurtosis_gamma4: float
+    deflated_sharpe_ratio: float | None
+    observed_sharpe_sr: float | None
+    benchmark_null_sr0: float | None
+    skewness_gamma3: float | None
+    kurtosis_gamma4: float | None
     sample_length_t: int
     num_trials_n: int
-    status: Literal["STATISTICALLY_SIGNIFICANT", "OVERFITTING_WARNING"]
+    status: str
     is_overfitted: bool
-    annualized_sharpe: float = 0.0
+    annualized_sharpe: float | None = None
 
 
 class TrialRegistry:
