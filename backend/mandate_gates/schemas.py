@@ -122,6 +122,10 @@ class PortfolioState(BaseModel):
         default_factory=dict,
         description="Mapa {symbol: notional_usd} de posiciones activas con margen comprometido",
     )
+    open_orders_notional: dict[str, float] = Field(
+        default_factory=dict,
+        description="Mapa {symbol: notional_usd} de órdenes límite activas en el libro pendientes de ejecución",
+    )
     rolling_edge_mu: float = Field(
         ..., description="Retorno esperado instantáneo (drift mu) estimado sobre microestructura"
     )

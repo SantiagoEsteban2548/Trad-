@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   ShieldAlert,
   Activity,
@@ -833,16 +833,6 @@ export default function App() {
   >('command');
 
   // Telemetry Server Endpoints (Direct integration with backend/telemetry_server.py)
-  const initialPort = typeof window !== 'undefined' && window.location.port === '8001' ? 8001 : 8000;
-  const initialHost = typeof window !== 'undefined' && window.location.hostname ? window.location.hostname : '127.0.0.1';
-
-  const [activeServerInstance, setActiveServerInstance] = useState<'binance_8000' | 'bingx_8001'>(
-    initialPort === 8001 ? 'bingx_8001' : 'binance_8000'
-  );
-  const activeInstanceRef = useRef<'binance_8000' | 'bingx_8001'>(
-    initialPort === 8001 ? 'bingx_8001' : 'binance_8000'
-  );
-
   const [wsUrl, setWsUrl] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       if (window.location.port === '5173') {
@@ -851,7 +841,7 @@ export default function App() {
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       return `${proto}//${window.location.host}/ws/telemetry`;
     }
-    return `ws://${initialHost}:${initialPort}/ws/telemetry`;
+    return 'ws://127.0.0.1:8000/ws/telemetry';
   });
   const [apiBaseUrl, setApiBaseUrl] = useState<string>(() => {
     if (typeof window !== 'undefined') {
@@ -860,38 +850,11 @@ export default function App() {
       }
       return window.location.origin;
     }
-    return `http://${initialHost}:${initialPort}`;
+    return 'http://127.0.0.1:8000';
   });
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [httpConnected, setHttpConnected] = useState<boolean>(false);
   const [wsLastError, setWsLastError] = useState<string | null>(null);
-
-  const activeWsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<any>(null);
-
-  const handleSelectInstance = (instance: 'binance_8000' | 'bingx_8001') => {
-    activeInstanceRef.current = instance;
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    if (activeWsRef.current) {
-      activeWsRef.current.onopen = null;
-      activeWsRef.current.onmessage = null;
-      activeWsRef.current.onerror = null;
-      activeWsRef.current.onclose = null;
-      try { activeWsRef.current.close(); } catch {}
-      activeWsRef.current = null;
-    }
-    setWsConnected(false);
-
-    setActiveServerInstance(instance);
-    const host = (typeof window !== 'undefined' && window.location.hostname) ? window.location.hostname : '127.0.0.1';
-    const port = instance === 'binance_8000' ? 8000 : 8001;
-    setApiBaseUrl(`http://${host}:${port}`);
-    setWsUrl(`ws://${host}:${port}/ws/telemetry`);
-    setTradingMode(instance === 'binance_8000' ? 'LIVE_BINANCE' : 'LIVE_BINGX');
-  };
 
   // Live Telemetry Payload State (Direct from backend/telemetry_server.py)
   const [isLiveRunning, setIsLiveRunning] = useState<boolean>(true);
@@ -912,9 +875,9 @@ export default function App() {
   const [rotationsFilled, setRotationsFilled] = useState<number>(0);
 
   // Portfolio State
-  const [baseCapital, setBaseCapital] = useState<number>(initialPort === 8001 ? 99460.0 : 4950.0);
-  const [currentEquity, setCurrentEquity] = useState<number>(initialPort === 8001 ? 99460.0 : 4950.0);
-  const [dailyHwm, setDailyHwm] = useState<number>(initialPort === 8001 ? 99460.0 : 4950.0);
+  const [baseCapital, setBaseCapital] = useState<number>(100.0);
+  const [currentEquity, setCurrentEquity] = useState<number>(100.0);
+  const [dailyHwm, setDailyHwm] = useState<number>(100.0);
   const [realizedPnlToday, setRealizedPnlToday] = useState<number>(0.0);
   const [dailyReturnPct, setDailyReturnPct] = useState<number>(0.0);
   const [dailyDrawdownPct, setDailyDrawdownPct] = useState<number>(0.0);
@@ -923,9 +886,7 @@ export default function App() {
   const [exchangeEquities, setExchangeEquities] = useState<Record<string, number>>({});
 
   // Operational Mode State: PAPER_L2 vs LIVE_BINANCE vs LIVE_BINGX vs LIVE_MULTI
-  const [tradingMode, setTradingMode] = useState<'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI'>(
-    initialPort === 8001 ? 'LIVE_BINGX' : 'LIVE_BINANCE'
-  );
+  const [tradingMode, setTradingMode] = useState<'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI'>('PAPER_L2');
   const [pendingLiveMode, setPendingLiveMode] = useState<'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI'>('LIVE_BINANCE');
   const [isLiveConfirmOpen, setIsLiveConfirmOpen] = useState<boolean>(false);
   const [modeSwitchError, setModeSwitchError] = useState<string | null>(null);
@@ -1179,21 +1140,7 @@ export default function App() {
     };
   }, [activeCoin, activeTimeframe, symbolsData, midPrice, bestBid, bestAsk, liveObi, optimalSpread, reservationPrice, candlesHistory]);
 
-  const applyTelemetrySnapshot = (data: any, sourceInstance?: 'binance_8000' | 'bingx_8001') => {
-    const currentActive = activeInstanceRef.current;
-    if (sourceInstance && sourceInstance !== currentActive) {
-      return;
-    }
-    const incomingMode = data.trading_mode || data.mode;
-
-    // Strict Anti-Alternation Guard: Never apply frames from the wrong instance
-    if (currentActive === 'bingx_8001' && incomingMode !== 'LIVE_BINGX') {
-      return;
-    }
-    if (currentActive === 'binance_8000' && incomingMode !== 'LIVE_BINANCE') {
-      return;
-    }
-
+  const applyTelemetrySnapshot = (data: any) => {
     setTickCount((prev) => prev + 1);
 
     if (data.mode) {
@@ -1382,107 +1329,80 @@ export default function App() {
 
   // WebSocket Connection to backend/telemetry_server.py
   useEffect(() => {
-    let isDestroyed = false;
+    let ws: WebSocket | null = null;
+    let reconnectTimeout: any = null;
 
     const connectWs = () => {
-      if (isDestroyed) return;
       try {
-        if (activeWsRef.current) {
-          activeWsRef.current.onopen = null;
-          activeWsRef.current.onmessage = null;
-          activeWsRef.current.onerror = null;
-          activeWsRef.current.onclose = null;
-          try { activeWsRef.current.close(); } catch {}
-          activeWsRef.current = null;
-        }
-
-        const currentTargetWs = wsUrl;
-        const currentTargetInstance = activeServerInstance;
-        const ws = new WebSocket(currentTargetWs);
-        activeWsRef.current = ws;
+        ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
-          if (isDestroyed || activeWsRef.current !== ws) {
-            try { ws.close(); } catch {}
-            return;
-          }
           setWsConnected(true);
           setWsLastError(null);
         };
 
         ws.onmessage = (event) => {
-          if (isDestroyed || activeWsRef.current !== ws) return;
-          if (activeInstanceRef.current !== currentTargetInstance) {
-            try { ws.close(); } catch {}
-            return;
-          }
           try {
             const data = JSON.parse(event.data);
-            applyTelemetrySnapshot(data, currentTargetInstance);
+            applyTelemetrySnapshot(data);
           } catch {
             // ignore non-json frame
           }
         };
 
         ws.onerror = () => {
-          if (isDestroyed || activeWsRef.current !== ws) return;
           setWsConnected(false);
-          setWsLastError(`Reintentando conexión con ${currentTargetWs}...`);
+          setWsLastError('Reintentando conexión con /ws/telemetry...');
         };
 
         ws.onclose = () => {
-          if (isDestroyed || activeWsRef.current !== ws) return;
           setWsConnected(false);
-          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = setTimeout(connectWs, 3000);
+          reconnectTimeout = setTimeout(connectWs, 3000);
         };
       } catch (err: any) {
-        if (isDestroyed) return;
         setWsConnected(false);
         setWsLastError(err.message || 'Error inicializando WebSocket');
-        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = setTimeout(connectWs, 3000);
+        reconnectTimeout = setTimeout(connectWs, 3000);
       }
     };
 
     connectWs();
 
     return () => {
-      isDestroyed = true;
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = null;
-      }
-      if (activeWsRef.current) {
-        activeWsRef.current.onopen = null;
-        activeWsRef.current.onmessage = null;
-        activeWsRef.current.onerror = null;
-        activeWsRef.current.onclose = null;
-        try { activeWsRef.current.close(); } catch {}
-        activeWsRef.current = null;
-      }
-      setWsConnected(false);
+      if (ws) ws.close();
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
     };
-  }, [wsUrl, activeServerInstance]);
+  }, [wsUrl]);
 
   // REST Telemetry sync polling (Zero mocks: fetches real data from GET /api/telemetry when WS is idle or connecting)
   useEffect(() => {
     if (wsConnected || !isLiveRunning) return;
 
     let active = true;
-    const currentInstance = activeServerInstance;
     const fetchTelemetry = async () => {
-      if (!active || activeInstanceRef.current !== currentInstance) return;
       try {
-        const res = await fetch(`${apiBaseUrl}/api/telemetry`, { cache: 'no-store' });
-        if (res.ok) {
-          const data = await res.json();
-          if (active && activeInstanceRef.current === currentInstance) {
-            applyTelemetrySnapshot(data, currentInstance);
-            setHttpConnected(true);
-            setWsLastError(null);
+        // Try local relative origin first, fallback to direct port 8000
+        const endpoints = [
+          `${apiBaseUrl}/api/telemetry`,
+          'http://127.0.0.1:8000/api/telemetry',
+        ];
+        for (const ep of endpoints) {
+          try {
+            const res = await fetch(ep, { cache: 'no-store' });
+            if (res.ok) {
+              const data = await res.json();
+              if (active) {
+                applyTelemetrySnapshot(data);
+                setHttpConnected(true);
+                setWsLastError(null);
+              }
+              return;
+            }
+          } catch {
+            // try next endpoint
           }
-        } else if (active) {
+        }
+        if (active) {
           setHttpConnected(false);
         }
       } catch {
@@ -1497,7 +1417,7 @@ export default function App() {
       active = false;
       clearInterval(interval);
     };
-  }, [wsConnected, isLiveRunning, apiBaseUrl, activeServerInstance]);
+  }, [wsConnected, isLiveRunning, apiBaseUrl]);
 
 
   // Kill Switch HTTP Trigger (POST /api/emergency-flatten)
@@ -1535,12 +1455,6 @@ export default function App() {
 
   const handleSwitchMode = async (targetMode: 'PAPER_L2' | 'LIVE_BINANCE' | 'LIVE_BINGX' | 'LIVE_MULTI') => {
     if (targetMode === tradingMode) return;
-    if (targetMode === 'LIVE_BINGX' && activeServerInstance !== 'bingx_8001') {
-      handleSelectInstance('bingx_8001');
-    } else if (targetMode === 'LIVE_BINANCE' && activeServerInstance !== 'binance_8000') {
-      handleSelectInstance('binance_8000');
-    }
-
     if (targetMode === 'LIVE_BINANCE' || targetMode === 'LIVE_BINGX' || targetMode === 'LIVE_MULTI') {
       setPendingLiveMode(targetMode);
       setModeSwitchError(null);
@@ -1575,14 +1489,8 @@ export default function App() {
   const confirmSwitchToLive = async () => {
     setIsSwitchingMode(true);
     setModeSwitchError(null);
-    if (pendingLiveMode === 'LIVE_BINGX' && activeServerInstance !== 'bingx_8001') {
-      handleSelectInstance('bingx_8001');
-    } else if (pendingLiveMode === 'LIVE_BINANCE' && activeServerInstance !== 'binance_8000') {
-      handleSelectInstance('binance_8000');
-    }
-    const targetUrl = pendingLiveMode === 'LIVE_BINGX' ? 'http://127.0.0.1:8001' : (pendingLiveMode === 'LIVE_BINANCE' ? 'http://127.0.0.1:8000' : apiBaseUrl);
     try {
-      const res = await fetch(`${targetUrl}/api/trading-mode`, {
+      const res = await fetch(`${apiBaseUrl}/api/trading-mode`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: pendingLiveMode }),
@@ -1887,32 +1795,6 @@ export default function App() {
                         {wsConnected ? 'LIVE CCXT WS (10 Hz)' : 'OFFLINE / RECONNECT'}
                       </p>
                     </div>
-                  </div>
-
-                  {/* Selector de Instancia de Ejecución (Binance :8000 vs BingX :8001) */}
-                  <div className="flex items-center gap-1 p-1 bg-[#080A0F] rounded-lg border border-[#1C2230] text-[10px] font-mono">
-                    <button
-                      onClick={() => handleSelectInstance('binance_8000')}
-                      className={`flex-1 py-1 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
-                        activeServerInstance === 'binance_8000'
-                          ? 'bg-[#A855F7]/25 text-[#A855F7] border border-[#A855F7]/40 shadow-sm'
-                          : 'text-slate-400 hover:text-[#A855F7]'
-                      }`}
-                      title="Instancia Servidor Binance Futures (Puerto 8000 - Todas las monedas)"
-                    >
-                      <span>BINANCE :8000</span>
-                    </button>
-                    <button
-                      onClick={() => handleSelectInstance('bingx_8001')}
-                      className={`flex-1 py-1 px-1 rounded font-bold flex items-center justify-center gap-1 transition-all ${
-                        activeServerInstance === 'bingx_8001'
-                          ? 'bg-amber-500/25 text-amber-400 border border-amber-500/40 shadow-sm'
-                          : 'text-slate-400 hover:text-amber-400'
-                      }`}
-                      title="Instancia Servidor BingX Swap (Puerto 8001 - Todas las monedas)"
-                    >
-                      <span>BINGX :8001</span>
-                    </button>
                   </div>
 
                   {/* Selector cuadri-modal protegido */}

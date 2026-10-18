@@ -145,7 +145,7 @@ class WebSocketMultiplexer:
         logger.info("Multiplexer WS detenido correctamente.")
 
     async def _secondary_order_book_stream(self, symbol: str) -> None:
-        watch_symbol = self._resolve_secondary_watch_symbol(symbol)
+        watch_symbol = self._resolve_watch_symbol(symbol)
         while self.running and self.secondary_exchange:
             try:
                 ob = await self.secondary_exchange.watch_order_book(watch_symbol, limit=5)
@@ -188,60 +188,67 @@ class WebSocketMultiplexer:
     def _resolve_watch_symbol(self, symbol: str) -> str:
         if symbol == "PEPE/USDT:USDT":
             return "1000PEPE/USDT:USDT"
-        ex_id = getattr(self, "exchange_id", "") or (getattr(self.exchange, "id", "") if hasattr(self, "exchange") and self.exchange else "")
-        if "bingx" in str(ex_id).lower():
-            if symbol == "XAU/USDT:USDT":
-                return "XAUT/USDT:USDT"
-            if symbol == "XAG/USDT:USDT":
-                return "NCCOXAG2USD/USDT:USDT"
-        return symbol
-
-    def _resolve_secondary_watch_symbol(self, symbol: str) -> str:
-        if symbol == "PEPE/USDT:USDT":
-            return "1000PEPE/USDT:USDT"
-        sec_id = getattr(self, "secondary_exchange_id", "") or (getattr(self.secondary_exchange, "id", "") if getattr(self, "secondary_exchange", None) else "")
-        if "bingx" in str(sec_id).lower():
-            if symbol == "XAU/USDT:USDT":
-                return "XAUT/USDT:USDT"
-            if symbol == "XAG/USDT:USDT":
-                return "NCCOXAG2USD/USDT:USDT"
         return symbol
 
     async def _order_book_stream(self, symbol: str) -> None:
         ring = self.buffers[symbol]
         watch_symbol = self._resolve_watch_symbol(symbol)
         while self.running:
-            ob = await self.exchange.watch_order_book(watch_symbol, limit=5)
-            ts_ns = time.time_ns()
+            try:
+                ob = await asyncio.wait_for(
+                    self.exchange.watch_order_book(watch_symbol, limit=5),
+                    timeout=15.0,
+                )
+                ts_ns = time.time_ns()
 
-            raw_bids = ob.get("bids", [])
-            raw_asks = ob.get("asks", [])
-            if len(raw_bids) < 5 or len(raw_asks) < 5:
-                continue
+                raw_bids = ob.get("bids", [])
+                raw_asks = ob.get("asks", [])
+                if len(raw_bids) < 5 or len(raw_asks) < 5:
+                    continue
 
-            bid_p = [self._safe_price(watch_symbol, b[0]) for b in raw_bids[:5]]
-            bid_q = [self._safe_amount(watch_symbol, b[1]) for b in raw_bids[:5]]
-            ask_p = [self._safe_price(watch_symbol, a[0]) for a in raw_asks[:5]]
-            ask_q = [self._safe_amount(watch_symbol, a[1]) for a in raw_asks[:5]]
+                bid_p = [self._safe_price(watch_symbol, b[0]) for b in raw_bids[:5]]
+                bid_q = [self._safe_amount(watch_symbol, b[1]) for b in raw_bids[:5]]
+                ask_p = [self._safe_price(watch_symbol, a[0]) for a in raw_asks[:5]]
+                ask_q = [self._safe_amount(watch_symbol, a[1]) for a in raw_asks[:5]]
 
-            if any(p <= 0.0 for p in bid_p) or any(p <= 0.0 for p in ask_p):
-                continue
+                if any(p <= 0.0 for p in bid_p) or any(p <= 0.0 for p in ask_p):
+                    continue
 
-            ring.push_order_book(bid_p, bid_q, ask_p, ask_q, ts_ns)
+                ring.push_order_book(bid_p, bid_q, ask_p, ask_q, ts_ns)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout (15s) en watch_order_book {symbol}. Reconectando stream...")
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Excepción en _order_book_stream {symbol}: {e}")
+                await asyncio.sleep(1.0)
 
     async def _trades_stream(self, symbol: str) -> None:
         ring = self.buffers[symbol]
         watch_symbol = self._resolve_watch_symbol(symbol)
         while self.running:
-            trades = await self.exchange.watch_trades(watch_symbol)
-            ts_ns = time.time_ns()
-            for trade in trades:
-                p = self._safe_price(watch_symbol, trade.get("price"))
-                q = self._safe_amount(watch_symbol, trade.get("amount"))
-                if p <= 0.0 or q <= 0.0:
-                    continue
-                side_maker = trade.get("side") == "sell" or trade.get("info", {}).get("m", False)
-                ring.push_trade(p, q, side_maker, ts_ns)
+            try:
+                trades = await asyncio.wait_for(
+                    self.exchange.watch_trades(watch_symbol),
+                    timeout=30.0,
+                )
+                ts_ns = time.time_ns()
+                for trade in trades:
+                    p = self._safe_price(watch_symbol, trade.get("price"))
+                    q = self._safe_amount(watch_symbol, trade.get("amount"))
+                    if p <= 0.0 or q <= 0.0:
+                        continue
+                    side_maker = trade.get("side") == "sell" or trade.get("info", {}).get("m", False)
+                    ring.push_trade(p, q, side_maker, ts_ns)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout (30s) en watch_trades {symbol}. Reconectando stream...")
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Excepción en _trades_stream {symbol}: {e}")
+                await asyncio.sleep(1.0)
 
     async def _liquidations_stream(self, symbol: str) -> None:
         ring = self.buffers[symbol]

@@ -393,3 +393,192 @@ async def test_place_order_ws_handles_5022_order_immediately_fillable_cleanly(mo
 
     assert order_id2 == ""
 
+
+@pytest.mark.asyncio
+async def test_close_position_market_failure_retains_active_position_and_sl(mock_exchange: MagicMock) -> None:
+    """
+    Escenario Adversario 1: Si close_position_market falla (ej. timeout / error 502) durante
+    un evento de STOP_LOSS en vivo, el motor NO debe borrar la posición de portfolio.active_positions
+    ni limpiar ctx.stop_loss_price para que el siguiente ciclo vuelva a intentar cerrarla.
+    """
+    from backend.telemetry_server import engine
+    import time
+
+    sym = "BTC/USDT:USDT"
+    ctx = engine.symbol_contexts[sym]
+    prev_mode = engine.trading_mode
+    prev_gw = engine.live_gateway
+
+    try:
+        # Configurar gateway que falla al enviar orden market
+        mock_exchange.create_order = AsyncMock(side_effect=Exception("502 Bad Gateway"))
+        gw = BinanceLiveWsGateway(exchange=mock_exchange, portfolio=engine.portfolio)
+        gw.ledger.reconcile_position(sym, "BUY", 0.01, 65000.0, 65000.0)
+        engine.live_gateway = gw
+        engine.trading_mode = "LIVE_BINANCE"
+
+        # Simular posición LONG abierta con Stop Loss en $64,800
+        engine.portfolio.active_positions[sym] = 650.0  # $650 USD notional
+        ctx.avg_entry_price = 65000.0
+        ctx.take_profit_price = 65150.0
+        ctx.stop_loss_price = 64800.0
+        ctx.inventory_open_ts_ns = time.time_ns()
+
+        # Disparar evaluación con mid_px ($64,700) por debajo del Stop Loss ($64,800)
+        exit_res = await engine.check_and_execute_tp_sl_closures(
+            symbol=sym,
+            best_bid=64699.0,
+            best_ask=64701.0,
+            mid_px=64700.0,
+            now_ns=time.time_ns(),
+        )
+
+        # Al fallar los 3 intentos de close_position_market, debe retornar None y conservar estado
+        assert exit_res is None
+        assert sym in engine.portfolio.active_positions
+        assert engine.portfolio.active_positions[sym] == 650.0
+        assert ctx.stop_loss_price == 64800.0
+        assert mock_exchange.create_order.await_count == 3
+    finally:
+        engine.trading_mode = prev_mode
+        engine.live_gateway = prev_gw
+        engine.portfolio.active_positions.pop(sym, None)
+        ctx.avg_entry_price = None
+        ctx.take_profit_price = None
+        ctx.stop_loss_price = None
+        ctx.inventory_open_ts_ns = None
+
+
+@pytest.mark.asyncio
+async def test_fill_idempotency_prevents_double_accounting_ws_and_rest(mock_exchange: MagicMock) -> None:
+    """
+    Escenario Adversario 2: Si una orden se llena y el evento llega simultáneamente por
+    WebSocket (_handle_order_completion) y por polling REST (sync_portfolio_state / fetch_my_trades),
+    el cerrojo de idempotencia (_processed_order_ids) debe evitar duplicar el inventario y el callback on_fill.
+    """
+    fills_recorded = []
+
+    def on_fill_cb(**kwargs):
+        fills_recorded.append(kwargs)
+
+    portfolio = PortfolioState(
+        base_capital_usd=1000.0,
+        current_equity_usd=1000.0,
+        daily_high_watermark_usd=1000.0,
+        realized_pnl_today_usd=0.0,
+        active_positions={},
+        rolling_edge_mu=0.045,
+        rolling_variance_sigma2=0.0090,
+    )
+
+    mock_exchange.fetch_order = AsyncMock(
+        return_value={
+            "id": "ord_999",
+            "status": "closed",
+            "filled": 0.01,
+            "average": 65000.0,
+            "price": 65000.0,
+        }
+    )
+
+    gw = BinanceLiveWsGateway(exchange=mock_exchange, portfolio=portfolio, on_fill=on_fill_cb)
+    gw.active_orders_meta["ord_999"] = {
+        "symbol": "BTC/USDT:USDT",
+        "side": "BUY",
+        "price": 65000.0,
+        "qty": 0.01,
+        "client_order_id": "AVELLANEDA_OBI_MAIN_1",
+    }
+
+    # Invocar _handle_order_completion dos veces concurrentemente para el mismo order_id
+    await gw._handle_order_completion("ord_999", "BTC/USDT:USDT", "BUY", portfolio)
+    await gw._handle_order_completion("ord_999", "BTC/USDT:USDT", "BUY", portfolio)
+
+    # Debe haberse contabilizado exactamente 1 vez (0.01 BTC = $650.0 USD nocional)
+    assert len(fills_recorded) == 1
+    assert gw.ledger.get_net_inventory("BTC/USDT:USDT") == pytest.approx(0.01)
+    assert portfolio.active_positions["BTC/USDT:USDT"] == pytest.approx(650.0)
+
+
+@pytest.mark.asyncio
+async def test_place_protective_stop_loss_uses_mark_price_and_reduce_only(mock_exchange: MagicMock) -> None:
+    """
+    Escenario Adversario 3: Verifica que place_protective_stop_loss envíe una orden
+    STOP_MARKET nativa al servidor del exchange con workingType='MARK_PRICE' y reduceOnly=True.
+    """
+    mock_exchange.create_order = AsyncMock(return_value={"id": "sl_native_777", "status": "open"})
+    gw = BinanceLiveWsGateway(exchange=mock_exchange)
+
+    sl_id = await gw.place_protective_stop_loss(
+        symbol="BTC/USDT:USDT",
+        close_side="SELL",
+        qty=0.015,
+        stop_price=64123.456,
+    )
+
+    assert sl_id == "sl_native_777"
+    assert gw.protective_sl_by_symbol["BTC/USDT:USDT"] == "sl_native_777"
+    mock_exchange.create_order.assert_awaited_once()
+    call_kwargs = mock_exchange.create_order.await_args.kwargs
+    assert call_kwargs["type"] == "STOP_MARKET"
+    assert call_kwargs["side"] == "sell"
+    assert call_kwargs["amount"] == 0.015
+    assert call_kwargs["params"]["reduceOnly"] is True
+    assert call_kwargs["params"]["workingType"] == "MARK_PRICE"
+    assert call_kwargs["params"]["stopPrice"] == 64123.4
+
+
+def test_gatekeeper_loss_streak_circuit_breaker_and_429_cooldown() -> None:
+    """
+    Escenario Adversario 4: Verifica que MandateGatekeeper active el Kill-Switch tras alcanzar
+    max_consecutive_losses (5 pérdidas seguidas) y que bloquee temporalmente el envío de órdenes
+    durante un enfriamiento por HTTP 429 / -1003 (Rate Limit).
+    """
+    valid_portfolio = PortfolioState(
+        base_capital_usd=10_000.0,
+        current_equity_usd=10_000.0,
+        daily_high_watermark_usd=10_000.0,
+        realized_pnl_today_usd=0.0,
+        active_positions={},
+        rolling_edge_mu=0.045,
+        rolling_variance_sigma2=0.0090,
+    )
+    gk = MandateGatekeeper(max_consecutive_losses=5)
+    order = OrderRequest(
+        symbol="BTC/USDT:USDT",
+        side="BUY",
+        order_type="LIMIT",
+        price=60000.0,
+        qty=0.01,
+        time_in_force="GTX",
+        margin_mode="ISOLATED",
+        strategy_id="AVELLANEDA_OBI",
+        timestamp_ns=1_000_000_000,
+    )
+
+    # 1. Simular error 429 Rate Limit -> debe activar cooldown temporal
+    gk.record_api_error("429 Too Many Requests (-1003 Way too much request weight)")
+    allowed_rl, reason_rl = gk.validate_order(order, valid_portfolio)
+    assert allowed_rl is False
+    assert "RATE_LIMIT_COOLDOWN" in reason_rl
+
+    # Limpiar cooldown para probar racha de pérdidas
+    gk.rate_limit_cooldown_until_ns = 0
+
+    # 2. Registrar 4 pérdidas seguidas y 1 ganancia -> resetea contador a 0
+    for _ in range(4):
+        gk.record_trade_outcome(-1.50)
+    assert gk.consecutive_losses == 4
+    gk.record_trade_outcome(2.00)
+    assert gk.consecutive_losses == 0
+
+    # 3. Registrar 5 pérdidas consecutivas -> dispara Circuit Breaker y Kill-Switch
+    for _ in range(5):
+        gk.record_trade_outcome(-1.25)
+    assert gk.consecutive_losses == 5
+    assert gk.kill_switch_engaged is True
+
+    allowed_ls, reason_ls = gk.validate_order(order, valid_portfolio)
+    assert allowed_ls is False
+    assert "KILL_SWITCH" in reason_ls or "LOSS_STREAK" in reason_ls
+

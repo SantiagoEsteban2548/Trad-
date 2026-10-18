@@ -1,11 +1,17 @@
 {
   "market_regime": "LOW_VOL_RANGE",
   "avellaneda_gamma": 0.15,
-  "order_book_intensity_kappa": 2.0,
+  "order_book_intensity_kappa": 2.2,
   "obi_cancel_threshold": 0.65,
   "approved_symbols": [
-    "BTC/USDT:USDT"
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "XAU/USDT:USDT"
   ],
-  "max_leverage_cap": 3.0,
-  "risk_rationale": "Local fallback: normal volatility regime (0.00). Standard market making parameters active."
+  "max_leverage_cap": 4.0,
+  "max_single_pair_margin_ratio": 0.20,
+  "min_profitable_spread_bps_floor": 8.0,
+  "inventory_holding_decay_window_s": 180.0,
+  "risk_rationale": "Calibrado institucional: régimen normal de baja volatilidad, 4x apalancamiento máximo, spread floor de 8 bps y contención de riesgo por par al 20%."
 }

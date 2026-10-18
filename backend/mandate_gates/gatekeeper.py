@@ -1,6 +1,7 @@
 # backend/mandate_gates/gatekeeper.py
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from backend.mandate_gates.schemas import OrderRequest, PortfolioState
 
@@ -16,6 +17,8 @@ class MandateGatekeeper:
     MAX_LEVERAGE_CAP: float = 4.0
     MAX_SINGLE_PAIR_MARGIN_RATIO: float = 0.20
     DAILY_KILL_SWITCH_DRAWDOWN: float = -0.03
+    MAX_CONSECUTIVE_LOSSES: int = 5
+    MAX_CONSECUTIVE_API_ERRORS: int = 5
     FLOAT_EPSILON: float = 1e-12
 
     __slots__ = (
@@ -24,6 +27,10 @@ class MandateGatekeeper:
         "emergency_flatten_count",
         "max_leverage_cap",
         "max_single_pair_margin_ratio",
+        "consecutive_losses",
+        "max_consecutive_losses",
+        "consecutive_api_errors",
+        "rate_limit_cooldown_until_ns",
     )
 
     def __init__(
@@ -31,6 +38,7 @@ class MandateGatekeeper:
         emergency_callback: Callable[[], None] | None = None,
         max_leverage_cap: float | None = None,
         max_single_pair_margin_ratio: float | None = None,
+        max_consecutive_losses: int | None = None,
     ) -> None:
         self._emergency_callback = emergency_callback
         self.kill_switch_engaged: bool = False
@@ -43,6 +51,48 @@ class MandateGatekeeper:
             if max_single_pair_margin_ratio is not None
             else self.MAX_SINGLE_PAIR_MARGIN_RATIO
         )
+        self.consecutive_losses: int = 0
+        self.max_consecutive_losses: int = (
+            int(max_consecutive_losses) if max_consecutive_losses is not None else self.MAX_CONSECUTIVE_LOSSES
+        )
+        self.consecutive_api_errors: int = 0
+        self.rate_limit_cooldown_until_ns: int = 0
+
+    def record_trade_outcome(self, pnl_usd: float) -> bool:
+        """
+        Registra el resultado de un cierre de posición para el Circuit Breaker de racha de pérdidas.
+        Retorna True si se disparó el Kill-Switch por racha de pérdidas consecutivas.
+        """
+        if pnl_usd < -1e-6:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= self.max_consecutive_losses:
+                self.trigger_emergency_flatten()
+                return True
+        elif pnl_usd > 1e-6:
+            self.consecutive_losses = 0
+        return False
+
+    def record_api_error(self, error_str: str, cooldown_seconds: float = 60.0) -> None:
+        """
+        Registra errores de API o límites de tasa (HTTP 429 / 418 / -1003) y activa
+        una ventana de enfriamiento (cooldown) para proteger la IP de baneos del exchange.
+        """
+        self.consecutive_api_errors += 1
+        err_lower = str(error_str).lower()
+        is_rate_limit = (
+            "429" in err_lower
+            or "418" in err_lower
+            or "-1003" in err_lower
+            or "too many requests" in err_lower
+            or "rate limit" in err_lower
+            or "way too many" in err_lower
+        )
+        if is_rate_limit or self.consecutive_api_errors >= self.MAX_CONSECUTIVE_API_ERRORS:
+            self.rate_limit_cooldown_until_ns = time.time_ns() + int(cooldown_seconds * 1_000_000_000)
+
+    def record_api_success(self) -> None:
+        """Resetea el contador de errores consecutivos de API tras una respuesta exitosa."""
+        self.consecutive_api_errors = 0
 
     def set_leverage_tier(self, leverage: float) -> None:
         """
@@ -76,8 +126,7 @@ class MandateGatekeeper:
         """
         # ---------------------------------------------------------------------
         # GATE 4: Kill-Switch Diario del -3.0% desde el High-Water Mark
-        # Se evalúa con prioridad crítica para frenar inmediatamente toda exposición
-        # si la cuenta ha sufrido un drawdown diario >= 3.0%.
+        # y Circuit Breaker por Racha de Pérdidas / Rate-Limit Cooldown
         # ---------------------------------------------------------------------
         hwm = state.daily_high_watermark_usd
         drawdown = (state.current_equity_usd - hwm) / hwm
@@ -87,6 +136,20 @@ class MandateGatekeeper:
                 False,
                 f"GATE_4_KILL_SWITCH: Drawdown diario ({drawdown * 100:.2f}%) <= -3.00%. "
                 "Nuevas órdenes bloqueadas y flatten de emergencia disparado.",
+            )
+
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            self.trigger_emergency_flatten()
+            return (
+                False,
+                f"GATE_4_LOSS_STREAK_CIRCUIT_BREAKER: {self.consecutive_losses} pérdidas consecutivas "
+                f"(máximo permitido: {self.max_consecutive_losses}). Flatten de emergencia activado.",
+            )
+
+        if self.rate_limit_cooldown_until_ns > 0 and time.time_ns() < self.rate_limit_cooldown_until_ns:
+            return (
+                False,
+                "GATE_4_API_RATE_LIMIT_COOLDOWN: Enfriamiento activo por Rate Limit (HTTP 429/418) o errores de API.",
             )
 
         # ---------------------------------------------------------------------
@@ -125,13 +188,15 @@ class MandateGatekeeper:
 
         # 3a. Concentración máxima por par individual (<= 20% del margen operativo)
         existing_pair_notional = state.active_positions.get(order.symbol, 0.0)
+        open_orders_map = getattr(state, "open_orders_notional", None) or {}
+        pending_pair_notional = abs(float(open_orders_map.get(order.symbol, 0.0)))
         is_reducing = (existing_pair_notional > 0 and order.side == "SELL") or (
             existing_pair_notional < 0 and order.side == "BUY"
         )
         if is_reducing:
             projected_pair_notional = max(0.0, abs(existing_pair_notional) - order_notional)
         else:
-            projected_pair_notional = abs(existing_pair_notional) + order_notional
+            projected_pair_notional = abs(existing_pair_notional) + pending_pair_notional + order_notional
         pair_margin_ratio = projected_pair_notional / base_cap
 
         if pair_margin_ratio > (self.max_single_pair_margin_ratio + self.FLOAT_EPSILON):
@@ -144,6 +209,8 @@ class MandateGatekeeper:
         # 3b. Apalancamiento total del portafolio vs min(L_half_kelly, max_leverage_cap)
         other_pairs_notional = sum(
             abs(pos_notional) for sym, pos_notional in state.active_positions.items() if sym != order.symbol
+        ) + sum(
+            abs(float(ord_notional)) for sym, ord_notional in open_orders_map.items() if sym != order.symbol
         )
 
         projected_total_leverage = (other_pairs_notional + projected_pair_notional) / base_cap
