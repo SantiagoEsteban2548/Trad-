@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import math
 from typing import Literal, Sequence
 import numpy as np
@@ -267,6 +268,29 @@ class DSRAuditResult:
     num_trials_n: int
     status: Literal["STATISTICALLY_SIGNIFICANT", "OVERFITTING_WARNING"]
     is_overfitted: bool
+    annualized_sharpe: float = 0.0
+
+
+class TrialRegistry:
+    """Registro determinista y observable del número real de configuraciones / trials evaluados."""
+    _trials_count: int = 1
+
+    @classmethod
+    def register_trial(cls) -> int:
+        cls._trials_count += 1
+        return cls._trials_count
+
+    @classmethod
+    def set_trials_count(cls, count: int) -> None:
+        cls._trials_count = max(1, int(count))
+
+    @classmethod
+    def get_trials_count(cls) -> int:
+        return cls._trials_count
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._trials_count = 1
 
 
 class DeflatedSharpeAuditor:
@@ -384,6 +408,7 @@ class DeflatedSharpeAuditor:
         kurtosis_gamma4: float,
         num_trials_n: int = 1,
         trials_sr_variance: float | None = None,
+        annualization_factor: float = 365.0,
     ) -> DSRAuditResult:
         """
         Calcula el Deflated Sharpe Ratio de Bailey y López de Prado.
@@ -412,6 +437,7 @@ class DeflatedSharpeAuditor:
         status: Literal["STATISTICALLY_SIGNIFICANT", "OVERFITTING_WARNING"] = (
             "OVERFITTING_WARNING" if is_overfitted else "STATISTICALLY_SIGNIFICANT"
         )
+        annualized_sr = round(float(observed_sr * math.sqrt(annualization_factor)), 4)
 
         return DSRAuditResult(
             deflated_sharpe_ratio=dsr_value,
@@ -423,7 +449,37 @@ class DeflatedSharpeAuditor:
             num_trials_n=num_trials_n,
             status=status,
             is_overfitted=is_overfitted,
+            annualized_sharpe=annualized_sr,
         )
+
+    @classmethod
+    def aggregate_daily_returns(
+        cls,
+        equity_snapshots: Sequence[tuple[int | str, float]],
+    ) -> list[float]:
+        """
+        Agrega una serie de equidad con timestamps (ms o date_str) en retornos diarios discretos:
+        R_d = (Equity_d - Equity_{d-1}) / Equity_{d-1}
+        """
+        daily_equity: dict[str, float] = {}
+        for ts, eq in equity_snapshots:
+            if isinstance(ts, (int, float)):
+                d_str = datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+            else:
+                d_str = str(ts)[:10]
+            daily_equity[d_str] = float(eq)
+
+        sorted_days = sorted(daily_equity.keys())
+        if len(sorted_days) < 2:
+            return []
+
+        daily_returns: list[float] = []
+        for i in range(1, len(sorted_days)):
+            prev_eq = daily_equity[sorted_days[i - 1]]
+            curr_eq = daily_equity[sorted_days[i]]
+            if prev_eq > 1e-6:
+                daily_returns.append((curr_eq - prev_eq) / prev_eq)
+        return daily_returns
 
     @classmethod
     def audit_returns(
@@ -431,10 +487,11 @@ class DeflatedSharpeAuditor:
         returns: Sequence[float] | np.ndarray,
         num_trials_n: int = 1,
         trials_sr_variance: float | None = None,
+        annualization_factor: float = 365.0,
     ) -> DSRAuditResult:
         """
         Calcula asimetría, curtosis de Pearson, Sharpe observado y DSR
-        directamente a partir de una serie temporal de retornos individuales.
+        directamente a partir de una serie temporal de retornos individuales o diarios.
         """
         arr = np.asarray(returns, dtype=np.float64)
         t = len(arr)
@@ -455,6 +512,7 @@ class DeflatedSharpeAuditor:
                 num_trials_n=num_trials_n,
                 status="OVERFITTING_WARNING",
                 is_overfitted=True,
+                annualized_sharpe=0.0,
             )
 
         observed_sr = mean_r / std_r
@@ -478,4 +536,5 @@ class DeflatedSharpeAuditor:
             kurtosis_gamma4=kurtosis_gamma4,
             num_trials_n=num_trials_n,
             trials_sr_variance=trials_sr_variance,
+            annualization_factor=annualization_factor,
         )

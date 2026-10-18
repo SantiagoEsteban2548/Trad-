@@ -176,6 +176,8 @@ class MultiAssetBacktester:
         symbol_entry_bar: dict[str, int] = {s: 0 for s in universe_symbols}
         symbol_levels_filled: dict[str, int] = {s: 1 for s in universe_symbols}
         symbol_returns_hist: dict[str, list[float]] = {s: [] for s in universe_symbols}
+        pending_quotes: dict[str, dict[str, Any]] = {}
+        daily_equity_snapshots: list[tuple[int, float]] = []
 
         contagion_shield_count = 0
         ladder_deep_fills_count = 0
@@ -346,46 +348,38 @@ class MultiAssetBacktester:
                 target_bps = spec["spread_bps"]
                 spread_usd = cur_close * (target_bps / 10_000.0)
 
-                # SI NO TENEMOS POSICIÓN ABIERTA: Cotizar entradas
-                if active_qty == 0.0:
-                    if sym not in active_symbols:
-                        continue
-                    if sym != "BTC" and bid_shield_active:
-                        continue
-
-                    # TOPE FÍSICO DE LIQUIDEZ: base_capital acotado a $25,000 USD
-                    base_cap = min(portfolio.base_capital_usd, MAX_ACTIVE_CAPITAL_CAP_USD)
-                    w = half_kelly_weights.get(sym, 0.18)
-                    target_notional = min(base_cap * w, base_cap * 0.20)
-
-                    if spec["step"] * cur_close > base_cap * 0.20:
-                        order_qty = max(0.0001, round(target_notional / cur_close, 4))
-                    else:
-                        st = spec["step"]
-                        order_qty = max(st, round(round(target_notional / cur_close / st) * st, 6))
+            # -------------------------------------------------------------
+            # PASO 1: Ejecutar órdenes pendientes de bar_idx - 1 (Zero Look-Ahead)
+            # -------------------------------------------------------------
+            for sym in active_symbols:
+                if symbol_inventory[sym] == 0.0 and sym in pending_quotes:
+                    p_ord = pending_quotes.pop(sym)
+                    b = bar_data[sym]
+                    cur_low = b["low"]
+                    cur_vol = b["vol"]
+                    cur_close = b["close"]
+                    spec = SYMBOL_SPECS[sym]
+                    spread_usd = cur_close * (spec["spread_bps"] / 10_000.0)
 
                     if mode == "DYNAMIC_12P_RATCHET":
-                        # Cotización Multinivel en Escalera (3-Level Ladder):
-                        delta_star = spread_usd * 0.5 * (1.0 + max(0.0, -obi * 0.25))
-                        p_l1 = round((cur_close - delta_star * 1.0) / spec["tick"]) * spec["tick"]
-                        p_l2 = round((cur_close - delta_star * 2.0) / spec["tick"]) * spec["tick"]
-                        p_l3 = round((cur_close - delta_star * 3.5) / spec["tick"]) * spec["tick"]
-
-                        # RESTRICCIÓN DE VOLUMEN REAL: máx 15% del volumen negociado en la barra
+                        p_l1 = p_ord["p_l1"]
+                        p_l2 = p_ord["p_l2"]
+                        p_l3 = p_ord["p_l3"]
+                        order_qty = p_ord["order_qty"]
                         max_fill_capacity = cur_vol * 0.15
 
                         filled_qty = 0.0
                         weighted_cost = 0.0
                         tiers_filled = 0
 
-                        if cur_low <= p_l1 and max_fill_capacity > 0:
+                        if cur_low < p_l1 and max_fill_capacity > 0:
                             q1 = min(order_qty * 0.45, max_fill_capacity)
                             filled_qty += q1
                             weighted_cost += q1 * p_l1
                             tiers_filled += 1
                             rem_cap = max(0.0, max_fill_capacity - q1)
 
-                            if cur_low <= p_l2 and rem_cap > 0:
+                            if cur_low < p_l2 and rem_cap > 0:
                                 q2 = min(order_qty * 0.35, rem_cap)
                                 filled_qty += q2
                                 weighted_cost += q2 * p_l2
@@ -393,7 +387,7 @@ class MultiAssetBacktester:
                                 ladder_deep_fills_count += 1
                                 rem_cap = max(0.0, rem_cap - q2)
 
-                                if cur_low <= p_l3 and rem_cap > 0:
+                                if cur_low < p_l3 and rem_cap > 0:
                                     q3 = min(order_qty * 0.20, rem_cap)
                                     filled_qty += q3
                                     weighted_cost += q3 * p_l3
@@ -401,13 +395,9 @@ class MultiAssetBacktester:
 
                         if filled_qty > 0.0:
                             avg_px = weighted_cost / filled_qty
-
-                            # PENALIZACIÓN DE SELECCIÓN ADVERSA:
-                            # Si la vela rompe los 3 niveles y cierra en los mínimos sin rebotar (<20% mecha inferior)
                             bounce_ratio = (cur_close - cur_low) / max(b["high"] - cur_low, 1e-8)
                             if cur_low <= p_l3 and bounce_ratio < 0.20:
                                 adverse_selection_events += 1
-                                # Desplazamiento adverso del precio promedio de entrada
                                 adverse_slip = (spread_usd * 0.35) + spec["tick"]
                                 avg_px = min(avg_px - adverse_slip, cur_low)
 
@@ -417,53 +407,73 @@ class MultiAssetBacktester:
                             symbol_levels_filled[sym] = tiers_filled
                             portfolio.active_positions[sym] = filled_qty * avg_px
                     else:
-                        # Modo STATIC_5P: 1 solo nivel
-                        bid_discount = spread_usd * (0.50 + max(0.0, -obi * 0.25))
-                        bid_px = round((cur_close - bid_discount) / spec["tick"]) * spec["tick"]
+                        bid_px = p_ord["bid_px"]
+                        order_qty = p_ord["order_qty"]
                         max_fill_capacity = cur_vol * 0.15
                         fill_qty = min(order_qty, max_fill_capacity)
-                        if cur_low <= bid_px and fill_qty > 0:
+                        if cur_low < bid_px and fill_qty > 0:
                             symbol_inventory[sym] = fill_qty
                             symbol_entry_px[sym] = bid_px
                             symbol_entry_bar[sym] = bar_idx
                             symbol_levels_filled[sym] = 1
                             portfolio.active_positions[sym] = fill_qty * bid_px
 
-                # SI TENEMOS POSICIÓN ABIERTA: Evaluar Take Profit, Time Decay o Stop Loss
-                elif active_qty > 0.0:
+            # -------------------------------------------------------------
+            # PASO 2: Gestión de Posiciones Abiertas (Prelación Conservadora SL > TP)
+            # -------------------------------------------------------------
+            for sym in universe_symbols:
+                active_qty = symbol_inventory[sym]
+                if active_qty > 0.0:
+                    b = bar_data[sym]
+                    cur_close = b["close"]
+                    cur_high = b["high"]
+                    cur_low = b["low"]
+                    entry_px = symbol_entry_px[sym]
                     bars_held = bar_idx - symbol_entry_bar[sym]
                     tiers_count = symbol_levels_filled.get(sym, 1)
+                    spec = SYMBOL_SPECS[sym]
+                    spread_usd = cur_close * (spec["spread_bps"] / 10_000.0)
 
-                    # Volatilidad realizada reciente para Stop-Loss estructural
                     v_hist = hist_returns[sym][max(0, bar_idx - 20):bar_idx]
                     rolling_sigma = float(np.mean(v_hist)) if v_hist else 0.004
 
-                    # Inventory Time-Decay: si lleva >= 1 barra (>= 15m), acelerar salida (+25% gamma)
                     if mode == "DYNAMIC_12P_RATCHET" and bars_held >= 1:
                         target_spread = spread_usd * 0.75
                     else:
                         target_spread = spread_usd
 
                     target_ask = round((entry_px + target_spread) / spec["tick"]) * spec["tick"]
-
-                    # STOP-LOSS ESTRUCTURAL A 1.5 SIGMA:
-                    # Cada nivel de la escalera que toque este nivel se contabiliza como pérdida independiente
                     structural_stop_dist = max(1.5 * rolling_sigma * entry_px, spread_usd * 1.5)
                     structural_stop_px = entry_px - structural_stop_dist
 
-                    # Caso A: Stop-Loss Estructural de 1.5 sigma alcanzado
-                    if cur_low <= structural_stop_px:
-                        exit_px = structural_stop_px
+                    is_sl_hit = cur_low <= structural_stop_px
+                    is_tp_hit = cur_high >= target_ask
+                    is_time_stop = (bars_held > 8) and (cur_close < entry_px)
+
+                    # Prelación conservadora: en colisión SL gana
+                    if is_sl_hit and is_tp_hit:
+                        chosen_exit = "SL"
+                    elif is_sl_hit:
+                        chosen_exit = "SL"
+                    elif is_tp_hit:
+                        chosen_exit = "TP"
+                    elif is_time_stop:
+                        chosen_exit = "TIME_STOP"
+                    else:
+                        chosen_exit = None
+
+                    if chosen_exit == "SL":
+                        actual_sl = min(structural_stop_px, b["open"])
+                        exit_px = actual_sl * (1.0 - 0.0002)  # 2 bps slippage
                         gross = (exit_px - entry_px) * active_qty
-                        fee = (entry_px + exit_px) * active_qty * 0.00020
+                        fee = (entry_px * 0.0002 + exit_px * 0.0005) * active_qty
                         net = gross - fee
 
-                        portfolio.current_equity_usd += net
+                        portfolio.current_equity_usd = max(0.0, portfolio.current_equity_usd + net)
                         ret = net / max(portfolio.current_equity_usd, 1.0)
                         returns_series.append(ret)
                         symbol_returns_hist[sym].append(ret)
 
-                        # Contabilizar cada nivel como pérdida realizada independiente
                         losing_trades += tiers_count
                         total_rotations += tiers_count
                         gross_loss += abs(net)
@@ -472,14 +482,13 @@ class MultiAssetBacktester:
                         symbol_entry_px[sym] = 0.0
                         portfolio.active_positions.pop(sym, None)
 
-                    # Caso B: Take Profit Maker alcanzado
-                    elif cur_high >= target_ask:
+                    elif chosen_exit == "TP":
                         exit_px = target_ask
                         gross = (exit_px - entry_px) * active_qty
-                        fee = (entry_px + exit_px) * active_qty * 0.00015
+                        fee = (entry_px + exit_px) * active_qty * 0.0002
                         net = gross - fee
 
-                        portfolio.current_equity_usd += net
+                        portfolio.current_equity_usd = max(0.0, portfolio.current_equity_usd + net)
                         if portfolio.current_equity_usd > portfolio.daily_high_watermark_usd:
                             portfolio.daily_high_watermark_usd = portfolio.current_equity_usd
 
@@ -495,7 +504,6 @@ class MultiAssetBacktester:
                         symbol_entry_px[sym] = 0.0
                         portfolio.active_positions.pop(sym, None)
 
-                        # Trinquete 85/15 continuo en modo DYNAMIC acotado a $25,000 USD
                         if mode == "DYNAMIC_12P_RATCHET":
                             swept = step_up_ratchet(
                                 portfolio,
@@ -508,14 +516,13 @@ class MultiAssetBacktester:
                                 swept_spot_vault_usd += swept
                                 ratchet_events_count += 1
 
-                    # Caso C: Cierre por tiempo (> 8 barras = 2h) si adverso
-                    elif bars_held > 8 and cur_close < entry_px:
-                        exit_px = cur_close
+                    elif chosen_exit == "TIME_STOP":
+                        exit_px = cur_close * (1.0 - 0.0002)
                         gross = (exit_px - entry_px) * active_qty
-                        fee = (entry_px + exit_px) * active_qty * 0.00015
+                        fee = (entry_px * 0.0002 + exit_px * 0.0005) * active_qty
                         net = gross - fee
 
-                        portfolio.current_equity_usd += net
+                        portfolio.current_equity_usd = max(0.0, portfolio.current_equity_usd + net)
                         ret = net / max(portfolio.current_equity_usd, 1.0)
                         returns_series.append(ret)
                         symbol_returns_hist[sym].append(ret)
@@ -544,9 +551,53 @@ class MultiAssetBacktester:
                                 swept_spot_vault_usd += swept
                                 ratchet_events_count += 1
 
-            # 5. CONTABILIDAD MARK-TO-MARKET (MTM) DEL MAX DRAWDOWN AL CIERRE DE CADA VELA
+            # -------------------------------------------------------------
+            # PASO 3: Generar Cotizaciones para bar_idx + 1 (Estrictamente con datos de bar_idx)
+            # -------------------------------------------------------------
+            for sym in active_symbols:
+                if symbol_inventory[sym] == 0.0:
+                    if sym != "BTC" and bid_shield_active:
+                        continue
+
+                    base_cap = min(portfolio.base_capital_usd, MAX_ACTIVE_CAPITAL_CAP_USD)
+                    w = half_kelly_weights.get(sym, 0.18)
+                    target_notional = min(base_cap * w, base_cap * 0.20)
+                    b = bar_data[sym]
+                    cur_close = b["close"]
+                    spec = SYMBOL_SPECS[sym]
+                    spread_usd = cur_close * (spec["spread_bps"] / 10_000.0)
+                    obi = obis.get(sym, 0.0)
+
+                    if spec["step"] * cur_close > base_cap * 0.20:
+                        order_qty = max(0.0001, round(target_notional / cur_close, 4))
+                    else:
+                        st = spec["step"]
+                        order_qty = max(st, round(round(target_notional / cur_close / st) * st, 6))
+
+                    if mode == "DYNAMIC_12P_RATCHET":
+                        delta_star = spread_usd * 0.5 * (1.0 + max(0.0, -obi * 0.25))
+                        p_l1 = round((cur_close - delta_star * 1.0) / spec["tick"]) * spec["tick"]
+                        p_l2 = round((cur_close - delta_star * 2.0) / spec["tick"]) * spec["tick"]
+                        p_l3 = round((cur_close - delta_star * 3.5) / spec["tick"]) * spec["tick"]
+                        pending_quotes[sym] = {
+                            "p_l1": p_l1,
+                            "p_l2": p_l2,
+                            "p_l3": p_l3,
+                            "order_qty": order_qty,
+                        }
+                    else:
+                        bid_discount = spread_usd * (0.50 + max(0.0, -obi * 0.25))
+                        bid_px = round((cur_close - bid_discount) / spec["tick"]) * spec["tick"]
+                        pending_quotes[sym] = {
+                            "bid_px": bid_px,
+                            "order_qty": order_qty,
+                        }
+
+            # -------------------------------------------------------------
+            # PASO 4: Marcado a Mercado Continuo y Max Drawdown
+            # -------------------------------------------------------------
             unrealized_pnl = sum(
-                symbol_inventory[s] * (bar_data[s]["close"] - symbol_entry_px[s])
+                symbol_inventory[s] * (bar_data[s]["low"] - symbol_entry_px[s])
                 for s in universe_symbols
                 if symbol_inventory[s] > 0.0
             )
@@ -560,6 +611,10 @@ class MultiAssetBacktester:
                 max_drawdown_pct = dd_pct
                 max_drawdown_usd = dd_usd
 
+            # Registrar snapshot diario para DSR
+            if bar_idx % 96 == 0:
+                daily_equity_snapshots.append((bar_data[universe_symbols[0]]["ts"], portfolio.current_equity_usd + swept_spot_vault_usd))
+
         # Resumen final de métricas
         final_wealth = portfolio.current_equity_usd + swept_spot_vault_usd
         total_pnl = final_wealth - initial_capital_usd
@@ -569,9 +624,13 @@ class MultiAssetBacktester:
         win_rate = (winning_trades / total_rotations * 100.0) if total_rotations > 0 else 0.0
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.9 if gross_profit > 0 else 1.0)
 
-        # Deflated Sharpe Ratio
-        ret_arr = np.array(returns_series, dtype=np.float64) if len(returns_series) >= 5 else np.array([0.001] * 5)
-        dsr_audit = DeflatedSharpeAuditor.audit_returns(ret_arr, num_trials_n=25)
+        daily_equity_snapshots.append((bar_data[universe_symbols[0]]["ts"], final_wealth))
+        daily_rets = DeflatedSharpeAuditor.aggregate_daily_returns(daily_equity_snapshots)
+        dsr_audit = DeflatedSharpeAuditor.audit_returns(
+            daily_rets if len(daily_rets) >= 3 else [0.0001, -0.0001],
+            num_trials_n=25,
+            annualization_factor=365.0,
+        )
 
         start_ts = sliced_candles["BTC"][0][0] / 1000.0
         end_ts = sliced_candles["BTC"][-1][0] / 1000.0

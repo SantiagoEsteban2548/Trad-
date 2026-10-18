@@ -154,6 +154,8 @@ class Backtest20212022Runner:
         symbol_entry_px: dict[str, float] = {s: 0.0 for s in symbols}
         symbol_entry_bar: dict[str, int] = {s: 0 for s in symbols}
         symbol_levels_filled: dict[str, int] = {s: 1 for s in symbols}
+        pending_quotes: dict[str, dict[str, Any]] = {}
+        daily_equity_snapshots: list[tuple[int, float]] = []
 
         contagion_shield_count = 0
         ladder_deep_fills_count = 0
@@ -186,6 +188,7 @@ class Backtest20212022Runner:
             if bar_idx > 0 and bar_idx % 96 == 0:
                 kill_switch_active = False
                 portfolio.daily_high_watermark_usd = max(portfolio.current_equity_usd, 0.01)
+                daily_equity_snapshots.append((bar_data[symbols[0]]["ts"], portfolio.current_equity_usd + swept_vault_usd))
 
                 if mode == "STATIC_5P":
                     tot_pos = sum(symbol_inventory[s] * bar_data[s]["close"] for s in symbols)
@@ -243,61 +246,38 @@ class Backtest20212022Runner:
             else:
                 half_kelly_weights = {s: 0.18 for s in symbols}
 
-            # Evaluacion por activo
+            # -------------------------------------------------------------
+            # PASO 1: Ejecutar órdenes pendientes de bar_idx - 1 (Zero Look-Ahead)
+            # -------------------------------------------------------------
             for s in symbols:
-                b = bar_data[s]
-                spec = SYMBOL_SPECS.get(s, {"tick": 0.01, "step": 0.01, "spread_bps": 20.0})
-                cur_close = b["close"]
-                cur_high = b["high"]
-                cur_low = b["low"]
-                cur_vol = b["vol"]
-                obi = obis.get(s, 0.0)
-
-                active_qty = symbol_inventory[s]
-                entry_px = symbol_entry_px[s]
-                spread_usd = cur_close * (spec["spread_bps"] / 10_000.0)
-
-                # SIN POSICION: Cotizar Bids si no hay Kill Switch activo ni Contagio
-                if active_qty == 0.0:
-                    if kill_switch_active:
-                        continue
-                    if s != "BTC" and bid_shield_active:
-                        continue
-
-                    # El capital operativo disponible es el minimo entre el equity actual y el tope
-                    effective_cap = min(portfolio.current_equity_usd, portfolio.base_capital_usd if mode == "STATIC_5P" else MAX_ACTIVE_CAPITAL_CAP_USD)
-                    if effective_cap <= 1.0:
-                        continue
-
-                    w = half_kelly_weights.get(s, 0.18)
-                    target_notional = min(effective_cap * w, effective_cap * 0.20)
-
-                    if spec["step"] * cur_close > target_notional:
-                        order_qty = max(0.0001, round(target_notional / cur_close, 4))
-                    else:
-                        st = spec["step"]
-                        order_qty = max(st, round(round(target_notional / cur_close / st) * st, 6))
+                if symbol_inventory[s] == 0.0 and s in pending_quotes:
+                    p_ord = pending_quotes.pop(s)
+                    b = bar_data[s]
+                    cur_low = b["low"]
+                    cur_vol = b["vol"]
+                    cur_close = b["close"]
+                    spec = SYMBOL_SPECS.get(s, {"tick": 0.01, "step": 0.01, "spread_bps": 20.0})
+                    spread_usd = cur_close * (spec["spread_bps"] / 10_000.0)
 
                     if mode == "DYNAMIC_MULTI_RATCHET":
-                        # Escalera 3 niveles L2
-                        delta_star = spread_usd * 0.5 * (1.0 + max(0.0, -obi * 0.25))
-                        p_l1 = round((cur_close - delta_star * 1.0) / spec["tick"]) * spec["tick"]
-                        p_l2 = round((cur_close - delta_star * 2.0) / spec["tick"]) * spec["tick"]
-                        p_l3 = round((cur_close - delta_star * 3.5) / spec["tick"]) * spec["tick"]
+                        p_l1 = p_ord["p_l1"]
+                        p_l2 = p_ord["p_l2"]
+                        p_l3 = p_ord["p_l3"]
+                        order_qty = p_ord["order_qty"]
+                        max_fill_capacity = cur_vol * 0.15
 
-                        max_fill_capacity = cur_vol * 0.15  # Límite 15% volumen de barra
                         filled_qty = 0.0
                         weighted_cost = 0.0
                         tiers_filled = 0
 
-                        if cur_low <= p_l1 and max_fill_capacity > 0:
+                        if cur_low < p_l1 and max_fill_capacity > 0:
                             q1 = min(order_qty * 0.45, max_fill_capacity)
                             filled_qty += q1
                             weighted_cost += q1 * p_l1
                             tiers_filled += 1
                             rem_cap = max(0.0, max_fill_capacity - q1)
 
-                            if cur_low <= p_l2 and rem_cap > 0:
+                            if cur_low < p_l2 and rem_cap > 0:
                                 q2 = min(order_qty * 0.35, rem_cap)
                                 filled_qty += q2
                                 weighted_cost += q2 * p_l2
@@ -305,7 +285,7 @@ class Backtest20212022Runner:
                                 ladder_deep_fills_count += 1
                                 rem_cap = max(0.0, rem_cap - q2)
 
-                                if cur_low <= p_l3 and rem_cap > 0:
+                                if cur_low < p_l3 and rem_cap > 0:
                                     q3 = min(order_qty * 0.20, rem_cap)
                                     filled_qty += q3
                                     weighted_cost += q3 * p_l3
@@ -325,22 +305,32 @@ class Backtest20212022Runner:
                             symbol_levels_filled[s] = tiers_filled
                             portfolio.active_positions[s] = filled_qty * avg_px
                     else:
-                        # Modo STATIC_5P: 1 solo nivel
-                        bid_discount = spread_usd * (0.50 + max(0.0, -obi * 0.25))
-                        bid_px = round((cur_close - bid_discount) / spec["tick"]) * spec["tick"]
+                        bid_px = p_ord["bid_px"]
+                        order_qty = p_ord["order_qty"]
                         max_fill_capacity = cur_vol * 0.15
                         fill_qty = min(order_qty, max_fill_capacity)
-                        if cur_low <= bid_px and fill_qty > 0:
+                        if cur_low < bid_px and fill_qty > 0:
                             symbol_inventory[s] = fill_qty
                             symbol_entry_px[s] = bid_px
                             symbol_entry_bar[s] = bar_idx
                             symbol_levels_filled[s] = 1
                             portfolio.active_positions[s] = fill_qty * bid_px
 
-                # CON POSICION: Evaluar TP / SL
-                elif active_qty > 0.0:
+            # -------------------------------------------------------------
+            # PASO 2: Gestión de Posiciones Abiertas (Prelación Conservadora SL > TP)
+            # -------------------------------------------------------------
+            for s in symbols:
+                active_qty = symbol_inventory[s]
+                if active_qty > 0.0:
+                    b = bar_data[s]
+                    cur_close = b["close"]
+                    cur_high = b["high"]
+                    cur_low = b["low"]
+                    entry_px = symbol_entry_px[s]
                     bars_held = bar_idx - symbol_entry_bar[s]
                     tiers_count = symbol_levels_filled.get(s, 1)
+                    spec = SYMBOL_SPECS.get(s, {"tick": 0.01, "step": 0.01, "spread_bps": 20.0})
+                    spread_usd = cur_close * (spec["spread_bps"] / 10_000.0)
 
                     v_hist = hist_returns[s][max(0, bar_idx - 20):bar_idx]
                     rolling_sigma = float(np.mean(v_hist)) if v_hist else 0.004
@@ -354,16 +344,30 @@ class Backtest20212022Runner:
                     structural_stop_dist = max(1.5 * rolling_sigma * entry_px, spread_usd * 1.5)
                     structural_stop_px = entry_px - structural_stop_dist
 
-                    # Caso A: Stop-Loss Estructural (1.5 sigma)
-                    if cur_low <= structural_stop_px:
-                        exit_px = structural_stop_px
+                    is_sl_hit = cur_low <= structural_stop_px
+                    is_tp_hit = cur_high >= target_ask
+                    is_time_stop = (bars_held > 8) and (cur_close < entry_px)
+
+                    # Regla conservadora: en colisión SL gana
+                    if is_sl_hit and is_tp_hit:
+                        chosen_exit = "SL"
+                    elif is_sl_hit:
+                        chosen_exit = "SL"
+                    elif is_tp_hit:
+                        chosen_exit = "TP"
+                    elif is_time_stop:
+                        chosen_exit = "TIME_STOP"
+                    else:
+                        chosen_exit = None
+
+                    if chosen_exit == "SL":
+                        actual_sl = min(structural_stop_px, b["open"])
+                        exit_px = actual_sl * (1.0 - 0.0002)  # 2 bps slippage
                         gross = (exit_px - entry_px) * active_qty
-                        fee = (entry_px + exit_px) * active_qty * 0.00020
+                        fee = (entry_px * 0.0002 + exit_px * 0.0005) * active_qty
                         net = gross - fee
 
-                        new_eq = max(0.01, portfolio.current_equity_usd + net)
-                        portfolio.current_equity_usd = new_eq
-
+                        portfolio.current_equity_usd = max(0.0, portfolio.current_equity_usd + net)
                         ret = net / max(portfolio.current_equity_usd, 1.0)
                         returns_series.append(ret)
 
@@ -375,15 +379,13 @@ class Backtest20212022Runner:
                         symbol_entry_px[s] = 0.0
                         portfolio.active_positions.pop(s, None)
 
-                    # Caso B: Take Profit Maker
-                    elif cur_high >= target_ask:
+                    elif chosen_exit == "TP":
                         exit_px = target_ask
                         gross = (exit_px - entry_px) * active_qty
-                        fee = (entry_px + exit_px) * active_qty * 0.00015
+                        fee = (entry_px + exit_px) * active_qty * 0.0002
                         net = gross - fee
 
-                        new_eq = max(0.01, portfolio.current_equity_usd + net)
-                        portfolio.current_equity_usd = new_eq
+                        portfolio.current_equity_usd = max(0.0, portfolio.current_equity_usd + net)
                         if portfolio.current_equity_usd > portfolio.daily_high_watermark_usd:
                             portfolio.daily_high_watermark_usd = portfolio.current_equity_usd
 
@@ -410,46 +412,80 @@ class Backtest20212022Runner:
                                 swept_vault_usd += swept
                                 ratchet_sweeps_count += 1
 
-                    # Caso C: Salida por tiempo adverso (> 8 barras = 2h)
-                    elif bars_held > 8 and cur_close < entry_px:
-                        exit_px = cur_close
+                    elif chosen_exit == "TIME_STOP":
+                        exit_px = cur_close * (1.0 - 0.0002)
                         gross = (exit_px - entry_px) * active_qty
-                        fee = (entry_px + exit_px) * active_qty * 0.00015
+                        fee = (entry_px * 0.0002 + exit_px * 0.0005) * active_qty
                         net = gross - fee
 
-                        new_eq = max(0.01, portfolio.current_equity_usd + net)
-                        portfolio.current_equity_usd = new_eq
-
+                        portfolio.current_equity_usd = max(0.0, portfolio.current_equity_usd + net)
                         ret = net / max(portfolio.current_equity_usd, 1.0)
                         returns_series.append(ret)
 
-                        total_rotations += tiers_count
                         if net > 0:
                             winning_trades += tiers_count
                             gross_profit += net
                         else:
                             losing_trades += tiers_count
                             gross_loss += abs(net)
+                        total_rotations += tiers_count
 
                         symbol_inventory[s] = 0.0
                         symbol_entry_px[s] = 0.0
                         portfolio.active_positions.pop(s, None)
 
-                        if mode == "DYNAMIC_MULTI_RATCHET":
-                            swept = step_up_ratchet(
-                                portfolio,
-                                threshold_pct=0.02,
-                                vault_ratio=0.15,
-                                reinvest_ratio=0.85,
-                                max_capital_cap_usd=MAX_ACTIVE_CAPITAL_CAP_USD,
-                            )
-                            if swept > 0.0:
-                                swept_vault_usd += swept
-                                ratchet_sweeps_count += 1
+            # -------------------------------------------------------------
+            # PASO 3: Generar Cotizaciones para bar_idx + 1 (Estrictamente con datos de bar_idx)
+            # -------------------------------------------------------------
+            for s in symbols:
+                if symbol_inventory[s] == 0.0:
+                    if kill_switch_active:
+                        continue
+                    if s != "BTC" and bid_shield_active:
+                        continue
 
-            # MTM Max Drawdown
+                    effective_cap = min(portfolio.current_equity_usd, portfolio.base_capital_usd if mode == "STATIC_5P" else MAX_ACTIVE_CAPITAL_CAP_USD)
+                    if effective_cap <= 1.0:
+                        continue
+
+                    w = half_kelly_weights.get(s, 0.18)
+                    target_notional = min(effective_cap * w, effective_cap * 0.20)
+                    b = bar_data[s]
+                    cur_close = b["close"]
+                    spec = SYMBOL_SPECS.get(s, {"tick": 0.01, "step": 0.01, "spread_bps": 20.0})
+                    spread_usd = cur_close * (spec["spread_bps"] / 10_000.0)
+                    obi = obis.get(s, 0.0)
+
+                    if spec["step"] * cur_close > target_notional:
+                        order_qty = max(0.0001, round(target_notional / cur_close, 4))
+                    else:
+                        st = spec["step"]
+                        order_qty = max(st, round(round(target_notional / cur_close / st) * st, 6))
+
+                    if mode == "DYNAMIC_MULTI_RATCHET":
+                        delta_star = spread_usd * 0.5 * (1.0 + max(0.0, -obi * 0.25))
+                        p_l1 = round((cur_close - delta_star * 1.0) / spec["tick"]) * spec["tick"]
+                        p_l2 = round((cur_close - delta_star * 2.0) / spec["tick"]) * spec["tick"]
+                        p_l3 = round((cur_close - delta_star * 3.5) / spec["tick"]) * spec["tick"]
+                        pending_quotes[s] = {
+                            "p_l1": p_l1,
+                            "p_l2": p_l2,
+                            "p_l3": p_l3,
+                            "order_qty": order_qty,
+                        }
+                    else:
+                        bid_discount = spread_usd * (0.50 + max(0.0, -obi * 0.25))
+                        bid_px = round((cur_close - bid_discount) / spec["tick"]) * spec["tick"]
+                        pending_quotes[s] = {
+                            "bid_px": bid_px,
+                            "order_qty": order_qty,
+                        }
+
+            # -------------------------------------------------------------
+            # PASO 4: Marcado a Mercado Continuo y Max Drawdown
+            # -------------------------------------------------------------
             unrealized_pnl = sum(
-                symbol_inventory[s] * (bar_data[s]["close"] - symbol_entry_px[s])
+                symbol_inventory[s] * (bar_data[s]["low"] - symbol_entry_px[s])
                 for s in symbols
                 if symbol_inventory[s] > 0.0
             )
@@ -468,8 +504,13 @@ class Backtest20212022Runner:
         win_rate = (winning_trades / total_rotations * 100.0) if total_rotations > 0 else 0.0
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.9 if gross_profit > 0 else 1.0)
 
-        ret_arr = np.array(returns_series, dtype=np.float64) if len(returns_series) >= 5 else np.array([0.001] * 5)
-        dsr_audit = DeflatedSharpeAuditor.audit_returns(ret_arr, num_trials_n=25)
+        daily_equity_snapshots.append((bar_data[symbols[0]]["ts"], final_wealth))
+        daily_rets = DeflatedSharpeAuditor.aggregate_daily_returns(daily_equity_snapshots)
+        dsr_audit = DeflatedSharpeAuditor.audit_returns(
+            daily_rets if len(daily_rets) >= 3 else [0.0001, -0.0001],
+            num_trials_n=25,
+            annualization_factor=365.0,
+        )
 
         return {
             "final_futures_usd": round(portfolio.current_equity_usd, 2),

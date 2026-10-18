@@ -83,4 +83,9 @@ class RegimeConfig(BaseModel):
             data = json.load(f)
         return cls.model_validate(data)
 
+    @classmethod
+    def default_normal(cls) -> RegimeConfig:
+        """Retorna una configuración canónica por defecto para régimen normal/rango."""
+        return cls()
+
 DEFAULT_REGIME_CONFIG_PATH = Path("backend/config/regime_config.json")
