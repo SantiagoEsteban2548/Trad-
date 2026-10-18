@@ -117,6 +117,16 @@ class MandateGatekeeper:
         if self._emergency_callback is not None:
             self._emergency_callback()
 
+    def reset_kill_switch(self) -> None:
+        """
+        Reinicia el estado del Kill-Switch, las rachas de pérdidas consecutivas
+        y los errores consecutivos de API para permitir reanudar el trading.
+        """
+        self.kill_switch_engaged = False
+        self.consecutive_losses = 0
+        self.consecutive_api_errors = 0
+        self.rate_limit_cooldown_until_ns = 0
+
     def validate_order(
         self, order: OrderRequest, state: PortfolioState
     ) -> tuple[bool, str]:

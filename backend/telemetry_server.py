@@ -4232,14 +4232,23 @@ class DryRunExecutionEngine:
         }
 
         def _do_write() -> None:
+            tmp_path = None
             try:
                 self.dsr_state_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = self.dsr_state_path.with_suffix(".tmp")
+                import uuid
+                tmp_path = self.dsr_state_path.with_suffix(f".tmp_{uuid.uuid4().hex}")
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump(state_data, f, indent=2)
-                tmp_path.replace(self.dsr_state_path)
+                import os
+                os.replace(str(tmp_path), str(self.dsr_state_path))
             except Exception as e:
                 logger.error(f"Error persistiendo estado de cuarentena DSR: {e}")
+            finally:
+                if tmp_path is not None and tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
 
         try:
             loop = asyncio.get_running_loop()
@@ -6162,7 +6171,7 @@ async def profit_sweep_endpoint() -> dict[str, Any]:
 @app.post("/api/reset-kill-switch")
 async def reset_kill_switch_endpoint() -> dict[str, Any]:
     """Permite al operador reiniciar el Kill-Switch tras auditar la contingencia."""
-    engine.gatekeeper.kill_switch_engaged = False
+    engine.gatekeeper.reset_kill_switch()
     logger.info("Kill-Switch reseteado por el operador.")
     return {
         "status": "KILL_SWITCH_RESET",
