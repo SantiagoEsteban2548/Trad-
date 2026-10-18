@@ -917,7 +917,8 @@ class BinanceLiveWsGateway:
             if portfolio is not None:
                 self.portfolio = portfolio
             meta = self.active_orders_meta.pop(oid, {})
-            px = float(meta.get("price") or (portfolio.current_equity_usd if portfolio else 65000.0))
+            order_sym = str(meta.get("symbol") or sym)
+            px = float(meta.get("price") or 0.0)
             q = float(meta.get("qty") or 0.0002)
 
             order_status = None
@@ -925,7 +926,7 @@ class BinanceLiveWsGateway:
             avg_px = px
             try:
                 if hasattr(self.exchange, "fetch_order"):
-                    res_ord = self.exchange.fetch_order(oid, sym)
+                    res_ord = self.exchange.fetch_order(oid, order_sym)
                     if inspect.isawaitable(res_ord):
                         res_ord = await res_ord
                     if isinstance(res_ord, dict):
@@ -935,7 +936,12 @@ class BinanceLiveWsGateway:
                             filled_qty = fetched_filled
                         avg_px = float(res_ord.get("average") or res_ord.get("price") or px)
             except Exception as e:
-                logger.debug(f"fetch_order({oid}, {sym}) en Binance: {e}")
+                logger.debug(f"fetch_order({oid}, {order_sym}) en Binance: {e}")
+
+            # Si el precio sigue en 0, no podemos registrar un fill válido
+            if avg_px <= 0.0:
+                logger.warning(f"Orden {oid} en Binance ({order_sym}) sin precio válido. Omitiendo registro de fill.")
+                return
 
             # Solo registrar fill si la orden fue 'closed' o si tiene cantidad ejecutada > 0 (incluyendo partial fills cancelados)
             is_actually_filled = (order_status == "closed") or (filled_qty > 1e-8)
@@ -947,26 +953,27 @@ class BinanceLiveWsGateway:
                     self._processed_order_ids.add(str(cid))
                 fill_res = self.ledger.record_fill(
                     order_id_or_cid=cid,
-                    symbol=sym,
+                    symbol=order_sym,
                     side=side,
                     fill_price=avg_px,
                     fill_qty=actual_qty,
                     ts_ns=time.time_ns(),
                 )
-                net_inv_contracts = self.ledger.get_net_inventory(sym)
+                net_inv_contracts = self.ledger.get_net_inventory(order_sym)
                 if self.portfolio is not None:
                     if not hasattr(self.portfolio, "active_positions") or self.portfolio.active_positions is None:
                         self.portfolio.active_positions = {}
                     # Almacenar siempre USD Notional con signo consistente con Gate 3 y sync_portfolio_state
-                    self.portfolio.active_positions[sym] = round(net_inv_contracts * avg_px, 2)
+                    self.portfolio.active_positions[order_sym] = round(net_inv_contracts * avg_px, 2)
                 sub_lot = fill_res.get("sub_lot_id", "MAIN")
                 strat_tag = f"{fill_res.get('strategy_id', 'AVELLANEDA_OBI')}_{sub_lot}" if sub_lot != "MAIN" else fill_res.get("strategy_id", "AVELLANEDA_OBI")
+                fee_est = round(avg_px * actual_qty * 0.0002, 4)
                 pnl_recorded = fill_res.get("realized_pnl_usd", 0.0) or (round(avg_px * actual_qty * 0.0005, 2) or 0.05)
-                logger.info(f"FILL CONFIRMADO en Binance: {sym} {side} {actual_qty} @ ${avg_px} (order {oid}, lot {strat_tag})")
+                logger.info(f"FILL CONFIRMADO en Binance: {order_sym} {side} {actual_qty} @ ${avg_px} (order {oid}, lot {strat_tag})")
                 if self.on_fill and callable(self.on_fill):
                     try:
                         self.on_fill(
-                            symbol=sym,
+                            symbol=order_sym,
                             strategy=strat_tag,
                             side=side,
                             entry_price=avg_px,
@@ -975,6 +982,7 @@ class BinanceLiveWsGateway:
                             return_pct=0.05,
                             pnl_usd=pnl_recorded,
                             trade_id=f"LIVE-{oid}",
+                            fee_cost=fee_est,
                         )
                     except Exception as ef:
                         logger.debug(f"Error registrando fill en vivo: {ef}")
@@ -982,16 +990,16 @@ class BinanceLiveWsGateway:
                 # Colocación Inmediata de Take-Profit Maker y Stop-Loss Nativo en Servidor (MARK_PRICE)
                 if fill_res.get("is_increasing"):
                     close_side = "SELL" if side.upper() == "BUY" else "BUY"
-                    lev_now = self.symbol_leverage.get(sym, self.default_leverage)
+                    lev_now = self.symbol_leverage.get(order_sym, self.default_leverage)
                     tier_cfg = DryRunExecutionEngine.LEVERAGE_TIERS_CONFIG.get(lev_now, {"tp_bps": 15.0, "sl_bps": 25.0})
                     tp_offset_bps = float(tier_cfg.get("tp_bps", 15.0))
                     sl_offset_bps = float(tier_cfg.get("sl_bps", 25.0))
                     tp_price = avg_px * (1.0 + tp_offset_bps / 10_000.0) if side.upper() == "BUY" else avg_px * (1.0 - tp_offset_bps / 10_000.0)
                     sl_price = avg_px * (1.0 - sl_offset_bps / 10_000.0) if side.upper() == "BUY" else avg_px * (1.0 + sl_offset_bps / 10_000.0)
-                    asyncio.create_task(self.place_protective_stop_loss(sym, close_side, abs(net_inv_contracts) or actual_qty, sl_price))
-                    asyncio.create_task(self.close_position_maker(sym, close_side, abs(net_inv_contracts) or actual_qty, tp_price))
+                    asyncio.create_task(self.place_protective_stop_loss(order_sym, close_side, abs(net_inv_contracts) or actual_qty, sl_price))
+                    asyncio.create_task(self.close_position_maker(order_sym, close_side, abs(net_inv_contracts) or actual_qty, tp_price))
             else:
-                logger.info(f"Orden {oid} en {sym} ({side}) cancelada o expirada sin fills. No se genera trade fantasma.")
+                logger.info(f"Orden {oid} en {order_sym} ({side}) cancelada o expirada sin fills. No se genera trade fantasma.")
 
     async def sync_portfolio_state(self, portfolio: PortfolioState) -> None:
         """
@@ -1120,12 +1128,14 @@ class BinanceLiveWsGateway:
                     if self.live_active_bid_id and self.live_active_bid_id not in open_order_ids:
                         old_bid = self.live_active_bid_id
                         self.live_active_bid_id = None
-                        await self._handle_order_completion(old_bid, "BTC/USDT:USDT", "BUY", portfolio)
+                        meta_sym = str(self.active_orders_meta.get(old_bid, {}).get("symbol") or "BTC/USDT:USDT")
+                        await self._handle_order_completion(old_bid, meta_sym, "BUY", portfolio)
 
                     if self.live_active_ask_id and self.live_active_ask_id not in open_order_ids:
                         old_ask = self.live_active_ask_id
                         self.live_active_ask_id = None
-                        await self._handle_order_completion(old_ask, "BTC/USDT:USDT", "SELL", portfolio)
+                        meta_sym = str(self.active_orders_meta.get(old_ask, {}).get("symbol") or "BTC/USDT:USDT")
+                        await self._handle_order_completion(old_ask, meta_sym, "SELL", portfolio)
         except Exception as e:
             logger.error(f"Error sincronizando órdenes abiertas con Binance: {e}")
 
@@ -1141,6 +1151,10 @@ class BinanceLiveWsGateway:
                         res_trades = await res_trades
                     if isinstance(res_trades, list):
                         for tr in res_trades:
+                            tr_sym_raw = tr.get("symbol")
+                            if tr_sym_raw and self.resolve_binance_symbol(str(tr_sym_raw)) != target_sym:
+                                continue
+
                             tid = str(tr.get("id") or "")
                             if tid and tid in self._processed_trade_ids:
                                 continue
@@ -1163,10 +1177,11 @@ class BinanceLiveWsGateway:
                             tr_side = str(tr.get("side") or "").upper()
                             tr_px = float(tr.get("price") or 0.0)
                             tr_qty = float(tr.get("amount") or 0.0)
+                            if tr_px <= 0.0 or tr_qty <= 0.0:
+                                continue
                             tr_cost = float(tr.get("cost") or (tr_px * tr_qty))
 
-                            fee_info = tr.get("fee") or {}
-                            fee_cost = float(fee_info.get("cost") or 0.0)
+                            fee_cost = float(tr.get("fee", {}).get("cost") or tr.get("info", {}).get("fee") or (tr_px * tr_qty * 0.0002))
                             realized_pnl_raw = float(tr.get("info", {}).get("realizedPnl") or 0.0)
 
                             fill_res = self.ledger.record_fill(
@@ -1202,6 +1217,7 @@ class BinanceLiveWsGateway:
                                         pnl_usd=round(net_pnl, 2),
                                         trade_id=f"LIVE-{tid or cid}",
                                         timestamp_ns=(tr_ts * 1_000_000) if tr_ts > 0 else None,
+                                        fee_cost=round(fee_cost, 4),
                                     )
                                 except Exception as ef:
                                     logger.debug(f"Error despachando on_fill Binance: {ef}")
@@ -2318,22 +2334,30 @@ class BingXLiveWsGateway:
             if portfolio is not None:
                 self.portfolio = portfolio
             meta = self.active_orders_meta.pop(oid, {})
-            px = float(meta.get("price") or (portfolio.current_equity_usd if portfolio else 3500.0))
+            order_sym = str(meta.get("symbol") or sym)
+            px = float(meta.get("price") or 0.0)
             q = float(meta.get("qty") or 0.0002)
             order_status = "canceled"
             filled_qty = 0.0
             avg_px = px
             try:
                 if hasattr(self.exchange, "fetch_order"):
-                    res_ord = self.exchange.fetch_order(oid, sym)
+                    res_ord = self.exchange.fetch_order(oid, order_sym)
                     if inspect.isawaitable(res_ord):
                         res_ord = await res_ord
                     if isinstance(res_ord, dict):
                         order_status = str(res_ord.get("status", "")).lower()
-                        filled_qty = float(res_ord.get("filled") or 0.0)
+                        fetched_filled = float(res_ord.get("filled") or 0.0)
+                        if fetched_filled > 0.0:
+                            filled_qty = fetched_filled
                         avg_px = float(res_ord.get("average") or res_ord.get("price") or px)
             except Exception as e:
-                logger.debug(f"fetch_order({oid}, {sym}) en BingX: {e}")
+                logger.debug(f"fetch_order({oid}, {order_sym}) en BingX: {e}")
+
+            # Si el precio sigue en 0, no podemos registrar un fill válido
+            if avg_px <= 0.0:
+                logger.warning(f"Orden {oid} en BingX ({order_sym}) sin precio válido. Omitiendo registro de fill.")
+                return
 
             # Solo registrar fill si la orden fue 'closed' o si tiene cantidad ejecutada > 0
             is_actually_filled = (order_status == "closed") or (filled_qty > 1e-8)
@@ -2342,32 +2366,35 @@ class BingXLiveWsGateway:
                     self._processed_order_ids.add(oid)
                 actual_qty = filled_qty if filled_qty > 1e-8 else q
                 cid = meta.get("client_order_id", oid)
+                if cid:
+                    self._processed_order_ids.add(str(cid))
                 fill_res = self.ledger.record_fill(
                     order_id_or_cid=cid,
-                    symbol=sym,
+                    symbol=order_sym,
                     side=side,
                     fill_price=avg_px,
                     fill_qty=actual_qty,
                     ts_ns=time.time_ns(),
                 )
-                net_inv_contracts = self.ledger.get_net_inventory(sym)
+                net_inv_contracts = self.ledger.get_net_inventory(order_sym)
                 if self.portfolio is not None:
                     if not hasattr(self.portfolio, "active_positions") or self.portfolio.active_positions is None:
                         self.portfolio.active_positions = {}
                     # Almacenar nocional USD con signo en active_positions para consistencia de unidades
                     signed_notional = round(net_inv_contracts * avg_px, 2)
                     if abs(signed_notional) > 1e-4:
-                        self.portfolio.active_positions[sym] = signed_notional
+                        self.portfolio.active_positions[order_sym] = signed_notional
                     else:
-                        self.portfolio.active_positions.pop(sym, None)
+                        self.portfolio.active_positions.pop(order_sym, None)
                 sub_lot = fill_res.get("sub_lot_id", "MAIN")
                 strat_tag = f"{fill_res.get('strategy_id', 'AVELLANEDA_OBI')}_{sub_lot}" if sub_lot != "MAIN" else fill_res.get("strategy_id", "AVELLANEDA_OBI")
+                fee_est = round(avg_px * actual_qty * 0.0002, 4)
                 pnl_recorded = float(fill_res.get("realized_pnl_usd", 0.0) or 0.0)
-                logger.info(f"FILL CONFIRMADO en BingX: {sym} {side} {actual_qty} @ ${avg_px} (order {oid}, lot {strat_tag})")
+                logger.info(f"FILL CONFIRMADO en BingX: {order_sym} {side} {actual_qty} @ ${avg_px} (order {oid}, lot {strat_tag})")
                 if self.on_fill and callable(self.on_fill):
                     try:
                         self.on_fill(
-                            symbol=sym,
+                            symbol=order_sym,
                             strategy=strat_tag,
                             side=side,
                             entry_price=avg_px,
@@ -2376,6 +2403,7 @@ class BingXLiveWsGateway:
                             return_pct=0.05 if pnl_recorded == 0.0 else round((pnl_recorded / max(avg_px * actual_qty, 1e-8)) * 100.0, 3),
                             pnl_usd=pnl_recorded,
                             trade_id=f"BINGX-{oid}",
+                            fee_cost=fee_est,
                         )
                     except Exception as ef:
                         logger.debug(f"Error registrando fill en vivo BingX: {ef}")
@@ -2383,15 +2411,15 @@ class BingXLiveWsGateway:
                 # Módulo 1: Colocación Inmediata de Take-Profit Maker y Stop-Loss Protector Server-Side
                 if fill_res.get("is_increasing"):
                     close_side = "SELL" if side.upper() == "BUY" else "BUY"
-                    spec = SYMBOL_SPECS.get(sym)
+                    spec = SYMBOL_SPECS.get(order_sym)
                     tp_offset_bps = spec.tp_bps if spec else 15.0
                     sl_offset_bps = spec.sl_bps if spec else 18.0
                     tp_price = avg_px * (1.0 + tp_offset_bps / 10_000.0) if side.upper() == "BUY" else avg_px * (1.0 - tp_offset_bps / 10_000.0)
                     sl_price = avg_px * (1.0 - sl_offset_bps / 10_000.0) if side.upper() == "BUY" else avg_px * (1.0 + sl_offset_bps / 10_000.0)
-                    asyncio.create_task(self.close_position_maker(sym, close_side, actual_qty, tp_price))
-                    asyncio.create_task(self.place_protective_stop_loss(sym, close_side, abs(net_inv_contracts) or actual_qty, sl_price))
+                    asyncio.create_task(self.close_position_maker(order_sym, close_side, actual_qty, tp_price))
+                    asyncio.create_task(self.place_protective_stop_loss(order_sym, close_side, abs(net_inv_contracts) or actual_qty, sl_price))
             else:
-                logger.info(f"Orden {oid} en {sym} ({side}) cancelada o expirada en BingX sin fills. No se genera trade fantasma.")
+                logger.info(f"Orden {oid} en {order_sym} ({side}) cancelada o expirada en BingX sin fills. No se genera trade fantasma.")
 
     async def sync_portfolio_state(self, portfolio: PortfolioState) -> None:
         """
@@ -2531,12 +2559,14 @@ class BingXLiveWsGateway:
                     if self.live_active_bid_id and self.live_active_bid_id not in open_order_ids:
                         old_bid = self.live_active_bid_id
                         self.live_active_bid_id = None
-                        await self._handle_order_completion(old_bid, "BTC/USDT:USDT", "BUY", portfolio)
+                        meta_sym = str(self.active_orders_meta.get(old_bid, {}).get("symbol") or "BTC/USDT:USDT")
+                        await self._handle_order_completion(old_bid, meta_sym, "BUY", portfolio)
 
                     if self.live_active_ask_id and self.live_active_ask_id not in open_order_ids:
                         old_ask = self.live_active_ask_id
                         self.live_active_ask_id = None
-                        await self._handle_order_completion(old_ask, "BTC/USDT:USDT", "SELL", portfolio)
+                        meta_sym = str(self.active_orders_meta.get(old_ask, {}).get("symbol") or "BTC/USDT:USDT")
+                        await self._handle_order_completion(old_ask, meta_sym, "SELL", portfolio)
         except Exception as e:
             logger.error(f"Error sincronizando órdenes abiertas con BingX: {e}")
 
@@ -2554,6 +2584,9 @@ class BingXLiveWsGateway:
                     for tr in res_trades:
                         if not isinstance(tr, dict):
                             continue
+                        tr_sym_raw = tr.get("symbol")
+                        if tr_sym_raw and self.resolve_bingx_symbol(str(tr_sym_raw)) != target_sym:
+                            continue
                         tid = str(tr.get("id") or "")
                         ord_id = str(tr.get("order") or "")
                         if (tid and tid in self._processed_trade_ids) or (ord_id and ord_id in self._processed_order_ids):
@@ -2568,7 +2601,9 @@ class BingXLiveWsGateway:
                         tr_side = str(tr.get("side") or "").upper()
                         tr_px = float(tr.get("price") or 0.0)
                         tr_qty = float(tr.get("amount") or 0.0)
-                        fee_cost = float(tr.get("fee", {}).get("cost") or 0.0) if isinstance(tr.get("fee"), dict) else 0.0
+                        if tr_px <= 0.0 or tr_qty <= 0.0:
+                            continue
+                        fee_cost = float(tr.get("fee", {}).get("cost") or tr.get("info", {}).get("fee") or (tr_px * tr_qty * 0.0002))
                         cid = str(tr.get("order") or tr.get("clientOrderId") or "")
                         fill_res = self.ledger.record_fill(
                             order_id_or_cid=cid or f"tr_{tid}",
@@ -2600,6 +2635,7 @@ class BingXLiveWsGateway:
                                     pnl_usd=round(net_pnl, 2),
                                     trade_id=f"LIVE-BINGX-{tid or cid}",
                                     timestamp_ns=(tr_ts * 1_000_000) if tr_ts > 0 else None,
+                                    fee_cost=round(fee_cost, 4),
                                 )
                             except Exception as ef:
                                 logger.debug(f"Error despachando on_fill BingX: {ef}")
@@ -4033,6 +4069,41 @@ class DryRunExecutionEngine:
         time_str = dt.strftime("%H:%M:%S.%f")[:-3]
         tid = trade_id or f"TRD-{ts_ms}-{len(self.recent_trades) + 1}"
 
+        # ---------------------------------------------------------------------
+        # 1. Filtro de Coherencia de Precios (Price Sanity Guard: Banda de ±15% respecto al Mid-Price)
+        # ---------------------------------------------------------------------
+        ctx = getattr(self, "symbol_contexts", {}).get(symbol)
+        sym_mid = 0.0
+        if ctx is not None:
+            if ctx.ring_buffer.ob_count > 0:
+                idx = (ctx.ring_buffer.ob_head - 1) % ctx.ring_buffer.capacity
+                bb = float(ctx.ring_buffer.ob_bid_prices[idx, 0])
+                ba = float(ctx.ring_buffer.ob_ask_prices[idx, 0])
+                if bb > 0 and ba > 0:
+                    sym_mid = 0.5 * (bb + ba)
+            if sym_mid <= 0.0 and ctx.ring_buffer.trade_count > 0:
+                t_idx = (ctx.ring_buffer.trade_head - 1) % ctx.ring_buffer.capacity
+                last_px = float(ctx.ring_buffer.trade_prices[t_idx])
+                if last_px > 0.0:
+                    sym_mid = last_px
+
+        ep_float = float(entry_price)
+        xp_float = float(exit_or_mid_price)
+        if sym_mid > 0.0:
+            min_allowed = 0.85 * sym_mid
+            max_allowed = 1.15 * sym_mid
+            is_entry_bad = (ep_float > 0.0) and (ep_float < min_allowed or ep_float > max_allowed)
+            is_exit_bad = (xp_float > 0.0) and (xp_float < min_allowed or xp_float > max_allowed)
+            if is_entry_bad or is_exit_bad:
+                logger.critical(
+                    f"[SANITY_REJECT] Precios cruzados detectados para {symbol}: "
+                    f"entry={ep_float}, exit={xp_float}, mid={sym_mid:.4f} (banda [{min_allowed:.4f}, {max_allowed:.4f}]). "
+                    "Descartando trade sin alterar PnL ni blotter."
+                )
+                return {}
+
+        fee_cost = float(kwargs.get("fee_cost") or 0.0)
+
         strat_upper = str(strategy).upper()
         if "LIQ" in strat_upper or "CASCADE" in strat_upper:
             strat_clean = "LIQ_CASCADE"
@@ -4059,6 +4130,7 @@ class DryRunExecutionEngine:
             "qty": round(float(qty), 4),
             "return_pct": round(float(return_pct), 3),
             "pnl_usd": round(float(pnl_usd), 2),
+            "fee_cost": round(float(fee_cost), 4),
         }
         self.recent_trades.append(trade_item)
         if pnl_usd >= 0.0:

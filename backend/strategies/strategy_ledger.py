@@ -150,11 +150,16 @@ class VirtualStrategyLedger:
         cid = self.exchange_to_client_id.get(str(order_id_or_cid), str(order_id_or_cid))
         lot_key = self.order_to_lot.get(cid)
 
-        if not lot_key:
+        if lot_key and lot_key in self.lots:
+            candidate_lot = self.lots[lot_key]
+            if candidate_lot.symbol == symbol:
+                lot = candidate_lot
+            else:
+                strat, sub = self.parse_client_order_id(cid)
+                lot = self.get_or_create_lot(symbol, strat, sub)
+        else:
             strat, sub = self.parse_client_order_id(cid)
             lot = self.get_or_create_lot(symbol, strat, sub)
-        else:
-            lot = self.lots[lot_key]
 
         side_upper = side.upper()
         now_ns = ts_ns or time.time_ns()
@@ -201,6 +206,7 @@ class VirtualStrategyLedger:
 
         return {
             "lot_key": lot.key,
+            "symbol": lot.symbol,
             "strategy_id": lot.strategy_id,
             "sub_lot_id": lot.sub_lot_id,
             "inventory_q": lot.inventory_q,

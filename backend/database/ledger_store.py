@@ -22,7 +22,9 @@ class LedgerSqliteStore:
     4. Curva de markouts post-trade (1s, 5s, 15s, 30s) para análisis de slippage.
     """
 
-    def __init__(self, db_path: str = "backend/data/trades_ledger.db") -> None:
+    def __init__(self, db_path: str | None = None) -> None:
+        if db_path is None:
+            db_path = os.getenv("LEDGER_DB_PATH", "backend/data/trades_ledger.db")
         self.db_path = db_path
         if db_path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
