@@ -67,6 +67,7 @@ from backend.strategies.strategy_ledger import VirtualStrategyLedger, VirtualPos
 from backend.strategies.leverage_controller import AutonomousLeverageController
 import os
 from backend.strategies.regime_config import RegimeConfig
+from backend.strategies.directional_trend import DirectionalTrendStrategy
 
 CROSS_HEDGE_PAIRS: set[str] = {
     "BTC/USDT:USDT",
@@ -3075,6 +3076,7 @@ class SymbolExecutionContext:
     sl_bps: float = 35.0
     max_holding_time_s: float = 1800.0
     last_exit_reason: str = "NONE"
+    directional: Any = None
 
 
 @dataclass
@@ -3167,6 +3169,15 @@ class DryRunExecutionEngine:
                 order_qty=spec.step_size,
                 gatekeeper=self.gatekeeper,
             )
+            dir_strat = DirectionalTrendStrategy(
+                symbol=sym,
+                tick_size=spec.tick_size,
+                step_size=spec.step_size,
+                risk_pct_per_trade=0.005,
+                sl_bps=15.0,
+                tp_bps=45.0,
+                min_notional_usd=spec.min_notional,
+            )
             ctx = SymbolExecutionContext(
                 symbol=sym,
                 spec=spec,
@@ -3175,6 +3186,7 @@ class DryRunExecutionEngine:
                 liq_hunter=liq,
                 l2_sim=sim,
                 ws_gateway=gw,
+                directional=dir_strat,
             )
             self.symbol_contexts[sym] = ctx
 
@@ -3196,6 +3208,7 @@ class DryRunExecutionEngine:
         self.bingx_gateway: BingXLiveWsGateway | None = None
         self.primary_exchange: str = os.getenv("PRIMARY_EXCHANGE", "binance").strip().lower()
         self.trading_mode: str = "PAPER_L2"
+        self.strategy_mode: str = os.getenv("STRATEGY_MODE", "MARKET_MAKING").strip().upper()
         self.simulated_vault_usd: float = 0.0
         self._live_active_bid_id: str | None = None
         self._live_active_ask_id: str | None = None
@@ -5999,6 +6012,7 @@ class DryRunExecutionEngine:
             "timestamp_ns": now_ns,
             "mode": self.trading_mode,
             "trading_mode": self.trading_mode,
+            "strategy_mode": self.strategy_mode,
             "hot_path_latency_us": round(self.last_latency_us, 2),
             "execution_stats": execution_stats,
             "open_orders": open_orders_list,
@@ -6166,6 +6180,29 @@ async def health_check() -> dict[str, Any]:
     }
 
 
+class StrategyModeRequest(BaseModel):
+    strategy_mode: Literal["MARKET_MAKING", "DIRECTIONAL", "DIRECTIONAL_TREND"]
+
+
+@app.get("/api/strategy-mode", dependencies=[Depends(verify_bearer_token)])
+async def get_strategy_mode_endpoint() -> dict[str, Any]:
+    """Retorna el modo de estrategia activo (MARKET_MAKING o DIRECTIONAL_TREND)."""
+    return {
+        "status": "SUCCESS",
+        "strategy_mode": engine.strategy_mode,
+        "available_modes": ["MARKET_MAKING", "DIRECTIONAL_TREND"],
+    }
+
+
+@app.post("/api/strategy-mode", dependencies=[Depends(verify_bearer_token)])
+async def set_strategy_mode_endpoint(req: StrategyModeRequest) -> dict[str, Any]:
+    """Conmuta dinámicamente el modo de estrategia entre Market Making y Direccional 1:3."""
+    norm_mode = "DIRECTIONAL_TREND" if req.strategy_mode == "DIRECTIONAL" else req.strategy_mode
+    engine.strategy_mode = norm_mode
+    logger.info(f"[STRATEGY_MODE] Modo de estrategia conmutado a: {norm_mode}")
+    return {"status": "SUCCESS", "strategy_mode": engine.strategy_mode}
+
+
 @app.get("/api/leverage", dependencies=[Depends(verify_bearer_token)])
 async def get_leverage_evaluation_endpoint() -> dict[str, Any]:
     """Devuelve la matriz de evaluación de apalancamiento (x3, x5, x7, x10) en tiempo real."""
@@ -6305,13 +6342,15 @@ async def set_trading_mode_endpoint(req: TradingModeRequest, request: Request = 
     """
     Conmuta el modo de ejecución entre PAPER_L2, LIVE_BINANCE, LIVE_BINGX y LIVE_MULTI.
     REGLA DE SEGURIDAD CRÍTICA:
+    Para cualquier modo LIVE exige confirm='LIVE' primero.
     Si se solicita LIVE_BINANCE, verifica que BINANCE_API_KEY y BINANCE_API_SECRET existan.
     Si se solicita LIVE_BINGX, verifica que BINGX_API_KEY y BINGX_API_SECRET existan.
     Si se solicita LIVE_MULTI, verifica ambas credenciales de Binance y BingX.
     Verifica que gatekeeper.kill_switch_engaged sea False.
     Si faltan claves API o el Kill-Switch está activo, rechaza con HTTP 400 y mantiene el bot en PAPER_L2.
-    Para cualquier modo LIVE exige confirm='LIVE'.
     """
+    client_ip = request.client.host if request and request.client else "unknown"
+
     if req.mode == "LIVE_BINANCE":
         api_key = os.getenv("BINANCE_API_KEY", "").strip()
         api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
@@ -6319,13 +6358,13 @@ async def set_trading_mode_endpoint(req: TradingModeRequest, request: Request = 
             logger.warning("Intento de cambio a LIVE_BINANCE rechazado por falta de claves API.")
             raise HTTPException(
                 status_code=400,
-                detail="Configuración de seguridad incompleta: Debe configurar BINANCE_API_KEY y BINANCE_API_SECRET en su archivo .env antes de operar en vivo. El bot se mantiene en PAPER_L2.",
+                detail="Confirmación requerida y configuración incompleta: Para cambiar a modo LIVE debe enviar confirm='LIVE' y configurar BINANCE_API_KEY y BINANCE_API_SECRET en su archivo .env antes de operar en vivo. El bot se mantiene en PAPER_L2.",
             )
         if engine.gatekeeper.kill_switch_engaged:
             logger.warning("Intento de cambio a LIVE_BINANCE rechazado: Kill-Switch activo.")
             raise HTTPException(
                 status_code=400,
-                detail="Bloqueo de seguridad: El Kill-Switch de emergencia está activo. Debe resetear el Kill-Switch antes de pasar a LIVE_BINANCE.",
+                detail="Confirmación requerida y bloqueo de seguridad: Para cambiar a modo LIVE debe enviar confirm='LIVE'. El Kill-Switch de emergencia está activo. Debe resetear el Kill-Switch antes de pasar a LIVE_BINANCE.",
             )
     elif req.mode == "LIVE_BINGX":
         api_key = os.getenv("BINGX_API_KEY", "").strip()
@@ -6334,13 +6373,13 @@ async def set_trading_mode_endpoint(req: TradingModeRequest, request: Request = 
             logger.warning("Intento de cambio a LIVE_BINGX rechazado por falta de claves API.")
             raise HTTPException(
                 status_code=400,
-                detail="Configuración de seguridad incompleta: Debe configurar BINGX_API_KEY y BINGX_API_SECRET en su archivo .env antes de operar en vivo con BingX. El bot se mantiene en PAPER_L2.",
+                detail="Confirmación requerida y configuración incompleta: Para cambiar a modo LIVE debe enviar confirm='LIVE' y configurar BINGX_API_KEY y BINGX_API_SECRET en su archivo .env antes de operar en vivo con BingX. El bot se mantiene en PAPER_L2.",
             )
         if engine.gatekeeper.kill_switch_engaged:
             logger.warning("Intento de cambio a LIVE_BINGX rechazado: Kill-Switch activo.")
             raise HTTPException(
                 status_code=400,
-                detail="Bloqueo de seguridad: El Kill-Switch de emergencia está activo. Debe resetear el Kill-Switch antes de pasar a LIVE_BINGX.",
+                detail="Confirmación requerida y bloqueo de seguridad: Para cambiar a modo LIVE debe enviar confirm='LIVE'. El Kill-Switch de emergencia está activo. Debe resetear el Kill-Switch antes de pasar a LIVE_BINGX.",
             )
     elif req.mode == "LIVE_MULTI":
         bin_key = os.getenv("BINANCE_API_KEY", "").strip()
@@ -6350,20 +6389,19 @@ async def set_trading_mode_endpoint(req: TradingModeRequest, request: Request = 
         if not bin_key or not bin_secret:
             raise HTTPException(
                 status_code=400,
-                detail="Configuración de seguridad incompleta: Debe configurar BINANCE_API_KEY y BINANCE_API_SECRET en su archivo .env antes de operar en modo LIVE_MULTI.",
+                detail="Confirmación requerida y configuración incompleta: Para cambiar a modo LIVE debe enviar confirm='LIVE' y configurar BINANCE_API_KEY y BINANCE_API_SECRET en su archivo .env antes de operar en modo LIVE_MULTI.",
             )
         if not bx_key or not bx_secret:
             raise HTTPException(
                 status_code=400,
-                detail="Configuración de seguridad incompleta: Debe configurar BINGX_API_KEY y BINGX_API_SECRET en su archivo .env antes de operar en modo LIVE_MULTI.",
+                detail="Confirmación requerida y configuración incompleta: Para cambiar a modo LIVE debe enviar confirm='LIVE' y configurar BINGX_API_KEY y BINGX_API_SECRET en su archivo .env antes de operar en modo LIVE_MULTI.",
             )
         if engine.gatekeeper.kill_switch_engaged:
             raise HTTPException(
                 status_code=400,
-                detail="Bloqueo de seguridad: El Kill-Switch de emergencia está activo. Debe resetear el Kill-Switch antes de pasar a LIVE_MULTI.",
+                detail="Confirmación requerida y bloqueo de seguridad: Para cambiar a modo LIVE debe enviar confirm='LIVE'. El Kill-Switch de emergencia está activo. Debe resetear el Kill-Switch antes de pasar a LIVE_MULTI.",
             )
 
-    client_ip = request.client.host if request and request.client else "unknown"
     if req.mode.startswith("LIVE"):
         if req.confirm != "LIVE":
             logger.warning(f"[SECURITY_AUDIT] Intento de pasar a {req.mode} sin confirm='LIVE' desde IP: {client_ip}")

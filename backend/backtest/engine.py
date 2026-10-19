@@ -143,7 +143,10 @@ class InstitutionalBacktestEngine:
         if len(candles) < 25:
             raise ValueError(f"Se requieren al menos 25 velas para el backtest. Recibidas: {len(candles)}")
 
-        gatekeeper = MandateGatekeeper(max_single_pair_margin_ratio=self.max_single_pair_margin_ratio)
+        gatekeeper = MandateGatekeeper(
+            max_single_pair_margin_ratio=self.max_single_pair_margin_ratio,
+            state_file_path=":memory:",
+        )
         if self.leverage > 1.0:
             gatekeeper.set_leverage_tier(self.leverage)
             if self.max_single_pair_margin_ratio != 0.20:
@@ -453,14 +456,21 @@ class InstitutionalBacktestEngine:
 
                 # Cálculo de Sizing
                 if self.fixed_risk_pct is not None and self.fixed_risk_pct > 0.0:
-                    # Fase 5: Sizing por Riesgo Fijo (ej. 0.5% del capital)
-                    # Qty = (Equity * risk_pct) / Distancia_al_Stop
-                    sl_dist = spread_usd * self.stop_loss_mult
-                    risk_budget = current_cap * self.fixed_risk_pct
-                    calc_qty = risk_budget / max(sl_dist, 1e-4)
-                    order_qty = round(math.floor(calc_qty / self.step_size) * self.step_size, 4)
+                    from backend.strategies.risk_sizing import compute_fixed_risk_position_size
+                    sl_dist = spread_usd * self.stop_loss_mult if strategy_mode == "MARKET_MAKING" else max(spread_usd * 1.5, close_p * 0.0015)
+                    order_qty = compute_fixed_risk_position_size(
+                        equity_usd=current_cap,
+                        entry_price=close_p,
+                        stop_loss_price=close_p - sl_dist,
+                        step_size=self.step_size,
+                        tick_size=self.tick_size,
+                        risk_pct_per_trade=self.fixed_risk_pct,
+                        max_pair_margin_ratio=self.max_single_pair_margin_ratio,
+                        leverage=self.leverage,
+                        min_notional_usd=self.min_notional_usd,
+                    )
                 else:
-                    max_notional_gate3 = current_cap * self.max_single_pair_margin_ratio
+                    max_notional_gate3 = current_cap * self.max_single_pair_margin_ratio * max(1.0, self.leverage)
                     order_qty = round((max_notional_gate3 * 0.90) / close_p, 4)
 
                 order_qty = max(self.step_size, order_qty)
@@ -498,15 +508,22 @@ class InstitutionalBacktestEngine:
                             }
 
                     elif strategy_mode == "DIRECTIONAL_TREND":
-                        # Fase 5: Estrategia Direccional 1:3 R:R (Ruptura con filtro de régimen OBI)
-                        # Compra en ruptura alcista sobre high de las últimas 10 barras
-                        recent_high = max(c[2] for c in candles[max(0, i - 10):i + 1])
-                        recent_low = min(c[3] for c in candles[max(0, i - 10):i + 1])
-                        breakout_range = recent_high - recent_low
+                        # Fase 5: Estrategia Direccional Institucional 1:3 R:R (Trend Momentum & Breakout)
+                        # Opera con tendencia EMA(8) > EMA(21) o quiebre de rango de 10 barras previas
+                        hist_closes = [c[4] for c in candles[max(0, i - 21):i + 1]]
+                        is_trend_up = False
+                        if len(hist_closes) >= 21:
+                            ema_fast = float(np.mean(hist_closes[-8:]))
+                            ema_slow = float(np.mean(hist_closes[-21:]))
+                            is_trend_up = (ema_fast > ema_slow * 1.0001)
 
-                        if close_p >= (recent_high - self.tick_size) and ema_obi > 0.20:
+                        prev_window = candles[max(0, i - 10):i]
+                        prev_high = max(c[2] for c in prev_window) if prev_window else close_p
+                        is_breakout = (close_p >= (prev_high - self.tick_size))
+
+                        if (is_trend_up or is_breakout) and ema_obi > -0.10:
                             entry_target = close_p
-                            sl_dist = max(breakout_range * 0.5, spread_usd * 1.5)
+                            sl_dist = max(spread_usd * 1.5, close_p * 0.0015)
                             rr_mult = self.risk_reward_ratio if self.risk_reward_ratio else 3.0
                             tp_dist = sl_dist * rr_mult
                             pending_order = {

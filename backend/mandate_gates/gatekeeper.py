@@ -22,6 +22,7 @@ class MandateGatekeeper:
     DAILY_KILL_SWITCH_DRAWDOWN: float = -0.03
     MAX_CONSECUTIVE_LOSSES: int = 5
     MAX_CONSECUTIVE_API_ERRORS: int = 5
+    MAX_SIMULTANEOUS_POSITIONS: int = 5
     FLOAT_EPSILON: float = 1e-12
 
     __slots__ = (
@@ -36,6 +37,7 @@ class MandateGatekeeper:
         "rate_limit_cooldown_until_ns",
         "state_file_path",
         "min_notional_floor",
+        "max_simultaneous_positions",
     )
 
     def __init__(
@@ -46,6 +48,7 @@ class MandateGatekeeper:
         max_consecutive_losses: int | None = None,
         state_file_path: str | Path | None = None,
         min_notional_floor: float | None = None,
+        max_simultaneous_positions: int | None = None,
     ) -> None:
         self._emergency_callback = emergency_callback
         self.kill_switch_engaged: bool = False
@@ -58,6 +61,11 @@ class MandateGatekeeper:
             if max_single_pair_margin_ratio is not None
             else self.MAX_SINGLE_PAIR_MARGIN_RATIO
         )
+        self.max_simultaneous_positions: int = (
+            int(max_simultaneous_positions)
+            if max_simultaneous_positions is not None
+            else self.MAX_SIMULTANEOUS_POSITIONS
+        )
         self.consecutive_losses: int = 0
         self.max_consecutive_losses: int = (
             int(max_consecutive_losses) if max_consecutive_losses is not None else self.MAX_CONSECUTIVE_LOSSES
@@ -66,7 +74,9 @@ class MandateGatekeeper:
         self.rate_limit_cooldown_until_ns: int = 0
         self.min_notional_floor: float | None = min_notional_floor
         env_state_path = os.getenv("KILL_SWITCH_STATE_PATH")
-        if state_file_path is not None:
+        if state_file_path == ":memory:":
+            self.state_file_path = None
+        elif state_file_path is not None:
             self.state_file_path = Path(state_file_path)
         elif env_state_path:
             self.state_file_path = Path(env_state_path)
@@ -303,5 +313,20 @@ class MandateGatekeeper:
                 f"GATE_3_HALF_KELLY_CAP: Apalancamiento proyectado ({projected_total_leverage:.4f}x) "
                 f"supera el techo permitido ({allowed_leverage:.4f}x | Half-Kelly={l_half_kelly:.4f}x).",
             )
+
+        # ---------------------------------------------------------------------
+        # GATE 5: Límite de Pares Simultáneos (Máximo 5 posiciones abiertas)
+        # ---------------------------------------------------------------------
+        is_opening_new_pair = (abs(existing_pair_notional) <= 1e-6)
+        if is_opening_new_pair and not is_reducing and order.strategy_id != "EMERGENCY_FLATTEN":
+            current_active_count = sum(
+                1 for sym, notional in state.active_positions.items() if abs(notional) > 1e-4
+            )
+            if current_active_count >= self.max_simultaneous_positions:
+                return (
+                    False,
+                    f"GATE_5_MAX_POSITIONS: Límite de {self.max_simultaneous_positions} posiciones simultáneas alcanzado "
+                    f"({current_active_count} posiciones activas). No se permiten nuevas posiciones hasta que cierre una.",
+                )
 
         return True, "APPROVED"
