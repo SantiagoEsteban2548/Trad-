@@ -34,12 +34,14 @@ import ccxt
 import ccxt.pro as ccxtpro
 import ccxt.async_support as ccxt_async
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 from dotenv import load_dotenv
+
+from backend.security.auth import verify_bearer_token, verify_websocket_token
 
 load_dotenv()
 
@@ -3037,6 +3039,7 @@ class DryRunExecutionEngine:
         self.symbols = symbols or list(SYMBOL_SPECS.keys())
         self.primary_symbol = self.symbols[0]
         self.config_path = config_path
+        self._start_ts_s: float = time.time()
 
         # 1. Ingesta WebSocket multiplexada concurrente vía CCXT Pro (Binance Primario + BingX Secundario para Lead-Lag)
         bingx_symbols = [s for s in self.symbols if SYMBOL_SPECS.get(s) and SYMBOL_SPECS[s].exchange == "bingx"]
@@ -5966,9 +5969,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_raw_allowed = os.getenv("ALLOWED_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:8000,http://localhost:8000")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_allowed.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -5977,14 +5983,21 @@ app.add_middleware(
 
 class TradingModeRequest(BaseModel):
     mode: Literal["PAPER_L2", "LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI"]
+    confirm: str | None = None
 
 
 class BaseCapitalRequest(BaseModel):
     base_capital_usd: float
+    confirm: str | None = None
 
 
 class ResetStateRequest(BaseModel):
     base_capital_usd: float | None = None
+    confirm: str | None = None
+
+
+class ResetKillSwitchRequest(BaseModel):
+    confirm: str | None = None
 
 
 class LeverageTierRequest(BaseModel):
@@ -5993,27 +6006,23 @@ class LeverageTierRequest(BaseModel):
 
 @app.get("/api/health")
 async def health_check() -> dict[str, Any]:
-    """Chequeo de salud del motor bimodal / trimodal."""
+    """Chequeo de salud público y sanitizado sin divulgación de datos sensibles."""
+    uptime_s = round(time.time() - getattr(engine, "_start_ts_s", time.time()), 2)
     return {
         "status": "OK",
         "mode": engine.trading_mode,
-        "trading_mode": engine.trading_mode,
-        "selected_leverage": engine.selected_leverage,
-        "kill_switch_engaged": engine.gatekeeper.kill_switch_engaged,
-        "emergency_flatten_count": engine.gatekeeper.emergency_flatten_count,
-        "regime_config": engine.regime_config.model_dump(),
-        "rotations_filled": engine.total_rotations_filled,
-        "simulated_vault_usd": getattr(engine, "simulated_vault_usd", 0.0),
+        "uptime_s": uptime_s,
+        "timestamp_ns": time.time_ns(),
     }
 
 
-@app.get("/api/leverage")
+@app.get("/api/leverage", dependencies=[Depends(verify_bearer_token)])
 async def get_leverage_evaluation_endpoint() -> dict[str, Any]:
     """Devuelve la matriz de evaluación de apalancamiento (x3, x5, x7, x10) en tiempo real."""
     return engine.evaluate_leverage_tiers()
 
 
-@app.post("/api/leverage")
+@app.post("/api/leverage", dependencies=[Depends(verify_bearer_token)])
 async def set_leverage_tier_endpoint(req: LeverageTierRequest) -> dict[str, Any]:
     """Ajusta el nivel de apalancamiento activo (x3, x5, x7, x10) y recalibra TP/SL y Gate 3."""
     try:
@@ -6028,13 +6037,13 @@ async def set_leverage_tier_endpoint(req: LeverageTierRequest) -> dict[str, Any]
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/telemetry")
+@app.get("/api/telemetry", dependencies=[Depends(verify_bearer_token)])
 async def get_telemetry_endpoint() -> dict[str, Any]:
     """Snapshot completo de telemetría real de microestructura y riesgo."""
     return engine.get_telemetry_snapshot()
 
 
-@app.get("/api/trades")
+@app.get("/api/trades", dependencies=[Depends(verify_bearer_token)])
 async def get_trades_endpoint(limit: int = 1000, symbol: str | None = None) -> dict[str, Any]:
     """
     Retorna el historial de transacciones persistidas en SQLite (o memoria)
@@ -6056,7 +6065,7 @@ async def get_trades_endpoint(limit: int = 1000, symbol: str | None = None) -> d
     }
 
 
-@app.get("/api/trades/export-csv")
+@app.get("/api/trades/export-csv", dependencies=[Depends(verify_bearer_token)])
 async def export_trades_csv_endpoint(limit: int = 10000, symbol: str | None = None):
     """
     Exporta el historial completo de transacciones en formato CSV descargable
@@ -6113,14 +6122,24 @@ async def export_trades_csv_endpoint(limit: int = 10000, symbol: str | None = No
     )
 
 
-@app.post("/api/reset-state")
-async def reset_state_endpoint(req: ResetStateRequest | None = None) -> dict[str, Any]:
+@app.post("/api/reset-state", dependencies=[Depends(verify_bearer_token)])
+async def reset_state_endpoint(req: ResetStateRequest | None = None, request: Request = None) -> dict[str, Any]:
     """
     Reinicia el estado institucional del motor cuantitativo desde 0:
     Limpia órdenes huérfanas, historial de trades, contadores de victorias/derrotas,
     PnL bruto y neto acumulado, curva de equidad y estado de cuarentena DSR.
+    Exige confirm='RESET_STATE'.
     """
-    cap = req.base_capital_usd if req else None
+    client_ip = request.client.host if request and request.client else "unknown"
+    if not req or req.confirm != "RESET_STATE":
+        logger.warning(f"[SECURITY_AUDIT] Intento de reset-state sin confirmación válida desde IP: {client_ip}")
+        raise HTTPException(
+            status_code=400,
+            detail="Operación destructiva: Debe enviar confirm='RESET_STATE' en el cuerpo de la solicitud.",
+        )
+
+    logger.warning(f"[SECURITY_AUDIT] reset-state confirmado ejecutado desde IP: {client_ip}")
+    cap = req.base_capital_usd
     engine.reset_state_from_zero(base_capital_usd=cap)
     return {
         "status": "STATE_RESET_OK",
@@ -6131,8 +6150,8 @@ async def reset_state_endpoint(req: ResetStateRequest | None = None) -> dict[str
     }
 
 
-@app.post("/api/trading-mode")
-async def set_trading_mode_endpoint(req: TradingModeRequest) -> dict[str, Any]:
+@app.post("/api/trading-mode", dependencies=[Depends(verify_bearer_token)])
+async def set_trading_mode_endpoint(req: TradingModeRequest, request: Request = None) -> dict[str, Any]:
     """
     Conmuta el modo de ejecución entre PAPER_L2, LIVE_BINANCE, LIVE_BINGX y LIVE_MULTI.
     REGLA DE SEGURIDAD CRÍTICA:
@@ -6141,6 +6160,7 @@ async def set_trading_mode_endpoint(req: TradingModeRequest) -> dict[str, Any]:
     Si se solicita LIVE_MULTI, verifica ambas credenciales de Binance y BingX.
     Verifica que gatekeeper.kill_switch_engaged sea False.
     Si faltan claves API o el Kill-Switch está activo, rechaza con HTTP 400 y mantiene el bot en PAPER_L2.
+    Para cualquier modo LIVE exige confirm='LIVE'.
     """
     if req.mode == "LIVE_BINANCE":
         api_key = os.getenv("BINANCE_API_KEY", "").strip()
@@ -6193,6 +6213,22 @@ async def set_trading_mode_endpoint(req: TradingModeRequest) -> dict[str, Any]:
                 detail="Bloqueo de seguridad: El Kill-Switch de emergencia está activo. Debe resetear el Kill-Switch antes de pasar a LIVE_MULTI.",
             )
 
+    client_ip = request.client.host if request and request.client else "unknown"
+    if req.mode.startswith("LIVE"):
+        if req.confirm != "LIVE":
+            logger.warning(f"[SECURITY_AUDIT] Intento de pasar a {req.mode} sin confirm='LIVE' desde IP: {client_ip}")
+            raise HTTPException(
+                status_code=400,
+                detail="Confirmación requerida: Para cambiar a modo LIVE debe enviar confirm='LIVE'.",
+            )
+    elif req.confirm and req.confirm not in ("CONFIRM_MODE", "PAPER_L2"):
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmación inválida: Para cambiar de modo debe enviar confirm='CONFIRM_MODE'.",
+        )
+
+    logger.warning(f"[SECURITY_AUDIT] Cambio de modo a {req.mode} ejecutado desde IP: {client_ip}")
+
     try:
         await engine.set_trading_mode(req.mode)
         return {
@@ -6205,8 +6241,8 @@ async def set_trading_mode_endpoint(req: TradingModeRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/emergency-flatten")
-async def emergency_flatten_endpoint() -> dict[str, Any]:
+@app.post("/api/emergency-flatten", dependencies=[Depends(verify_bearer_token)])
+async def emergency_flatten_endpoint(request: Request = None) -> dict[str, Any]:
     """
     Disparador síncrono del Kill-Switch de emergencia (Gate 4).
     Bloquea inmediatamente todas las órdenes nuevas y activa el flatten.
@@ -6246,7 +6282,7 @@ async def emergency_flatten_endpoint() -> dict[str, Any]:
     }
 
 
-@app.post("/api/profit-sweep")
+@app.post("/api/profit-sweep", dependencies=[Depends(verify_bearer_token)])
 async def profit_sweep_endpoint() -> dict[str, Any]:
     """
     Dispara el barrido de excedentes de ganancias:
@@ -6336,11 +6372,18 @@ async def profit_sweep_endpoint() -> dict[str, Any]:
     }
 
 
-@app.post("/api/reset-kill-switch")
-async def reset_kill_switch_endpoint() -> dict[str, Any]:
+@app.post("/api/reset-kill-switch", dependencies=[Depends(verify_bearer_token)])
+async def reset_kill_switch_endpoint(req: ResetKillSwitchRequest | None = None, request: Request = None) -> dict[str, Any]:
     """Permite al operador reiniciar el Kill-Switch tras auditar la contingencia."""
+    client_ip = request.client.host if request and request.client else "unknown"
+    if not req or req.confirm != "RESET_KILL_SWITCH":
+        logger.warning(f"[SECURITY_AUDIT] Intento de reset-kill-switch sin confirmación desde IP: {client_ip}")
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmación requerida: Debe enviar confirm='RESET_KILL_SWITCH' para restablecer el Kill-Switch.",
+        )
+    logger.warning(f"[SECURITY_AUDIT] Kill-Switch reseteado con confirmación desde IP: {client_ip}")
     engine.gatekeeper.reset_kill_switch()
-    logger.info("Kill-Switch reseteado por el operador.")
     return {
         "status": "KILL_SWITCH_RESET",
         "kill_switch_engaged": False,
@@ -6348,16 +6391,23 @@ async def reset_kill_switch_endpoint() -> dict[str, Any]:
     }
 
 
-@app.post("/api/base-capital")
-async def set_base_capital_endpoint(req: BaseCapitalRequest) -> dict[str, Any]:
+@app.post("/api/base-capital", dependencies=[Depends(verify_bearer_token)])
+async def set_base_capital_endpoint(req: BaseCapitalRequest, request: Request = None) -> dict[str, Any]:
     """Permite ajustar dinámicamente el capital base operativo asignado a las estrategias."""
+    client_ip = request.client.host if request and request.client else "unknown"
+    if req.confirm != "UPDATE_CAPITAL":
+        logger.warning(f"[SECURITY_AUDIT] Intento de actualizar capital sin confirmación desde IP: {client_ip}")
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmación requerida: Debe enviar confirm='UPDATE_CAPITAL' para modificar el capital base operativo.",
+        )
     if req.base_capital_usd <= 0:
         raise HTTPException(status_code=400, detail="El capital base debe ser mayor a 0.")
+    logger.warning(f"[SECURITY_AUDIT] Capital base operativo actualizado a {req.base_capital_usd} USDT desde IP: {client_ip}")
     engine.portfolio.base_capital_usd = round(req.base_capital_usd, 2)
     engine.portfolio.daily_high_watermark_usd = max(
         engine.portfolio.daily_high_watermark_usd, engine.portfolio.base_capital_usd
     )
-    logger.info(f"Capital base operativo asignado a {engine.portfolio.base_capital_usd} USDT.")
     return {
         "status": "BASE_CAPITAL_UPDATED",
         "base_capital_usd": engine.portfolio.base_capital_usd,
@@ -6370,15 +6420,26 @@ async def set_base_capital_endpoint(req: BaseCapitalRequest) -> dict[str, Any]:
 class StressEventRequest(BaseModel):
     event_type: str  # "FLASH_CRASH_5PCT" | "LATENCY_SPIKE_200MS" | "TRADFI_WEEKEND_CLOSE" | "RESET_CHAOS"
     symbol: str | None = "BTC/USDT:USDT"
+    confirm: str | None = None
 
 
-@app.post("/api/stress-event")
+@app.post("/api/stress-event", dependencies=[Depends(verify_bearer_token)])
 async def inject_stress_event_endpoint(req: StressEventRequest) -> dict[str, Any]:
     """
     Sub-panel de 'Chaos Injection' para PAPER_L2:
     Permite inyectar a voluntad un choque de liquidez (FLASH_CRASH_5PCT, LATENCY_SPIKE_200MS, TRADFI_WEEKEND_CLOSE)
     para verificar visualmente la reacción instantánea de los 4 Mandate Gates y del ContagionShield.
     """
+    if engine.trading_mode != "PAPER_L2":
+        raise HTTPException(
+            status_code=403,
+            detail="Chaos injection and stress events are strictly forbidden outside PAPER_L2 mode.",
+        )
+    if req.confirm != "INJECT_CHAOS":
+        raise HTTPException(
+            status_code=400,
+            detail="Se requiere payload con 'confirm': 'INJECT_CHAOS' para inyectar eventos de estrés.",
+        )
     global GLOBAL_MOCK_TRADFI_CLOSED, GLOBAL_CHAOS_LATENCY_ACTIVE
 
     ev_type = req.event_type.upper().strip()
@@ -6457,11 +6518,17 @@ async def inject_stress_event_endpoint(req: StressEventRequest) -> dict[str, Any
 
 class GeminiKeyRequest(BaseModel):
     api_key: str
+    confirm: str | None = None
 
 
-@app.post("/api/gemini-key")
+@app.post("/api/gemini-key", dependencies=[Depends(verify_bearer_token)])
 async def set_gemini_key_endpoint(req: GeminiKeyRequest) -> dict[str, Any]:
     """Permite configurar o actualizar en caliente la API Key de Gemini para el Warm Path Council."""
+    if req.confirm != "UPDATE_KEY":
+        raise HTTPException(
+            status_code=400,
+            detail="Se requiere payload con 'confirm': 'UPDATE_KEY' para actualizar la API key.",
+        )
     new_key = req.api_key.strip()
     if not new_key:
         raise HTTPException(status_code=400, detail="API key no puede estar vacía.")
@@ -6502,6 +6569,8 @@ async def telemetry_websocket_endpoint(websocket: WebSocket) -> None:
     Transmisión de telemetría viva a alta frecuencia (~10 Hz) hacia el Frontend React.
     Envía el estado real de PortfolioState, MarketRingBuffer, Gatekeeper y L2QueueSimulator.
     """
+    if not await verify_websocket_token(websocket):
+        return
     await websocket.accept()
     logger.info("Cliente WebSocket conectado a /ws/telemetry")
     try:
