@@ -22,7 +22,7 @@ class MandateGatekeeper:
     DAILY_KILL_SWITCH_DRAWDOWN: float = -0.03
     MAX_CONSECUTIVE_LOSSES: int = 5
     MAX_CONSECUTIVE_API_ERRORS: int = 5
-    MAX_SIMULTANEOUS_POSITIONS: int = 5
+    MAX_SIMULTANEOUS_POSITIONS: int = 20
     FLOAT_EPSILON: float = 1e-12
 
     __slots__ = (
@@ -61,10 +61,12 @@ class MandateGatekeeper:
             if max_single_pair_margin_ratio is not None
             else self.MAX_SINGLE_PAIR_MARGIN_RATIO
         )
+        env_max_pos = os.getenv("MAX_SIMULTANEOUS_POSITIONS")
+        default_max = int(env_max_pos) if env_max_pos and env_max_pos.isdigit() else self.MAX_SIMULTANEOUS_POSITIONS
         self.max_simultaneous_positions: int = (
             int(max_simultaneous_positions)
             if max_simultaneous_positions is not None
-            else self.MAX_SIMULTANEOUS_POSITIONS
+            else default_max
         )
         self.consecutive_losses: int = 0
         self.max_consecutive_losses: int = (
@@ -315,7 +317,7 @@ class MandateGatekeeper:
             )
 
         # ---------------------------------------------------------------------
-        # GATE 5: Límite de Pares Simultáneos (Máximo 5 posiciones abiertas)
+        # GATE 5: Límite de Pares Simultáneos (Configurable, por defecto 20 posiciones abiertas)
         # ---------------------------------------------------------------------
         is_opening_new_pair = (abs(existing_pair_notional) <= 1e-6)
         if is_opening_new_pair and not is_reducing and order.strategy_id != "EMERGENCY_FLATTEN":

@@ -2,10 +2,13 @@ import os
 import pytest
 
 @pytest.fixture(autouse=True)
-def isolate_test_ledger_database(monkeypatch):
+def isolate_test_environment(monkeypatch):
     """
-    Aislamiento estricto de base de datos para tests:
-    Fuerza el uso de SQLite en memoria (:memory:) para todas las suites de prueba,
-    impidiendo que los tests contaminen o modifiquen la base de datos real en backend/data/trades_ledger.db.
+    Aislamiento estricto de entorno para tests:
+    1. Base de datos SQLite en memoria (:memory:).
+    2. TRADING_MODE en PAPER_L2 por defecto para tests unitarios.
+    3. Limpieza de API_AUTH_TOKEN por defecto para tests que no prueban autenticación.
     """
     monkeypatch.setenv("LEDGER_DB_PATH", ":memory:")
+    monkeypatch.setenv("TRADING_MODE", "PAPER_L2")
+    monkeypatch.delenv("API_AUTH_TOKEN", raising=False)

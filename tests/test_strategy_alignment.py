@@ -133,6 +133,41 @@ def test_gate_5_max_simultaneous_positions_limit():
     assert approved_after_close, f"Habiendo 4 posiciones, abrir un nuevo par debe ser aprobado: {reason_after}"
 
 
+def test_gate_5_default_20_simultaneous_positions_limit():
+    """Verifica que el límite por defecto sea 20 y bloquee la apertura en la posición 21."""
+    gatekeeper = MandateGatekeeper(state_file_path=":memory:")
+    assert gatekeeper.max_simultaneous_positions == 20
+
+    # Crear cartera con 20 posiciones activas
+    active_20 = {f"PAIR_{i}/USDT:USDT": 100.0 for i in range(20)}
+    portfolio = PortfolioState(
+        base_capital_usd=50_000.0,
+        current_equity_usd=50_000.0,
+        daily_high_watermark_usd=50_000.0,
+        realized_pnl_today_usd=0.0,
+        active_positions=active_20,
+        rolling_edge_mu=0.045,
+        rolling_variance_sigma2=0.0090,
+    )
+
+    # Intento de abrir la posición 21 -> Rechazada
+    order_21st = OrderRequest(
+        symbol="PAIR_21/USDT:USDT",
+        side="BUY",
+        order_type="LIMIT",
+        price=10.0,
+        qty=1.0,
+        time_in_force="GTX",
+        margin_mode="ISOLATED",
+        strategy_id="DIRECTIONAL_TREND",
+        timestamp_ns=1000000,
+    )
+    approved_21, reason_21 = gatekeeper.validate_order(order_21st, portfolio)
+    assert not approved_21
+    assert "GATE_5_MAX_POSITIONS" in reason_21
+    assert "20 posiciones simultáneas" in reason_21
+
+
 def test_directional_trend_strategy_signal_generation():
     """
     Verifica que DirectionalTrendStrategy:
