@@ -754,6 +754,32 @@ class BinanceLiveWsGateway:
             logger.debug(f"place_protective_stop_loss omitido/rechazado en Binance ({symbol}): {e}")
             return None
 
+    async def place_protective_stop_loss_with_retry(
+        self, symbol: str, close_side: str, qty: float, stop_price: float, max_retries: int = 3
+    ) -> str | None:
+        """
+        Coloca Stop-Loss en Binance con hasta max_retries reintentos con backoff exponencial.
+        Si la colocación del SL falla tras agotar reintentos, cierra inmediatamente la posición
+        a mercado para erradicar posiciones huérfanas desprotegidas.
+        """
+        delay = 0.05
+        for attempt in range(max_retries):
+            sl_oid = await self.place_protective_stop_loss(symbol, close_side, qty, stop_price)
+            if sl_oid:
+                return sl_oid
+            logger.warning(
+                f"[SL_RETRY] Intento {attempt + 1}/{max_retries} fallido al colocar SL protector en Binance ({symbol}). Reintentando en {delay:.2f}s..."
+            )
+            await asyncio.sleep(delay)
+            delay *= 2.0
+
+        logger.critical(
+            f"[ALERTA CRÍTICA: ORPHAN_PREVENTION] Fallaron todos los ({max_retries}) reintentos de colocar Stop-Loss en Binance ({symbol}). "
+            "Cerrando inmediatamente posición huérfana a mercado para proteger el capital!"
+        )
+        await self.close_position_market(symbol, close_side, qty)
+        return None
+
     async def close_position_maker(self, symbol: str, close_side: str, qty: float, price: float) -> str | None:
         """
         Coloca una orden LIMIT reduceOnly en modo Post-Only (GTX) para Take-Profit en Binance,
@@ -990,7 +1016,7 @@ class BinanceLiveWsGateway:
                     except Exception as ef:
                         logger.debug(f"Error registrando fill en vivo: {ef}")
 
-                # Colocación Inmediata de Take-Profit Maker y Stop-Loss Nativo en Servidor (MARK_PRICE)
+                # Colocación Síncrona Inmediata de Stop-Loss Protector (con reintentos) y Take-Profit Maker
                 if fill_res.get("is_increasing"):
                     close_side = "SELL" if side.upper() == "BUY" else "BUY"
                     lev_now = self.symbol_leverage.get(order_sym, self.default_leverage)
@@ -999,8 +1025,18 @@ class BinanceLiveWsGateway:
                     sl_offset_bps = float(tier_cfg.get("sl_bps", 25.0))
                     tp_price = avg_px * (1.0 + tp_offset_bps / 10_000.0) if side.upper() == "BUY" else avg_px * (1.0 - tp_offset_bps / 10_000.0)
                     sl_price = avg_px * (1.0 - sl_offset_bps / 10_000.0) if side.upper() == "BUY" else avg_px * (1.0 + sl_offset_bps / 10_000.0)
-                    asyncio.create_task(self.place_protective_stop_loss(order_sym, close_side, abs(net_inv_contracts) or actual_qty, sl_price))
+                    await self.place_protective_stop_loss_with_retry(order_sym, close_side, abs(net_inv_contracts) or actual_qty, sl_price)
                     asyncio.create_task(self.close_position_maker(order_sym, close_side, abs(net_inv_contracts) or actual_qty, tp_price))
+
+                # OCO (One-Cancels-the-Other): Al cerrarse la posición por TP o SL, cancelar la orden opuesta pendiente
+                elif fill_res.get("is_decreasing"):
+                    if order_sym in self.protective_sl_by_symbol:
+                        sl_oid_to_cancel = self.protective_sl_by_symbol.pop(order_sym)
+                        try:
+                            await self.cancel_order_ws(sl_oid_to_cancel, order_sym)
+                            logger.info(f"[OCO] Posición cerrada en Binance {order_sym}: SL protector {sl_oid_to_cancel} cancelado.")
+                        except Exception as e:
+                            logger.warning(f"[OCO] Error cancelando SL en Binance: {e}")
             else:
                 logger.info(f"Orden {oid} en {order_sym} ({side}) cancelada o expirada sin fills. No se genera trade fantasma.")
 
@@ -2156,6 +2192,32 @@ class BingXLiveWsGateway:
             logger.debug(f"place_protective_stop_loss omitido/no soportado en BingX ({symbol}): {e}")
             return None
 
+    async def place_protective_stop_loss_with_retry(
+        self, symbol: str, close_side: str, qty: float, stop_price: float, max_retries: int = 3
+    ) -> str | None:
+        """
+        Coloca Stop-Loss en BingX con hasta max_retries reintentos con backoff exponencial.
+        Si la colocación del SL falla tras agotar reintentos, cierra inmediatamente la posición
+        a mercado para erradicar posiciones huérfanas desprotegidas.
+        """
+        delay = 0.05
+        for attempt in range(max_retries):
+            sl_oid = await self.place_protective_stop_loss(symbol, close_side, qty, stop_price)
+            if sl_oid:
+                return sl_oid
+            logger.warning(
+                f"[SL_RETRY] Intento {attempt + 1}/{max_retries} fallido al colocar SL protector en BingX ({symbol}). Reintentando en {delay:.2f}s..."
+            )
+            await asyncio.sleep(delay)
+            delay *= 2.0
+
+        logger.critical(
+            f"[ALERTA CRÍTICA: ORPHAN_PREVENTION] Fallaron todos los ({max_retries}) reintentos de colocar Stop-Loss en BingX ({symbol}). "
+            "Cerrando inmediatamente posición huérfana a mercado para proteger el capital!"
+        )
+        await self.close_position_market(symbol, close_side, qty)
+        return None
+
     async def close_position_maker(self, symbol: str, close_side: str, qty: float, price: float) -> str | None:
         """
         Coloca una orden LIMIT reduceOnly en modo Post-Only para Take-Profit en BingX,
@@ -2404,7 +2466,7 @@ class BingXLiveWsGateway:
                             entry_price=avg_px,
                             exit_or_mid_price=avg_px,
                             qty=actual_qty,
-                            return_pct=0.05 if pnl_recorded == 0.0 else round((pnl_recorded / max(avg_px * actual_qty, 1e-8)) * 100.0, 3),
+                            return_pct=0.0 if pnl_recorded == 0.0 else round((pnl_recorded / max(avg_px * actual_qty, 1e-8)) * 100.0, 3),
                             pnl_usd=pnl_recorded,
                             trade_id=f"BINGX-{oid}",
                             fee_cost=fee_est,
@@ -2412,7 +2474,7 @@ class BingXLiveWsGateway:
                     except Exception as ef:
                         logger.debug(f"Error registrando fill en vivo BingX: {ef}")
 
-                # Módulo 1: Colocación Inmediata de Take-Profit Maker y Stop-Loss Protector Server-Side
+                # Colocación Síncrona Inmediata de Stop-Loss Protector (con reintentos) y Take-Profit Maker
                 if fill_res.get("is_increasing"):
                     close_side = "SELL" if side.upper() == "BUY" else "BUY"
                     spec = SYMBOL_SPECS.get(order_sym)
@@ -2420,8 +2482,18 @@ class BingXLiveWsGateway:
                     sl_offset_bps = spec.sl_bps if spec else 18.0
                     tp_price = avg_px * (1.0 + tp_offset_bps / 10_000.0) if side.upper() == "BUY" else avg_px * (1.0 - tp_offset_bps / 10_000.0)
                     sl_price = avg_px * (1.0 - sl_offset_bps / 10_000.0) if side.upper() == "BUY" else avg_px * (1.0 + sl_offset_bps / 10_000.0)
+                    await self.place_protective_stop_loss_with_retry(order_sym, close_side, abs(net_inv_contracts) or actual_qty, sl_price)
                     asyncio.create_task(self.close_position_maker(order_sym, close_side, actual_qty, tp_price))
-                    asyncio.create_task(self.place_protective_stop_loss(order_sym, close_side, abs(net_inv_contracts) or actual_qty, sl_price))
+
+                # OCO (One-Cancels-the-Other): Al cerrarse la posición por TP o SL, cancelar la orden opuesta pendiente
+                elif fill_res.get("is_decreasing"):
+                    if order_sym in self.protective_sl_by_symbol:
+                        sl_oid_to_cancel = self.protective_sl_by_symbol.pop(order_sym)
+                        try:
+                            await self.cancel_order_ws(sl_oid_to_cancel, order_sym)
+                            logger.info(f"[OCO] Posición cerrada en BingX {order_sym}: SL protector {sl_oid_to_cancel} cancelado.")
+                        except Exception as e:
+                            logger.warning(f"[OCO] Error cancelando SL en BingX: {e}")
             else:
                 logger.info(f"Orden {oid} en {order_sym} ({side}) cancelada o expirada en BingX sin fills. No se genera trade fantasma.")
 
@@ -3052,7 +3124,8 @@ class DryRunExecutionEngine:
         )
 
         # 2. Cortafuegos determinista unificado MandateGatekeeper
-        self.gatekeeper = MandateGatekeeper()
+        self.gatekeeper = MandateGatekeeper(emergency_callback=self._on_emergency_flatten_triggered)
+        self._flattening_in_progress: bool = False
 
         # 3. Estado de Portafolio compartido en memoria (100.0 USDT base inicial)
         initial_capital = float(os.getenv("BASE_CAPITAL_USD", "100.0"))
@@ -3219,6 +3292,83 @@ class DryRunExecutionEngine:
         # Inicialización de contingencia para todos los ring buffers
         for ctx in self.symbol_contexts.values():
             self._seed_symbol_l2_snapshot(ctx)
+
+    def _on_emergency_flatten_triggered(self) -> None:
+        """
+        Callback reactivo disparado por MandateGatekeeper al violar Gate 4
+        (drawdown <= -3.0% o racha de pérdidas) o al invocar trigger_emergency_flatten().
+        Garantiza el corte inmediato de órdenes vivas y cierre forzado de posiciones a mercado.
+        """
+        logger.critical("[GATEKEEPER_KILL_SWITCH] Disparo de Kill-Switch detectado. Ejecutando flatten de emergencia inmediato...")
+        self.trigger_emergency_flatten_sync()
+
+    def trigger_emergency_flatten_sync(self) -> None:
+        """
+        Ejecuta el cierre de emergencia inmediato e idempotente de todas las posiciones
+        y la cancelación de todas las órdenes vivas en todos los contextos (simulador y portafolio).
+        """
+        if getattr(self, "_flattening_in_progress", False):
+            return
+        self._flattening_in_progress = True
+        try:
+            now_ns = time.time_ns()
+            # 1. Cancelar todas las órdenes abiertas en simuladores L2
+            for sym, ctx in self.symbol_contexts.items():
+                for o in list(ctx.l2_sim.orders.values()):
+                    if o.status in ("OPEN", "PARTIALLY_FILLED", "CANCEL_PENDING"):
+                        ctx.l2_sim.request_cancel(o.order_id, now_ns)
+                        o.status = "CANCELLED"
+                ctx.active_ladder_bids.clear()
+                ctx.active_ladder_asks.clear()
+                ctx.tp_maker_order_id = None
+                ctx.take_profit_price = None
+                ctx.stop_loss_price = None
+                ctx.avg_entry_price = None
+
+            # 2. Cerrar todas las posiciones activas en portfolio a mercado
+            for sym, pos_notional in list(self.portfolio.active_positions.items()):
+                if abs(pos_notional) > 1e-4:
+                    self.portfolio.active_positions.pop(sym, None)
+                    ctx = self.symbol_contexts.get(sym)
+                    mid = 100.0
+                    if ctx and ctx.ring_buffer.ob_count > 0:
+                        idx = (ctx.ring_buffer.ob_head - 1) % ctx.ring_buffer.capacity
+                        mid = 0.5 * (float(ctx.ring_buffer.ob_bid_prices[idx, 0]) + float(ctx.ring_buffer.ob_ask_prices[idx, 0]))
+                    qty = abs(pos_notional) / max(mid, 1.0)
+                    self.record_trade_fill(
+                        symbol=sym,
+                        side="SELL" if pos_notional > 0 else "BUY",
+                        entry_price=mid,
+                        exit_or_mid_price=mid,
+                        qty=qty,
+                        return_pct=-0.03,
+                        pnl_usd=-abs(pos_notional) * 0.03,
+                        trade_id=f"KILL-SWITCH-FLATTEN-{int(time.time()*1000)}",
+                        is_close=True,
+                    )
+
+            # 3. Si hay loop activo y modo LIVE, disparar flatten en vivo
+            if self.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI"):
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self.emergency_flatten_live_gateways())
+                except RuntimeError:
+                    pass
+        finally:
+            self._flattening_in_progress = False
+
+    async def emergency_flatten_live_gateways(self) -> None:
+        """Despacha la cancelación masiva y órdenes market reduceOnly en los exchanges conectados."""
+        if self.live_gateway is not None:
+            try:
+                await self.live_gateway.emergency_flatten_all(self.symbols)
+            except Exception as e:
+                logger.error(f"Error en emergency_flatten_all Binance: {e}")
+        if self.bingx_gateway is not None:
+            try:
+                await self.bingx_gateway.emergency_flatten_all(self.symbols)
+            except Exception as e:
+                logger.error(f"Error en emergency_flatten_all BingX: {e}")
 
     @property
     def ring_buffer(self) -> MarketRingBuffer:
@@ -6245,33 +6395,13 @@ async def set_trading_mode_endpoint(req: TradingModeRequest, request: Request = 
 async def emergency_flatten_endpoint(request: Request = None) -> dict[str, Any]:
     """
     Disparador síncrono del Kill-Switch de emergencia (Gate 4).
-    Bloquea inmediatamente todas las órdenes nuevas y activa el flatten.
-    Si el motor está en LIVE_BINANCE, LIVE_BINGX o LIVE_MULTI, invoca también emergency_flatten_all en el gateway activo.
+    Bloquea inmediatamente todas las órdenes nuevas y activa el flatten idempotente de órdenes y posiciones.
     """
     engine.gatekeeper.trigger_emergency_flatten()
+    engine.trigger_emergency_flatten_sync()
+    if engine.trading_mode in ("LIVE_BINANCE", "LIVE_BINGX", "LIVE_MULTI"):
+        await engine.emergency_flatten_live_gateways()
     logger.warning("Kill-Switch disparado manualmente a través de /api/emergency-flatten.")
-
-    if engine.trading_mode == "LIVE_MULTI":
-        if engine.live_gateway is not None:
-            try:
-                await engine.live_gateway.emergency_flatten_all(engine.symbols)
-            except Exception as e:
-                logger.error(f"Error ejecutando live emergency_flatten_all en Binance: {e}")
-        if engine.bingx_gateway is not None:
-            try:
-                await engine.bingx_gateway.emergency_flatten_all(engine.symbols)
-            except Exception as e:
-                logger.error(f"Error ejecutando live emergency_flatten_all en BingX: {e}")
-    elif engine.trading_mode == "LIVE_BINANCE" and engine.live_gateway is not None:
-        try:
-            await engine.live_gateway.emergency_flatten_all(engine.symbols)
-        except Exception as e:
-            logger.error(f"Error ejecutando live emergency_flatten_all en Binance: {e}")
-    elif engine.trading_mode == "LIVE_BINGX" and engine.bingx_gateway is not None:
-        try:
-            await engine.bingx_gateway.emergency_flatten_all(engine.symbols)
-        except Exception as e:
-            logger.error(f"Error ejecutando live emergency_flatten_all en BingX: {e}")
 
     return {
         "status": "EMERGENCY_FLATTEN_TRIGGERED",

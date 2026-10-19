@@ -132,6 +132,8 @@ def step_up_ratchet(
     state.base_capital_usd = round(min(state.base_capital_usd + reinvest_amount, max_capital_cap_usd), 4)
     # Ajustar equity descontando la porción transferida a la bóveda spot
     state.current_equity_usd = round(state.current_equity_usd - vault_transfer, 4)
+    # Corrección cuantitativa: Descontar vault_transfer del High-Water Mark para evitar falso drawdown
+    state.daily_high_watermark_usd = round(max(state.base_capital_usd, state.daily_high_watermark_usd - vault_transfer), 4)
     if state.current_equity_usd > state.daily_high_watermark_usd:
         state.daily_high_watermark_usd = state.current_equity_usd
 

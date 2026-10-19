@@ -1,6 +1,9 @@
 # backend/mandate_gates/gatekeeper.py
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 import time
 from collections.abc import Callable
 from backend.mandate_gates.schemas import OrderRequest, PortfolioState
@@ -31,6 +34,8 @@ class MandateGatekeeper:
         "max_consecutive_losses",
         "consecutive_api_errors",
         "rate_limit_cooldown_until_ns",
+        "state_file_path",
+        "min_notional_floor",
     )
 
     def __init__(
@@ -39,6 +44,8 @@ class MandateGatekeeper:
         max_leverage_cap: float | None = None,
         max_single_pair_margin_ratio: float | None = None,
         max_consecutive_losses: int | None = None,
+        state_file_path: str | Path | None = None,
+        min_notional_floor: float | None = None,
     ) -> None:
         self._emergency_callback = emergency_callback
         self.kill_switch_engaged: bool = False
@@ -57,6 +64,52 @@ class MandateGatekeeper:
         )
         self.consecutive_api_errors: int = 0
         self.rate_limit_cooldown_until_ns: int = 0
+        self.min_notional_floor: float | None = min_notional_floor
+        env_state_path = os.getenv("KILL_SWITCH_STATE_PATH")
+        if state_file_path is not None:
+            self.state_file_path = Path(state_file_path)
+        elif env_state_path:
+            self.state_file_path = Path(env_state_path)
+        elif not os.getenv("PYTEST_CURRENT_TEST"):
+            default_p = Path(__file__).resolve().parent.parent / "config" / "kill_switch_state.json"
+            self.state_file_path = default_p if default_p.parent.exists() else None
+        else:
+            self.state_file_path = None
+        self._load_state()
+
+    def _save_state(self) -> None:
+        if not self.state_file_path:
+            return
+        try:
+            p = self.state_file_path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp_p = p.with_suffix(".tmp")
+            data = {
+                "kill_switch_engaged": self.kill_switch_engaged,
+                "emergency_flatten_count": self.emergency_flatten_count,
+                "consecutive_losses": self.consecutive_losses,
+                "timestamp_ns": time.time_ns(),
+            }
+            with open(tmp_p, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            tmp_p.replace(p)
+        except Exception:
+            pass
+
+    def _load_state(self) -> None:
+        if not self.state_file_path:
+            return
+        try:
+            p = self.state_file_path
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.kill_switch_engaged = bool(data.get("kill_switch_engaged", False))
+                        self.emergency_flatten_count = int(data.get("emergency_flatten_count", 0))
+                        self.consecutive_losses = int(data.get("consecutive_losses", 0))
+        except Exception:
+            pass
 
     def record_trade_outcome(self, pnl_usd: float) -> bool:
         """
@@ -109,13 +162,17 @@ class MandateGatekeeper:
 
     def trigger_emergency_flatten(self) -> None:
         """
-        Activa el estado de bloqueo total (Kill-Switch) y notifica al despachador
-        de emergencia en segundo plano para cerrar posiciones sin bloquear el Hot Path.
+        Activa el estado de bloqueo total (Kill-Switch), persiste el estado en disco
+        y notifica al despachador de emergencia en segundo plano para cerrar posiciones sin bloquear el Hot Path.
         """
         self.kill_switch_engaged = True
         self.emergency_flatten_count += 1
+        self._save_state()
         if self._emergency_callback is not None:
-            self._emergency_callback()
+            try:
+                self._emergency_callback()
+            except Exception:
+                pass
 
     def reset_kill_switch(self) -> None:
         """
@@ -126,6 +183,7 @@ class MandateGatekeeper:
         self.consecutive_losses = 0
         self.consecutive_api_errors = 0
         self.rate_limit_cooldown_until_ns = 0
+        self._save_state()
 
     def validate_order(
         self, order: OrderRequest, state: PortfolioState
@@ -138,6 +196,21 @@ class MandateGatekeeper:
         # GATE 4: Kill-Switch Diario del -3.0% desde el High-Water Mark
         # y Circuit Breaker por Racha de Pérdidas / Rate-Limit Cooldown
         # ---------------------------------------------------------------------
+        if self.kill_switch_engaged:
+            return (
+                False,
+                "GATE_4_KILL_SWITCH: Kill-Switch activo. Toda nueva orden es rechazada.",
+            )
+
+        order_notional = order.price * order.qty
+        min_notional_req = order.min_notional if getattr(order, "min_notional", None) is not None else self.min_notional_floor
+        if min_notional_req is not None and order.order_type != "MARKET" and order.strategy_id != "EMERGENCY_FLATTEN":
+            if order_notional < (min_notional_req - self.FLOAT_EPSILON):
+                return (
+                    False,
+                    f"MIN_NOTIONAL_REJECT: Nocional proyectado (${order_notional:.2f}) inferior al mínimo "
+                    f"requerido (${min_notional_req:.2f}) para {order.symbol}.",
+                )
         hwm = state.daily_high_watermark_usd
         drawdown = (state.current_equity_usd - hwm) / hwm
         if drawdown <= (self.DAILY_KILL_SWITCH_DRAWDOWN + self.FLOAT_EPSILON):

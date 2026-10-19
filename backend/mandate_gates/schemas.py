@@ -48,6 +48,7 @@ class OrderRequest(BaseModel):
     strategy_id: str = Field(..., min_length=1, description="Identificador del motor de microestructura")
     timestamp_ns: int = Field(..., gt=0, description="Timestamp monotónico o epoch en nanosegundos")
     client_order_id: str | None = Field(default=None, description="Identificador único del cliente para etiquetar estrategia y lote")
+    min_notional: float | None = Field(default=None, description="Nocional mínimo del par en USDT")
 
     @field_validator("symbol", "order_type", "time_in_force", "margin_mode", "strategy_id")
     @classmethod
