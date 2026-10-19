@@ -1,0 +1,38 @@
+{
+  "market_making": {
+    "in_sample_2021": {
+      "trades": 153,
+      "win_rate": 54.9,
+      "net_pnl_usd": -63.43,
+      "roi_pct": -6.34,
+      "max_dd_pct": 6.46,
+      "sharpe": -1.6131
+    },
+    "out_of_sample_2022": {
+      "trades": 707,
+      "win_rate": 63.65,
+      "net_pnl_usd": -159.17,
+      "roi_pct": -15.92,
+      "max_dd_pct": 15.98,
+      "sharpe": -3.5499
+    }
+  },
+  "directional_trend_1_3": {
+    "in_sample_2021": {
+      "trades": 652,
+      "win_rate": 29.29,
+      "net_pnl_usd": -232.81,
+      "roi_pct": -23.28,
+      "max_dd_pct": 23.69,
+      "sharpe": -4.5416
+    },
+    "out_of_sample_2022": {
+      "trades": 1647,
+      "win_rate": 25.02,
+      "net_pnl_usd": -386.26,
+      "roi_pct": -38.63,
+      "max_dd_pct": 38.99,
+      "sharpe": -7.6846
+    }
+  }
+}
