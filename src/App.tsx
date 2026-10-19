@@ -834,14 +834,16 @@ export default function App() {
 
   // Telemetry Server Endpoints (Direct integration with backend/telemetry_server.py)
   const [wsUrl, setWsUrl] = useState<string>(() => {
+    const token = (import.meta as any).env?.VITE_API_AUTH_TOKEN || 'apex-quant-live-demo-token';
+    const query = token ? `?token=${encodeURIComponent(token)}` : '';
     if (typeof window !== 'undefined') {
       if (window.location.port === '5173') {
-        return 'ws://127.0.0.1:8000/ws/telemetry';
+        return `ws://127.0.0.1:8000/ws/telemetry${query}`;
       }
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      return `${proto}//${window.location.host}/ws/telemetry`;
+      return `${proto}//${window.location.host}/ws/telemetry${query}`;
     }
-    return 'ws://127.0.0.1:8000/ws/telemetry';
+    return `ws://127.0.0.1:8000/ws/telemetry${query}`;
   });
   const [apiBaseUrl, setApiBaseUrl] = useState<string>(() => {
     if (typeof window !== 'undefined') {

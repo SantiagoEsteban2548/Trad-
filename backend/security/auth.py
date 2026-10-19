@@ -32,7 +32,8 @@ def verify_bearer_token(
 
     # Si se configuró un token en el entorno, es estrictamente obligatorio
     if configured_token:
-        if not credentials or not credentials.credentials:
+        token = credentials.credentials if credentials and credentials.credentials else request.query_params.get("token")
+        if not token:
             client_ip = request.client.host if request and request.client else "unknown"
             logger.warning(f"[AUTH_REJECT] Intento de acceso sin token Bearer desde IP: {client_ip}")
             raise HTTPException(
@@ -40,7 +41,7 @@ def verify_bearer_token(
                 detail="No autorizado: Token Bearer ausente o malformado.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        if credentials.credentials != configured_token:
+        if token != configured_token:
             client_ip = request.client.host if request and request.client else "unknown"
             logger.warning(f"[AUTH_REJECT] Token Bearer inválido desde IP: {client_ip}")
             raise HTTPException(
@@ -48,7 +49,7 @@ def verify_bearer_token(
                 detail="No autorizado: Token Bearer inválido.",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        return credentials.credentials
+        return token
 
     # Si no hay token configurado en variables de entorno:
     trading_mode = os.getenv("TRADING_MODE", "PAPER_L2").upper()
